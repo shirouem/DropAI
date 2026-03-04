@@ -1,0 +1,30 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model Asset {
+  id          String   @id @default(cuid())
+  type        String   // "hook", "broll", "audio"
+  title       String
+  description String?
+  thumbnail   String?
+  sourceUrl   String?
+  duration    Float
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Composition {
+  id          String   @id @default(cuid())
+  title       String
+  angle       String?
+  duration    Float    @default(15.0)
+  elements    String   // Store array of elements as JSON string
+  collections String   // Store array of collections to preserve uploaded assets
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}

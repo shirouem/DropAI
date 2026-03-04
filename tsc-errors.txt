@@ -1,0 +1,7 @@
+src/app/api/skeletons/[id]/route.ts(7,39): error TS2339: Property 'skeleton' does not exist on type 'PrismaClient<{ adapter: PrismaLibSql; }, never, DefaultArgs>'.
+src/app/api/skeletons/[id]/route.ts(25,20): error TS2339: Property 'skeletonElement' does not exist on type 'PrismaClient<{ adapter: PrismaLibSql; }, never, DefaultArgs>'.
+src/app/api/skeletons/[id]/route.ts(26,20): error TS2339: Property 'skeleton' does not exist on type 'PrismaClient<{ adapter: PrismaLibSql; }, never, DefaultArgs>'.
+src/app/api/skeletons/[id]/route.ts(51,38): error TS2339: Property 'skeleton' does not exist on type 'PrismaClient<{ adapter: PrismaLibSql; }, never, DefaultArgs>'.
+src/app/api/skeletons/[id]/route.ts(64,22): error TS2339: Property 'skeleton' does not exist on type 'PrismaClient<{ adapter: PrismaLibSql; }, never, DefaultArgs>'.
+src/app/api/skeletons/route.ts(6,40): error TS2339: Property 'skeleton' does not exist on type 'PrismaClient<{ adapter: PrismaLibSql; }, never, DefaultArgs>'.
+src/app/api/skeletons/route.ts(19,39): error TS2339: Property 'skeleton' does not exist on type 'PrismaClient<{ adapter: PrismaLibSql; }, never, DefaultArgs>'.
