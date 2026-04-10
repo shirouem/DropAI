@@ -111,6 +111,7 @@ interface CanvasElement {
     variantOverrides?: Record<string, Partial<CanvasElement>>;
     sourceElementId?: string;
     volume?: number; // Volume from 0 to 1
+    mediaOffset?: number; // Offset into source media file (seconds), used after splitting
 }
 
 // --- Collection Type Styling ---
@@ -417,6 +418,34 @@ function CollectionCard({ collection, onAddItem, onDeleteItem, onUpdateItem }: {
     );
 }
 
+// --- Memoized Timeline Waveform ---
+const TimelineWaveform = React.memo(function TimelineWaveform({ elementId, collectionType, segPxWidth }: { elementId: string; collectionType: string; segPxWidth: number }) {
+    const barSpacing = 4;
+    const barCount = Math.max(1, Math.floor(segPxWidth / barSpacing));
+    const color = collectionType === 'audio' ? '#34d399' : '#a78bfa';
+    return (
+        <div className="absolute inset-0 pointer-events-none overflow-hidden opacity-40 z-0">
+            <svg width={segPxWidth} height="100%" style={{ display: 'block' }} preserveAspectRatio="none">
+                {Array.from({ length: barCount }, (_, i) => {
+                    const seed = (elementId.charCodeAt(i % elementId.length) * 31 + i * 7 + (i * 13) % 97) % 100;
+                    const h = 20 + (seed / 100) * 60;
+                    const barW = Math.max(1, barSpacing - 1);
+                    return (
+                        <rect
+                            key={i}
+                            x={i * barSpacing}
+                            y={`${(100 - h) / 2}%`}
+                            width={barW}
+                            height={`${h}%`}
+                            fill={color}
+                            rx="0.5"
+                        />
+                    );
+                })}
+            </svg>
+        </div>
+    );
+});
 
 // --- Canvas Layer ---
 function CanvasLayer({ el, isSelected, collections, currentTime, onClick, onActionStart }: { el: CanvasElement; isSelected: boolean; collections: CollectionItem[]; currentTime: number; onClick: () => void; onActionStart: (action: string, e: React.PointerEvent) => void }) {
@@ -637,23 +666,33 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     const [collections, setCollections] = useState<CollectionItem[]>(SEED_COLLECTIONS);
     const [selectedElementId, setSelectedElementId] = useState<string | null>(null);
     const [centerView, setCenterView] = useState<"canvas" | "preview">("canvas");
-    const [inspectorVariantMode, setInspectorVariantMode] = useState<string>("all"); // "all" or a variant ID
+    const [inspectorVariantModes, setInspectorVariantModes] = useState<Record<string, string>>({}); // elementId -> "all" | variantId
+    const [inspectorLocked, setInspectorLocked] = useState(false);
     const [saving, setSaving] = useState(false);
     const [fetching, setFetching] = useState(false);
 
-    // Validate inspectorVariantMode when selection changes to prevent editing a ghost variant overriding the base
-    useEffect(() => {
-        if (selectedElementId && inspectorVariantMode !== 'all') {
-            const el = elements.find(e => e.elementId === selectedElementId);
+    // Helper: get the variant mode for an element, auto-selecting single variants
+    const getVariantMode = useCallback((elementId: string): string => {
+        const mode = inspectorVariantModes[elementId] || 'all';
+        if (mode === 'all') {
+            // For single-variant collections, auto-select the only variant
+            const el = elements.find(e => e.elementId === elementId);
             if (el) {
                 const col = collections.find(c => c.id === el.collectionId);
-                const isValidVariant = col?.items.some(v => v.id === inspectorVariantMode);
-                if (!isValidVariant) {
-                    setInspectorVariantMode('all');
-                }
+                if (col?.items.length === 1) return col.items[0].id;
             }
         }
-    }, [selectedElementId, elements, collections, inspectorVariantMode]);
+        return mode;
+    }, [inspectorVariantModes, elements, collections]);
+
+    // Ref to always access latest getVariantMode without re-running effects
+    const getVariantModeRef = useRef(getVariantMode);
+    getVariantModeRef.current = getVariantMode;
+
+    // Set variant mode for the currently selected element
+    const setVariantMode = useCallback((elementId: string, mode: string) => {
+        setInspectorVariantModes(prev => ({ ...prev, [elementId]: mode }));
+    }, []);
 
     useEffect(() => {
         if (compositionId) {
@@ -751,26 +790,89 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             if (elIndex === -1) return prev;
 
             const el = prev[elIndex];
+            const isMedia = el.collectionType === 'video' || el.collectionType === 'audio';
+
+            // For media with per-variant timing, use effective timing for boundary check
+            let effStart = el.startTime;
+            let effDur = el.duration;
+            if (isMedia && el.variantOverrides) {
+                const firstVid = Object.keys(el.variantOverrides)[0];
+                if (firstVid) {
+                    effStart = el.variantOverrides[firstVid]?.startTime ?? el.startTime;
+                    effDur = el.variantOverrides[firstVid]?.duration ?? el.duration;
+                }
+            }
+
             // Don't split if too close to the edges
-            if (splitTime <= el.startTime + 0.1 || splitTime >= el.startTime + el.duration - 0.1) {
+            if (splitTime <= effStart + 0.1 || splitTime >= effStart + effDur - 0.1) {
                 return prev;
             }
+
             // Maintain heritage for randomizer
             const srcId = el.sourceElementId || el.elementId;
-            const splitOffset = splitTime - el.startTime;
 
-            const firstHalf = { ...el, duration: splitOffset, sourceElementId: srcId };
-            const secondHalf = {
-                ...el,
-                elementId: `el-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-                sourceElementId: srcId,
-                startTime: splitTime,
-                duration: el.startTime + el.duration - splitTime,
-            };
+            if (isMedia && el.variantOverrides && Object.keys(el.variantOverrides).length > 0) {
+                // Split each variant's timing independently
+                const firstOverrides: Record<string, Partial<CanvasElement>> = {};
+                const secondOverrides: Record<string, Partial<CanvasElement>> = {};
 
-            const next = [...prev];
-            next.splice(elIndex, 1, firstHalf, secondHalf);
-            return next;
+                for (const [vid, override] of Object.entries(el.variantOverrides)) {
+                    const vStart = override.startTime ?? el.startTime;
+                    const vDur = override.duration ?? el.duration;
+                    const splitOffset = splitTime - vStart;
+
+                    if (splitOffset <= 0.1) {
+                        // Split point is before this variant's start — entire variant goes to second half
+                        secondOverrides[vid] = { ...override };
+                    } else if (splitOffset >= vDur - 0.1) {
+                        // Split point is after this variant's end — entire variant goes to first half
+                        firstOverrides[vid] = { ...override };
+                    } else {
+                        // Normal split within this variant
+                        firstOverrides[vid] = { ...override, startTime: vStart, duration: Math.round(splitOffset * 10) / 10 };
+                        const existingOffset = (override as any).mediaOffset ?? (el.mediaOffset ?? 0);
+                        secondOverrides[vid] = { ...override, startTime: Math.round(splitTime * 10) / 10, duration: Math.round((vDur - splitOffset) * 10) / 10, mediaOffset: Math.round((existingOffset + splitOffset) * 10) / 10 };
+                    }
+                }
+
+                const baseSplitOffset = splitTime - el.startTime;
+                const firstHalf: CanvasElement = {
+                    ...el,
+                    duration: Math.round(baseSplitOffset * 10) / 10,
+                    sourceElementId: srcId,
+                    variantOverrides: firstOverrides,
+                };
+                const secondHalf: CanvasElement = {
+                    ...el,
+                    elementId: `el-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+                    sourceElementId: srcId,
+                    startTime: Math.round(splitTime * 10) / 10,
+                    duration: Math.round((el.duration - baseSplitOffset) * 10) / 10,
+                    mediaOffset: Math.round(((el.mediaOffset ?? 0) + baseSplitOffset) * 10) / 10,
+                    variantOverrides: secondOverrides,
+                };
+
+                const next = [...prev];
+                next.splice(elIndex, 1, firstHalf, secondHalf);
+                return next;
+            } else {
+                // Non-media or no overrides — simple split
+                const splitOffset = splitTime - el.startTime;
+                const firstHalf = { ...el, duration: Math.round(splitOffset * 10) / 10, sourceElementId: srcId };
+                const isMediaSimple = el.collectionType === 'video' || el.collectionType === 'audio';
+                const secondHalf = {
+                    ...el,
+                    elementId: `el-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+                    sourceElementId: srcId,
+                    startTime: Math.round(splitTime * 10) / 10,
+                    duration: Math.round((el.duration - splitOffset) * 10) / 10,
+                    ...(isMediaSimple ? { mediaOffset: Math.round(((el.mediaOffset ?? 0) + splitOffset) * 10) / 10 } : {}),
+                };
+
+                const next = [...prev];
+                next.splice(elIndex, 1, firstHalf, secondHalf);
+                return next;
+            }
         });
         setSplitHoverPosition(null);
     }, []);
@@ -805,9 +907,24 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     };
 
     const applyToElement = (el: CanvasElement, updates: Partial<CanvasElement>, variantMode: string): CanvasElement => {
+        const isMedia = el.collectionType === 'video' || el.collectionType === 'audio';
+
         if (variantMode === 'all') {
+            // For audio/video elements, preserve per-variant startTime/duration overrides
+            if (isMedia && el.variantOverrides) {
+                const preservedOverrides: Record<string, Partial<CanvasElement>> = {};
+                for (const [vid, overrides] of Object.entries(el.variantOverrides)) {
+                    const timingOnly: Partial<CanvasElement> = {};
+                    if (overrides.startTime !== undefined) timingOnly.startTime = overrides.startTime;
+                    if (overrides.duration !== undefined) timingOnly.duration = overrides.duration;
+                    if ((overrides as any).mediaOffset !== undefined) (timingOnly as any).mediaOffset = (overrides as any).mediaOffset;
+                    if (Object.keys(timingOnly).length > 0) preservedOverrides[vid] = timingOnly;
+                }
+                return { ...el, ...updates, variantOverrides: preservedOverrides };
+            }
             return { ...el, ...updates, variantOverrides: {} };
-        } else {
+        } else if (isMedia) {
+            // For media elements with a specific variant, store timing in overrides
             const existing = el.variantOverrides?.[variantMode] || {};
             return {
                 ...el,
@@ -816,6 +933,10 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                     [variantMode]: { ...existing, ...updates },
                 },
             };
+        } else {
+            // For non-media elements (image, text), always apply to base element
+            // Variant overrides only matter for media timing; non-media props live on base
+            return { ...el, ...updates };
         }
     };
 
@@ -845,7 +966,8 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         const baseEl = elements.find(el => el.elementId === selectedElementId);
         if (!baseEl) return;
 
-        const el = inspectorVariantMode !== 'all' ? getEffectiveElement(baseEl, inspectorVariantMode) : baseEl;
+        const curMode = selectedElementId ? getVariantMode(selectedElementId) : 'all';
+        const el = curMode !== 'all' ? getEffectiveElement(baseEl, curMode) : baseEl;
 
         // Disable body scroll/selection during drag
         document.body.style.userSelect = 'none';
@@ -975,7 +1097,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 cancelAnimationFrame(activeAnimationFrame.current);
             }
             activeAnimationFrame.current = requestAnimationFrame(() => {
-                setElements(prev => prev.map(el => el.elementId === selectedElementId ? applyToElement(el, updates, inspectorVariantMode) : el));
+                setElements(prev => prev.map(el => el.elementId === selectedElementId ? applyToElement(el, updates, selectedElementId ? getVariantModeRef.current(selectedElementId) : 'all') : el));
                 activeAnimationFrame.current = null;
             });
         };
@@ -991,7 +1113,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             window.removeEventListener('pointermove', handlePointerMove);
             window.removeEventListener('pointerup', handlePointerUp);
         };
-    }, [actionState, selectedElementId, inspectorVariantMode]);
+    }, [actionState, selectedElementId]);
 
 
     // Helper: check if the pointer ended up over the canvas area
@@ -1029,7 +1151,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             const el = elements.find(e => e.elementId === elId);
             const rect = canvasRef.current?.getBoundingClientRect();
             if (el && rect) {
-                const mode = elId === selectedElementId ? inspectorVariantMode : 'all';
+                const mode = getVariantMode(elId);
                 const effectiveEl = (mode !== 'all' && el.variantOverrides?.[mode]) ? { ...el, ...el.variantOverrides[mode] } as CanvasElement : el;
 
                 if (elId === selectedElementId) {
@@ -1082,6 +1204,20 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             const w = col.type === 'text' ? 80 : 60;
             const h = col.type === 'text' ? 8 : 40;
             const newId = `el-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+            // For audio/video, initialize per-variant timing overrides
+            const isMedia = col.type === 'video' || col.type === 'audio';
+            const variantOverrides: Record<string, Partial<CanvasElement>> = {};
+            if (isMedia) {
+                for (const item of col.items) {
+                    variantOverrides[item.id] = {
+                        startTime: 0,
+                        duration: item.duration || 5,
+                    };
+                }
+            }
+            const baseDuration = isMedia
+                ? (col.items[0]?.duration || 5)
+                : 5;
             const newEl: CanvasElement = {
                 elementId: newId,
                 sourceElementId: newId,
@@ -1095,11 +1231,12 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 zIndex: elements.length + 1,
                 content: col.type === 'text' ? col.items[0]?.value || "YOUR TEXT HERE" : undefined,
                 startTime: 0,
-                duration: 5,
+                duration: baseDuration,
                 rotation: 0,
                 opacity: 1,
                 visible: true,
                 animations: [],
+                ...(isMedia && Object.keys(variantOverrides).length > 0 ? { variantOverrides } : {}),
             };
             setElements(prev => [...prev, newEl]);
             setSelectedElementId(newEl.elementId);
@@ -1118,7 +1255,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
 
             setElements(prev => prev.map(el => {
                 if (el.elementId === elId) {
-                    const mode = el.elementId === selectedElementId ? inspectorVariantMode : 'all';
+                    const mode = getVariantMode(el.elementId);
                     const effectiveEl = (mode !== 'all' && el.variantOverrides?.[mode]) ? { ...el, ...el.variantOverrides[mode] } as CanvasElement : el;
                     let newX = effectiveEl.x + moveXPct;
                     let newY = effectiveEl.y + moveYPct;
@@ -1145,13 +1282,24 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     };
 
     // The element as seen in the inspector (with current variant overrides applied)
-    const effectiveElement = selectedElement && inspectorVariantMode !== 'all'
-        ? getEffectiveElement(selectedElement, inspectorVariantMode)
+    const selectedVariantMode = selectedElementId ? getVariantMode(selectedElementId) : 'all';
+    const effectiveElement = selectedElement && selectedVariantMode !== 'all'
+        ? getEffectiveElement(selectedElement, selectedVariantMode)
         : selectedElement;
 
     const updateSelected = (updates: Partial<CanvasElement>) => {
         if (!selectedElementId) return;
-        setElements(prev => prev.map(el => el.elementId === selectedElementId ? applyToElement(el, updates, inspectorVariantMode) : el));
+        let finalUpdates = updates;
+        // For audio/video in 'all' mode, strip timing properties — those are per-variant only
+        if (selectedVariantMode === 'all' && selectedElement) {
+            const isMedia = selectedElement.collectionType === 'video' || selectedElement.collectionType === 'audio';
+            if (isMedia) {
+                const { startTime, duration, ...rest } = finalUpdates as any;
+                finalUpdates = rest;
+                if (Object.keys(finalUpdates).length === 0) return;
+            }
+        }
+        setElements(prev => prev.map(el => el.elementId === selectedElementId ? applyToElement(el, finalUpdates, selectedVariantMode) : el));
     };
 
     const removeSelected = () => {
@@ -1243,8 +1391,8 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                         <button title="Export Video" className="p-1.5 px-2 bg-white/5 hover:bg-white/10 border border-white/10 text-gray-300 hover:text-white rounded-md transition-colors flex items-center justify-center">
                             <Download className="w-4 h-4" />
                         </button>
-                        <button onClick={saveSkeleton} disabled={saving} className="px-4 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white text-xs font-semibold rounded-md transition-colors">
-                            {saving ? "Saving..." : "Save to DB"}
+                        <button onClick={saveSkeleton} disabled={saving} className="px-4 py-1.5 bg-[#111] hover:bg-[#222] border border-white/5 disabled:opacity-50 text-gray-300 hover:text-white text-xs font-semibold rounded-md transition-colors">
+                            {saving ? "Saving..." : "Save Changes"}
                         </button>
                         <button className="px-4 py-1.5 bg-white hover:bg-gray-200 text-black text-xs font-semibold rounded-md transition-colors flex items-center gap-2">
                             <MonitorPlay className="w-4 h-4" /> Render
@@ -1356,18 +1504,18 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                     </aside>
 
                     {/* Center Area */}
-                    <section className="flex-1 relative flex flex-col items-center bg-[#080808] overflow-hidden" onClick={() => setSelectedElementId(null)}>
+                    <section className="flex-1 relative flex flex-col items-center bg-[#080808] overflow-hidden" onClick={() => { if (!inspectorLocked) setSelectedElementId(null) }}>
 
                         {/* Floating Tab Menu */}
                         <div className="absolute top-4 left-1/2 -translate-x-1/2 z-30 flex items-center bg-[#111]/90 backdrop-blur-md rounded-full border border-white/10 p-1 shadow-xl">
                             <button
-                                onClick={(e) => { e.stopPropagation(); setCenterView('canvas'); }}
+                                onClick={(e) => { e.stopPropagation(); setIsPlaying(false); setCenterView('canvas'); }}
                                 className={cn("px-5 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-widest transition-all", centerView === 'canvas' ? "bg-white text-black shadow-md" : "text-gray-400 hover:text-white")}
                             >
                                 Canvas
                             </button>
                             <button
-                                onClick={(e) => { e.stopPropagation(); setCenterView('preview'); }}
+                                onClick={(e) => { e.stopPropagation(); setIsPlaying(false); setCenterView('preview'); }}
                                 className={cn("px-5 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-widest transition-all", centerView === 'preview' ? "bg-white text-black shadow-md" : "text-gray-400 hover:text-white")}
                             >
                                 Preview
@@ -1406,8 +1554,8 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                 </AnimatePresence>
                                                 <div className="absolute inset-0 opacity-[0.06] pointer-events-none" style={{ backgroundImage: 'linear-gradient(rgba(255,255,255,0.3) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.3) 1px, transparent 1px)', backgroundSize: '10% 10%' }} />
                                                 {elements.filter(el => el.elementId !== selectedElementId).map(baseEl => {
-                                                    const variant = previewVariants[baseEl.elementId];
-                                                    const el = variant ? getEffectiveElement(baseEl, variant.id) : baseEl;
+                                                    const elMode = getVariantMode(baseEl.elementId);
+                                                    const el = elMode !== 'all' ? getEffectiveElement(baseEl, elMode) : baseEl;
                                                     return (
                                                         <CanvasLayer
                                                             key={el.elementId}
@@ -1478,7 +1626,16 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                             <div className="absolute inset-0 opacity-[0.03] pointer-events-none" style={{ backgroundImage: 'linear-gradient(rgba(255,255,255,0.3) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.3) 1px, transparent 1px)', backgroundSize: '10% 10%' }} />
                                             {elements
                                                 .map(baseEl => {
-                                                    const variant = previewVariants[baseEl.elementId];
+                                                    // When a specific variant is selected in inspector, use it for preview
+                                                    // When 'all', fall back to random seed-based preview
+                                                    let variant: CollectionVariant | null = null;
+                                                    const elMode = getVariantMode(baseEl.elementId);
+                                                    if (elMode !== 'all') {
+                                                        const col = collections.find(c => c.id === baseEl.collectionId);
+                                                        variant = col?.items.find(v => v.id === elMode) ?? previewVariants[baseEl.elementId];
+                                                    } else {
+                                                        variant = previewVariants[baseEl.elementId];
+                                                    }
                                                     const el = variant ? getEffectiveElement(baseEl, variant.id) : baseEl;
                                                     return { el, variant };
                                                 })
@@ -1521,15 +1678,15 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                             ) : el.collectionType === 'video' ? (
                                                                 variant?.value ? (
                                                                     <video
+                                                                        key={`vid-${el.elementId}-${variant?.value || 'base'}`}
                                                                         src={variant.value}
                                                                         className="w-full h-full object-cover"
-                                                                        muted
                                                                         playsInline
                                                                         preload="auto"
                                                                         ref={(videoEl) => {
                                                                             if (!videoEl) return;
                                                                             const rawDur = videoEl.duration || Infinity;
-                                                                            const localTime = Math.max(0, currentTime - el.startTime);
+                                                                            const localTime = Math.max(0, currentTime - el.startTime) + (el.mediaOffset ?? 0);
                                                                             const safeLocalTime = Math.min(localTime, rawDur);
                                                                             // Sync time if scrubbing or drifting out of sync
                                                                             if (Math.abs(videoEl.currentTime - safeLocalTime) > 0.2) {
@@ -1576,39 +1733,52 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                         </div>
                                                     );
                                                 })}
+
+                                            {/* Hidden audio elements for playback */}
+                                            {elements
+                                                .filter(baseEl => baseEl.collectionType === 'audio' && baseEl.visible !== false)
+                                                .map(baseEl => {
+                                                    let variant: CollectionVariant | null = null;
+                                                    const elMode = getVariantMode(baseEl.elementId);
+                                                    if (elMode !== 'all') {
+                                                        const col = collections.find(c => c.id === baseEl.collectionId);
+                                                        variant = col?.items.find(v => v.id === elMode) ?? previewVariants[baseEl.elementId];
+                                                    } else {
+                                                        variant = previewVariants[baseEl.elementId];
+                                                    }
+                                                    const el = variant ? getEffectiveElement(baseEl, variant.id) : baseEl;
+                                                    const isActive = currentTime >= el.startTime && currentTime < el.startTime + el.duration;
+                                                    return (
+                                                        <audio
+                                                            key={`aud-${el.elementId}-${variant?.value || el.content || 'base'}`}
+                                                            src={variant?.value || el.content}
+                                                            ref={(audioEl) => {
+                                                                if (!audioEl) return;
+                                                                const rawDur = audioEl.duration || Infinity;
+                                                                const localTime = Math.max(0, currentTime - el.startTime) + (el.mediaOffset ?? 0);
+                                                                const safeLocalTime = Math.min(localTime, rawDur);
+                                                                if (Math.abs(audioEl.currentTime - safeLocalTime) > 0.2) {
+                                                                    audioEl.currentTime = safeLocalTime;
+                                                                }
+                                                                if (audioEl.volume !== (el.volume ?? 1)) {
+                                                                    audioEl.volume = el.volume ?? 1;
+                                                                }
+                                                                if (isPlaying && isActive && safeLocalTime < rawDur) {
+                                                                    if (audioEl.paused) audioEl.play().catch(() => { });
+                                                                } else {
+                                                                    if (!audioEl.paused) audioEl.pause();
+                                                                }
+                                                            }}
+                                                        />
+                                                    );
+                                                })}
                                             {elements.length === 0 && (
                                                 <div className="absolute inset-0 flex flex-col items-center justify-center text-gray-600">
                                                     <MonitorPlay className="w-8 h-8 mb-2 opacity-30" />
                                                     <span className="text-[10px] font-mono">No elements</span>
                                                 </div>
                                             )}
-                                            {/* Audio Elements (Invisible on visual preview, but need functional DOM nodes) */}
-                                            {elements.filter(el => el.visible !== false && el.collectionType === 'audio').map(baseEl => {
-                                                const variant = previewVariants[baseEl.elementId];
-                                                const el = variant ? getEffectiveElement(baseEl, variant.id) : baseEl;
-                                                const isActive = currentTime >= el.startTime && currentTime < el.startTime + el.duration;
-                                                return (
-                                                    <audio
-                                                        key={`audio-${el.elementId}`}
-                                                        src={variant?.value || el.content}
-                                                        ref={(audioEl) => {
-                                                            if (!audioEl) return;
-                                                            const localTime = Math.max(0, currentTime - el.startTime);
-                                                            if (Math.abs(audioEl.currentTime - localTime) > 0.2) {
-                                                                audioEl.currentTime = localTime;
-                                                            }
-                                                            if (audioEl.volume !== (el.volume ?? 1)) {
-                                                                audioEl.volume = el.volume ?? 1;
-                                                            }
-                                                            if (isPlaying && isActive) {
-                                                                if (audioEl.paused) audioEl.play().catch(() => { });
-                                                            } else {
-                                                                if (!audioEl.paused) audioEl.pause();
-                                                            }
-                                                        }}
-                                                    />
-                                                );
-                                            })}
+
                                             <div className="absolute top-2 right-2 bg-black/70 backdrop-blur-sm rounded px-2 py-1 text-[9px] font-mono text-gray-400 z-50">
                                                 {currentTime.toFixed(1)}s
                                             </div>
@@ -1706,6 +1876,11 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                             </div>
                                         </div>
 
+                                        {/* Playback Time Indicator */}
+                                        <div className="px-3 py-1.5 border-b border-white/5 bg-[#0d0d0d]">
+                                            <span className="text-[11px] font-mono text-gray-400 tabular-nums">{currentTime.toFixed(1)}s</span>
+                                        </div>
+
                                         {/* Collapsible Timeline */}
                                         <AnimatePresence>
                                             {isTimelineOpen && (
@@ -1766,6 +1941,32 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                         const TOTAL = TOTAL_DURATION;
                                                                         const SNAP_THRESHOLD = 0.3; // seconds
 
+                                                                        // For media elements, resolve effective timing from variant overrides
+                                                                        const isMediaEl = el.collectionType === 'video' || el.collectionType === 'audio';
+                                                                        const activeVariantMode = getVariantMode(el.elementId);
+                                                                        // In 'all' mode for media, timeline is a non-interactive placeholder
+                                                                        const isMediaAllMode = isMediaEl && activeVariantMode === 'all';
+
+                                                                        // Compute effectiveEl for display:
+                                                                        // - Specific variant: merge that variant's overrides
+                                                                        // - "All" mode for media: use max variant duration as fixed placeholder
+                                                                        // - Non-media: use base element
+                                                                        let effectiveEl = el;
+                                                                        if (isMediaEl && el.variantOverrides) {
+                                                                            if (activeVariantMode !== 'all' && el.variantOverrides[activeVariantMode]) {
+                                                                                effectiveEl = { ...el, ...el.variantOverrides[activeVariantMode] } as CanvasElement;
+                                                                            } else {
+                                                                                // In 'all' mode, show max duration across all variants as placeholder
+                                                                                let maxDur = el.duration;
+                                                                                let placeholderStart = el.startTime;
+                                                                                for (const override of Object.values(el.variantOverrides)) {
+                                                                                    if (override.duration !== undefined && override.duration > maxDur) maxDur = override.duration;
+                                                                                    if (override.startTime !== undefined) placeholderStart = override.startTime;
+                                                                                }
+                                                                                effectiveEl = { ...el, startTime: placeholderStart, duration: maxDur } as CanvasElement;
+                                                                            }
+                                                                        }
+
                                                                         // Collect snap points from OTHER elements
                                                                         const snapPoints = elements
                                                                             .filter(o => o.elementId !== el.elementId)
@@ -1785,8 +1986,8 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                             const track = target?.parentElement;
                                                                             if (!track) return;
                                                                             const startX = e.clientX;
-                                                                            const origStart = el.startTime;
-                                                                            const dur = el.duration;
+                                                                            const origStart = effectiveEl.startTime;
+                                                                            const dur = effectiveEl.duration;
 
                                                                             (e.target as HTMLElement).setPointerCapture(e.pointerId);
 
@@ -1804,7 +2005,8 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                                 if (snappedEnd !== newStart + dur) { newStart = snappedEnd - dur; activeSnaps.push(snappedEnd); }
                                                                                 newStart = Math.max(0, Math.min(TOTAL - dur, newStart));
                                                                                 setTimelineSnapLines(activeSnaps);
-                                                                                setElements(prev => prev.map(x => x.elementId === el.elementId ? applyToElement(x, { startTime: Math.round(newStart * 10) / 10 }, x.elementId === selectedElementId ? inspectorVariantMode : 'all') : x));
+                                                                                const varMode = getVariantMode(el.elementId);
+                                                                                setElements(prev => prev.map(x => x.elementId === el.elementId ? applyToElement(x, { startTime: Math.round(newStart * 10) / 10 }, varMode) : x));
                                                                             };
                                                                             const onUp = () => {
                                                                                 setTimelineSnapLines([]);
@@ -1822,8 +2024,8 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                             const track = target?.parentElement;
                                                                             if (!track) return;
                                                                             const startX = e.clientX;
-                                                                            const origStart = el.startTime;
-                                                                            const origDur = el.duration;
+                                                                            const origStart = effectiveEl.startTime;
+                                                                            const origDur = effectiveEl.duration;
 
                                                                             (e.target as HTMLElement).setPointerCapture(e.pointerId);
 
@@ -1836,22 +2038,26 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                                     let newStart = Math.max(0, origStart + dTime);
                                                                                     let newDur = origDur - (newStart - origStart);
 
-
-
                                                                                     if (newDur < 0.5) { newStart = origStart + origDur - 0.5; newDur = 0.5; }
                                                                                     const snapped = snapValue(newStart);
                                                                                     if (snapped !== newStart) { newDur += (newStart - snapped); newStart = snapped; setTimelineSnapLines([snapped]); } else { setTimelineSnapLines([]); }
 
-                                                                                    if (el.collectionType === 'video' || el.collectionType === 'audio') {
-                                                                                        const variantModeToUse = selectedElementId === el.elementId ? inspectorVariantMode : 'all';
-                                                                                        const maxAllowedDur = getMediaDurationLimit(el, variantModeToUse, collections, TOTAL_DURATION);
+                                                                                    if (isMediaEl) {
+                                                                                        const maxAllowedDur = getMediaDurationLimit(el, activeVariantMode, collections, TOTAL_DURATION);
                                                                                         if (newDur > maxAllowedDur) {
                                                                                             newDur = maxAllowedDur;
                                                                                             newStart = origStart + origDur - newDur;
                                                                                         }
                                                                                     }
 
-                                                                                    setElements(prev => prev.map(x => x.elementId === el.elementId ? applyToElement(x, { startTime: Math.round(newStart * 10) / 10, duration: Math.round(newDur * 10) / 10 }, x.elementId === selectedElementId ? inspectorVariantMode : 'all') : x));
+                                                                                    const varMode = getVariantMode(el.elementId);
+                                                                                    const updates: Partial<CanvasElement> = { startTime: Math.round(newStart * 10) / 10, duration: Math.round(newDur * 10) / 10 };
+                                                                                    // Adjust mediaOffset when trimming left edge of media
+                                                                                    if (isMediaEl) {
+                                                                                        const startDelta = newStart - origStart;
+                                                                                        updates.mediaOffset = Math.max(0, Math.round(((effectiveEl.mediaOffset ?? 0) + startDelta) * 10) / 10);
+                                                                                    }
+                                                                                    setElements(prev => prev.map(x => x.elementId === el.elementId ? applyToElement(x, updates, varMode) : x));
                                                                                 } else {
                                                                                     let newDur = Math.max(0.5, Math.min(TOTAL - origStart, origDur + dTime));
 
@@ -1859,13 +2065,13 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                                     if (snappedEnd !== origStart + newDur) { newDur = snappedEnd - origStart; setTimelineSnapLines([snappedEnd]); } else { setTimelineSnapLines([]); }
                                                                                     newDur = Math.max(0.5, newDur);
 
-                                                                                    if (el.collectionType === 'video' || el.collectionType === 'audio') {
-                                                                                        const variantModeToUse = selectedElementId === el.elementId ? inspectorVariantMode : 'all';
-                                                                                        const maxAllowedDur = getMediaDurationLimit(el, variantModeToUse, collections, TOTAL_DURATION);
+                                                                                    if (isMediaEl) {
+                                                                                        const maxAllowedDur = getMediaDurationLimit(el, activeVariantMode, collections, TOTAL_DURATION);
                                                                                         newDur = Math.min(newDur, maxAllowedDur);
                                                                                     }
 
-                                                                                    setElements(prev => prev.map(x => x.elementId === el.elementId ? applyToElement(x, { duration: Math.round(newDur * 10) / 10 }, x.elementId === selectedElementId ? inspectorVariantMode : 'all') : x));
+                                                                                    const varMode = getVariantMode(el.elementId);
+                                                                                    setElements(prev => prev.map(x => x.elementId === el.elementId ? applyToElement(x, { duration: Math.round(newDur * 10) / 10 }, varMode) : x));
                                                                                 }
                                                                             };
                                                                             const onUp = () => {
@@ -1880,7 +2086,8 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                         const colors = COLLECTION_COLORS[el.collectionType];
                                                                         const isSelected = selectedElementId === el.elementId;
                                                                         const col = collections.find(c => c.id === el.collectionId);
-                                                                        const editingVariantStr = isSelected && inspectorVariantMode !== 'all' ? col?.items.find(v => v.id === inspectorVariantMode)?.label : null;
+                                                                        const elVarMode = getVariantMode(el.elementId);
+                                                                        const editingVariantStr = elVarMode !== 'all' ? col?.items.find(v => v.id === elVarMode)?.label : null;
                                                                         const displayText = editingVariantStr ? `${el.title} [${editingVariantStr}]` : el.title;
 
                                                                         return (
@@ -1888,12 +2095,16 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                                 <div
                                                                                     className={cn(
                                                                                         "absolute top-0 bottom-0 rounded flex items-center shrink-0 min-w-[20px] transition-colors",
-                                                                                        timelineTool === 'split' ? "" : "cursor-grab active:cursor-grabbing",
-                                                                                        selectedElementId === el.elementId ? 'bg-blue-600 border border-blue-400' : 'bg-blue-900 border border-transparent hover:bg-blue-800'
+                                                                                        isMediaAllMode
+                                                                                            ? "cursor-pointer"
+                                                                                            : (timelineTool === 'split' ? "" : "cursor-grab active:cursor-grabbing"),
+                                                                                        isMediaAllMode
+                                                                                            ? (selectedElementId === el.elementId ? 'bg-gray-600/60 border border-gray-400/50' : 'bg-gray-700/40 border border-transparent hover:bg-gray-600/40')
+                                                                                            : (selectedElementId === el.elementId ? 'bg-blue-600 border border-blue-400' : 'bg-blue-900 border border-transparent hover:bg-blue-800')
                                                                                     )}
                                                                                     style={{
-                                                                                        left: `${(el.startTime / TOTAL) * 100}%`,
-                                                                                        width: `${(el.duration / TOTAL) * 100}%`,
+                                                                                        left: `${(effectiveEl.startTime / TOTAL) * 100}%`,
+                                                                                        width: `${(effectiveEl.duration / TOTAL) * 100}%`,
                                                                                         cursor: timelineTool === 'split' ? `url('data:image/svg+xml;utf8,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><line x1="20" y1="4" x2="8.12" y2="15.88"/><line x1="14.47" y1="14.48" x2="20" y2="20"/><line x1="8.12" y1="8.12" x2="12" y2="12"/></svg>')}') 12 12, crosshair` : undefined
                                                                                     }}
                                                                                     onClick={(e) => {
@@ -1904,6 +2115,11 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                                     }}
                                                                                     onPointerDown={(e) => {
                                                                                         e.stopPropagation();
+                                                                                        // In 'all' mode for media, only allow click-to-select, no drag
+                                                                                        if (isMediaAllMode) {
+                                                                                            setSelectedElementId(el.elementId);
+                                                                                            return;
+                                                                                        }
                                                                                         if (timelineTool === 'split') {
                                                                                             const track = e.currentTarget.parentElement;
                                                                                             if (!track) return;
@@ -1922,7 +2138,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                                             const trackRect = track.getBoundingClientRect();
                                                                                             const px = e.clientX - trackRect.left;
                                                                                             const hoverTime = (px / trackRect.width) * TOTAL;
-                                                                                            if (hoverTime > el.startTime + 0.1 && hoverTime < el.startTime + el.duration - 0.1) {
+                                                                                            if (hoverTime > effectiveEl.startTime + 0.1 && hoverTime < effectiveEl.startTime + effectiveEl.duration - 0.1) {
                                                                                                 setSplitHoverPosition({ elementId: el.elementId, time: hoverTime, relativePx: px });
                                                                                             } else {
                                                                                                 setSplitHoverPosition(null);
@@ -1935,24 +2151,38 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                                         }
                                                                                     }}
                                                                                 >
-                                                                                    {/* Left resize handle */}
-                                                                                    <div
-                                                                                        className={cn("absolute left-0 top-0 bottom-0 w-2 hover:bg-white/30 z-10", timelineTool === 'split' ? "pointer-events-none" : "cursor-ew-resize")}
-                                                                                        onPointerDown={(e) => {
-                                                                                            if (timelineTool === 'split') return;
-                                                                                            handleEdgeDrag('left', e);
-                                                                                        }}
-                                                                                    />
+                                                                                    {/* Left resize handle — hidden in 'all' mode for media */}
+                                                                                    {!isMediaAllMode && (
+                                                                                        <div
+                                                                                            className={cn("absolute left-0 top-0 bottom-0 w-2 hover:bg-white/30 z-10", timelineTool === 'split' ? "pointer-events-none" : "cursor-ew-resize")}
+                                                                                            onPointerDown={(e) => {
+                                                                                                if (timelineTool === 'split') return;
+                                                                                                handleEdgeDrag('left', e);
+                                                                                            }}
+                                                                                        />
+                                                                                    )}
+                                                                                    {/* Waveform visualization for audio/video */}
+                                                                                    {(el.collectionType === 'audio' || el.collectionType === 'video') && (
+                                                                                        <TimelineWaveform
+                                                                                            elementId={el.elementId}
+                                                                                            collectionType={el.collectionType}
+                                                                                            segPxWidth={Math.round((effectiveEl.duration / TOTAL) * Math.max(100, TOTAL_DURATION * 20))}
+                                                                                        />
+                                                                                    )}
                                                                                     {/* Content */}
-                                                                                    <span className="text-[9px] font-mono text-white/90 truncate px-2 select-none z-0 pointer-events-none">{displayText}</span>
-                                                                                    {/* Right resize handle */}
-                                                                                    <div
-                                                                                        className={cn("absolute right-0 top-0 bottom-0 w-2 hover:bg-white/30 z-10", timelineTool === 'split' ? "pointer-events-none" : "cursor-ew-resize")}
-                                                                                        onPointerDown={(e) => {
-                                                                                            if (timelineTool === 'split') return;
-                                                                                            handleEdgeDrag('right', e);
-                                                                                        }}
-                                                                                    />
+                                                                                    <span className="text-[9px] font-mono text-white/90 truncate px-2 select-none z-[1] pointer-events-none relative">
+                                                                                        {isMediaAllMode ? `${displayText} ⬦` : displayText}
+                                                                                    </span>
+                                                                                    {/* Right resize handle — hidden in 'all' mode for media */}
+                                                                                    {!isMediaAllMode && (
+                                                                                        <div
+                                                                                            className={cn("absolute right-0 top-0 bottom-0 w-2 hover:bg-white/30 z-10", timelineTool === 'split' ? "pointer-events-none" : "cursor-ew-resize")}
+                                                                                            onPointerDown={(e) => {
+                                                                                                if (timelineTool === 'split') return;
+                                                                                                handleEdgeDrag('right', e);
+                                                                                            }}
+                                                                                        />
+                                                                                    )}
                                                                                 </div>
 
                                                                                 {/* Split Hover Indicator */}
@@ -2007,6 +2237,13 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                             >
                                                 {selectedElement.visible !== false ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
                                             </button>
+                                            <button
+                                                onClick={() => setInspectorLocked(!inspectorLocked)}
+                                                className={cn("p-1.5 rounded-md transition-colors", inspectorLocked ? "bg-amber-500/20 text-amber-500 hover:bg-amber-500/30" : "bg-white/5 text-white/50 hover:bg-white/10 hover:text-white")}
+                                                title={inspectorLocked ? "Unlock Selection" : "Lock Selection"}
+                                            >
+                                                {inspectorLocked ? <Lock className="w-3.5 h-3.5" /> : <Unlock className="w-3.5 h-3.5" />}
+                                            </button>
                                             <button onClick={removeSelected} className="p-1.5 bg-red-500/10 text-red-500 rounded-md hover:bg-red-500/20 transition-colors" title="Delete">
                                                 <X className="w-4 h-4" />
                                             </button>
@@ -2029,24 +2266,26 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                     <span className="text-cyan-400/60">({variants.length})</span>
                                                 </h4>
                                                 <div className="flex flex-wrap gap-1">
-                                                    <button
-                                                        onClick={() => setInspectorVariantMode('all')}
-                                                        className={cn("px-2.5 py-1.5 rounded-md text-[9px] font-mono font-bold uppercase tracking-wide transition-all border", inspectorVariantMode === 'all' ? "bg-cyan-500/20 border-cyan-500/40 text-cyan-300 shadow-[0_0_8px_rgba(6,182,212,0.15)]" : "bg-white/5 border-white/5 text-gray-500 hover:text-gray-300 hover:bg-white/10")}
-                                                    >
-                                                        ✦ All
-                                                    </button>
+                                                    {variants.length > 1 && (
+                                                        <button
+                                                            onClick={() => setVariantMode(selectedElement.elementId, 'all')}
+                                                            className={cn("px-2.5 py-1.5 rounded-md text-[9px] font-mono font-bold uppercase tracking-wide transition-all border", selectedVariantMode === 'all' ? "bg-cyan-500/20 border-cyan-500/40 text-cyan-300 shadow-[0_0_8px_rgba(6,182,212,0.15)]" : "bg-white/5 border-white/5 text-gray-500 hover:text-gray-300 hover:bg-white/10")}
+                                                        >
+                                                            ✦ All
+                                                        </button>
+                                                    )}
                                                     {variants.map(v => (
                                                         <button
                                                             key={v.id}
-                                                            onClick={() => setInspectorVariantMode(v.id)}
-                                                            className={cn("px-2.5 py-1.5 rounded-md text-[9px] font-mono transition-all border truncate max-w-[100px]", inspectorVariantMode === v.id ? "bg-blue-500/20 border-blue-500/40 text-blue-300 shadow-[0_0_8px_rgba(59,130,246,0.15)]" : "bg-white/5 border-white/5 text-gray-500 hover:text-gray-300 hover:bg-white/10")}
+                                                            onClick={() => setVariantMode(selectedElement.elementId, v.id)}
+                                                            className={cn("px-2.5 py-1.5 rounded-md text-[9px] font-mono transition-all border truncate max-w-[100px]", selectedVariantMode === v.id ? "bg-blue-500/20 border-blue-500/40 text-blue-300 shadow-[0_0_8px_rgba(59,130,246,0.15)]" : "bg-white/5 border-white/5 text-gray-500 hover:text-gray-300 hover:bg-white/10")}
                                                             title={v.label}
                                                         >
                                                             {v.label}
                                                         </button>
                                                     ))}
                                                 </div>
-                                                {inspectorVariantMode !== 'all' && (
+                                                {selectedVariantMode !== 'all' && (
                                                     <p className="text-[8px] font-mono text-blue-400/50">Changes only apply to this variant</p>
                                                 )}
                                             </div>
@@ -2132,9 +2371,9 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                     </div>
 
                                     {/* Text Content — only for text elements when a specific variant is selected */}
-                                    {selectedElement.collectionType === 'text' && inspectorVariantMode !== 'all' && (() => {
+                                    {selectedElement.collectionType === 'text' && selectedVariantMode !== 'all' && (() => {
                                         const col = collections.find(c => c.id === selectedElement.collectionId);
-                                        const variant = col?.items.find(v => v.id === inspectorVariantMode);
+                                        const variant = col?.items.find(v => v.id === selectedVariantMode);
                                         if (!variant || !col) return null;
                                         return (
                                             <div className="space-y-3 pt-4 border-t border-white/5">
