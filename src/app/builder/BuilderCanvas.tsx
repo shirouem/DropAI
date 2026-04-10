@@ -5,9 +5,11 @@ import { motion, AnimatePresence } from "framer-motion";
 import {
     Play, Pause, Plus, Image as ImageIcon, Music, Download, Upload,
     Layers, X, Type, MonitorPlay, SlidersHorizontal, GripVertical, Shuffle, SkipBack, Video, Trash2, Sparkles, ChevronDown, Eye, EyeOff,
-    Bold, Italic, Underline, AlignLeft, AlignCenter, AlignRight, Scissors, MousePointer2, Settings, Lock, Unlock
+    Bold, Italic, Underline, AlignLeft, AlignCenter, AlignRight, Scissors, MousePointer2, Settings, Lock, Unlock,
+    Film, Loader2, CheckCircle2, AlertCircle, Clapperboard
 } from "lucide-react";
 import Link from "next/link";
+import { renderComposition, type RenderProgress, type RenderElement } from "./renderer";
 import {
     DndContext,
     useSensor,
@@ -112,6 +114,7 @@ interface CanvasElement {
     sourceElementId?: string;
     volume?: number; // Volume from 0 to 1
     mediaOffset?: number; // Offset into source media file (seconds), used after splitting
+    syncWith?: { targetId: string; edge: 'start' | 'end' } | null;
 }
 
 // --- Collection Type Styling ---
@@ -638,6 +641,68 @@ function evaluateAnimations(el: CanvasElement, currentTime: number): AnimatedSty
     return result;
 }
 
+export function resolveElementTimings(
+    elements: CanvasElement[],
+    getVariantMode: (elId: string) => string
+): Map<string, { startTime: number, duration: number }> {
+    const timings = new Map<string, { startTime: number, duration: number }>();
+    const visited = new Set<string>();
+
+    const resolve = (elId: string): { startTime: number, duration: number } => {
+        if (timings.has(elId)) return timings.get(elId)!;
+        const el = elements.find(e => e.elementId === elId);
+        if (!el) {
+            const fallback = { startTime: 0, duration: 0 };
+            timings.set(elId, fallback);
+            return fallback;
+        }
+        if (visited.has(elId)) {
+            // Cycle detected, use base times
+            const fallback = { startTime: el.startTime, duration: el.duration };
+            timings.set(elId, fallback);
+            return fallback;
+        }
+        visited.add(elId);
+
+        const varMode = getVariantMode(elId);
+        let baseTime = el.startTime;
+        let baseDur = el.duration;
+        const isMedia = el.collectionType === 'video' || el.collectionType === 'audio';
+
+        if (isMedia && el.variantOverrides) {
+            if (varMode !== 'all' && el.variantOverrides[varMode]) {
+                // Specific variant selected — use that variant's timing overrides
+                if (el.variantOverrides[varMode].startTime !== undefined) baseTime = el.variantOverrides[varMode].startTime;
+                if (el.variantOverrides[varMode].duration !== undefined) baseDur = el.variantOverrides[varMode].duration;
+            } else if (varMode === 'all') {
+                // In 'all' mode, use the base element's startTime as the canonical position.
+                // Only pick up the max duration across variants for the placeholder width.
+                let maxDur = el.duration;
+                for (const override of Object.values(el.variantOverrides)) {
+                    if (override.duration !== undefined && override.duration > maxDur) maxDur = override.duration;
+                }
+                // baseTime stays as el.startTime (already set above)
+                baseDur = maxDur;
+            }
+        }
+
+        // syncWith overrides the start time regardless of variant mode
+        if (el.syncWith) {
+            const tgt = resolve(el.syncWith.targetId);
+            baseTime = el.syncWith.edge === 'end' ? tgt.startTime + tgt.duration : tgt.startTime;
+        }
+
+        const res = { startTime: baseTime, duration: baseDur };
+        timings.set(elId, res);
+        return res;
+    };
+
+    for (const el of elements) {
+        resolve(el.elementId);
+    }
+    return timings;
+}
+
 // Helper to safely get the media duration bound for an element, respecting variant overrides
 function getMediaDurationLimit(el: CanvasElement, variantMode: string, collections: CollectionItem[], fallbackDuration: number) {
     const col = collections.find(c => c.id === el.collectionId);
@@ -670,6 +735,16 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     const [inspectorLocked, setInspectorLocked] = useState(false);
     const [saving, setSaving] = useState(false);
     const [fetching, setFetching] = useState(false);
+
+    // --- Export / Render state ---
+    const [isExportModalOpen, setIsExportModalOpen] = useState(false);
+    const [renderProgress, setRenderProgress] = useState<RenderProgress | null>(null);
+    const renderAbortRef = useRef<AbortController | null>(null);
+    const [exportSettings, setExportSettings] = useState({
+        resolution: '1080x1920' as '1080x1920' | '720x1280' | '540x960',
+        fps: 30 as 24 | 30 | 60,
+        bitrate: 8 as 4 | 8 | 16,
+    });
 
     // Helper: get the variant mode for an element, auto-selecting single variants
     const getVariantMode = useCallback((elementId: string): string => {
@@ -779,6 +854,20 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         });
         return variants;
     }, [elements, collections, variantSeed]);
+
+    const activeVariantModes = useMemo(() => {
+        const modes: Record<string, string> = {};
+        for (const el of elements) {
+            modes[el.elementId] = centerView === 'preview'
+                ? (previewVariants[el.elementId]?.id || 'all')
+                : getVariantMode(el.elementId);
+        }
+        return modes;
+    }, [elements, centerView, previewVariants, getVariantMode]);
+
+    const elementTimings = useMemo(() => {
+        return resolveElementTimings(elements, elId => activeVariantModes[elId] || 'all');
+    }, [elements, activeVariantModes]);
 
     const randomizeVariants = useCallback(() => {
         setVariantSeed(s => s + 1);
@@ -910,19 +999,38 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         const isMedia = el.collectionType === 'video' || el.collectionType === 'audio';
 
         if (variantMode === 'all') {
-            // For audio/video elements, preserve per-variant startTime/duration overrides
+            // Track whether caller wants to clear syncWith (null = clear, object = set, absent = don't touch)
+            const shouldClearSyncWith = 'syncWith' in updates && updates.syncWith === null;
+            const shouldSetSyncWith = 'syncWith' in updates && updates.syncWith !== null && updates.syncWith !== undefined;
+            const isUpdatingStart = 'startTime' in updates || 'syncWith' in updates;
+
+            // Build safeUpdates without syncWith — we handle it manually below
+            const { syncWith: _sw, ...restUpdates } = updates as any;
+            const safeUpdates: Partial<CanvasElement> = restUpdates;
+
+            if (shouldSetSyncWith) {
+                (safeUpdates as any).syncWith = updates.syncWith;
+            }
+
             if (isMedia && el.variantOverrides) {
                 const preservedOverrides: Record<string, Partial<CanvasElement>> = {};
                 for (const [vid, overrides] of Object.entries(el.variantOverrides)) {
                     const timingOnly: Partial<CanvasElement> = {};
-                    if (overrides.startTime !== undefined) timingOnly.startTime = overrides.startTime;
+                    // When dragging in ALL mode (isUpdatingStart=true), DON'T preserve per-variant startTime.
+                    // This ensures dragging the ALL placeholder actually moves all variants.
+                    if (!isUpdatingStart && overrides.startTime !== undefined) timingOnly.startTime = overrides.startTime;
                     if (overrides.duration !== undefined) timingOnly.duration = overrides.duration;
                     if ((overrides as any).mediaOffset !== undefined) (timingOnly as any).mediaOffset = (overrides as any).mediaOffset;
                     if (Object.keys(timingOnly).length > 0) preservedOverrides[vid] = timingOnly;
                 }
-                return { ...el, ...updates, variantOverrides: preservedOverrides };
+                const newEl = { ...el, ...safeUpdates, variantOverrides: preservedOverrides };
+                // Always delete syncWith when clearing — el.syncWith bleeds through the spread otherwise
+                if (shouldClearSyncWith) delete (newEl as any).syncWith;
+                return newEl;
             }
-            return { ...el, ...updates, variantOverrides: {} };
+            const newEl = { ...el, ...safeUpdates, variantOverrides: {} };
+            if (shouldClearSyncWith) delete (newEl as any).syncWith;
+            return newEl;
         } else if (isMedia) {
             // For media elements with a specific variant, store timing in overrides
             const existing = el.variantOverrides?.[variantMode] || {};
@@ -1283,9 +1391,13 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
 
     // The element as seen in the inspector (with current variant overrides applied)
     const selectedVariantMode = selectedElementId ? getVariantMode(selectedElementId) : 'all';
-    const effectiveElement = selectedElement && selectedVariantMode !== 'all'
+    let effectiveElement = selectedElement && selectedVariantMode !== 'all'
         ? getEffectiveElement(selectedElement, selectedVariantMode)
         : selectedElement;
+    if (effectiveElement && selectedElementId) {
+        const timing = elementTimings.get(selectedElementId);
+        if (timing) effectiveElement = { ...effectiveElement, ...timing };
+    }
 
     const updateSelected = (updates: Partial<CanvasElement>) => {
         if (!selectedElementId) return;
@@ -1307,6 +1419,91 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         setElements(prev => prev.filter(el => el.elementId !== selectedElementId));
         setSelectedElementId(null);
     };
+
+    // --- Build a flat RenderJob from current state ---
+    const buildRenderJob = useCallback(() => {
+        const [rw, rh] = exportSettings.resolution.split('x').map(Number);
+
+        const renderEls: RenderElement[] = elements.map(el => {
+            const timingEntry = elementTimings.get(el.elementId) ?? { startTime: el.startTime, duration: el.duration };
+            const col = collections.find(c => c.id === el.collectionId);
+            const chosenVariant = previewVariants[el.elementId];
+
+            // Resolve actual content/URL from selected variant
+            let mediaUrl: string | undefined;
+            let content: string | undefined;
+            if (chosenVariant) {
+                if (el.collectionType === 'text') {
+                    content = chosenVariant.value;
+                } else {
+                    mediaUrl = chosenVariant.value;
+                }
+            } else if (el.collectionType === 'text') {
+                content = el.content;
+            } else {
+                content = el.content;
+            }
+
+            // Per-variant override for media (duration/offset)
+            const variantId = chosenVariant?.id;
+            const variantOverride = variantId && el.variantOverrides?.[variantId];
+
+            const startTime = timingEntry.startTime;
+            const duration = variantOverride?.duration ?? timingEntry.duration;
+            const mediaOffset = (variantOverride as any)?.mediaOffset ?? el.mediaOffset ?? 0;
+
+            return {
+                elementId: el.elementId,
+                collectionType: el.collectionType,
+                startTime,
+                duration,
+                x: (el.x / 1080) * 100,     // canvas coords → percent
+                y: (el.y / 1920) * 100,
+                width: (el.width / 1080) * 100,
+                height: (el.height / 1920) * 100,
+                rotation: el.rotation,
+                opacity: el.opacity,
+                content,
+                mediaUrl,
+                mediaOffset,
+                volume: el.volume ?? 1,
+                zIndex: el.zIndex,
+                fontSize: el.fontSize,
+                fontWeight: el.fontWeight,
+                fontStyle: el.fontStyle,
+                textDecoration: el.textDecoration,
+                letterSpacing: el.letterSpacing,
+                lineHeight: el.lineHeight,
+                textAlign: el.textAlign,
+                animations: el.animations ?? [],
+            } satisfies RenderElement;
+        });
+
+        return {
+            elements: renderEls,
+            totalDuration: TOTAL_DURATION,
+            width: rw,
+            height: rh,
+            fps: exportSettings.fps,
+            videoBitsPerSecond: exportSettings.bitrate * 1_000_000,
+        };
+    }, [elements, collections, previewVariants, elementTimings, exportSettings, TOTAL_DURATION]);
+
+    const startRender = useCallback(async () => {
+        const job = buildRenderJob();
+        const abortCtrl = new AbortController();
+        renderAbortRef.current = abortCtrl;
+        setRenderProgress({ phase: 'preparing', progress: 0, message: 'Starting…' });
+        try {
+            await renderComposition(job, setRenderProgress, abortCtrl.signal);
+        } catch (e: any) {
+            setRenderProgress({ phase: 'error', progress: 0, message: 'Render failed', error: e?.message ?? String(e) });
+        }
+    }, [buildRenderJob]);
+
+    const cancelRender = useCallback(() => {
+        renderAbortRef.current?.abort();
+    }, []);
 
     const saveSkeleton = async () => {
         setSaving(true);
@@ -1388,14 +1585,14 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                 )}
                             </AnimatePresence>
                         </div>
-                        <button title="Export Video" className="p-1.5 px-2 bg-white/5 hover:bg-white/10 border border-white/10 text-gray-300 hover:text-white rounded-md transition-colors flex items-center justify-center">
-                            <Download className="w-4 h-4" />
-                        </button>
                         <button onClick={saveSkeleton} disabled={saving} className="px-4 py-1.5 bg-[#111] hover:bg-[#222] border border-white/5 disabled:opacity-50 text-gray-300 hover:text-white text-xs font-semibold rounded-md transition-colors">
                             {saving ? "Saving..." : "Save Changes"}
                         </button>
-                        <button className="px-4 py-1.5 bg-white hover:bg-gray-200 text-black text-xs font-semibold rounded-md transition-colors flex items-center gap-2">
-                            <MonitorPlay className="w-4 h-4" /> Render
+                        <button
+                            onClick={() => { setIsExportModalOpen(true); setRenderProgress(null); }}
+                            className="px-4 py-1.5 bg-white hover:bg-gray-200 text-black text-xs font-semibold rounded-md transition-colors flex items-center gap-2"
+                        >
+                            <Clapperboard className="w-4 h-4" /> Export
                         </button>
                     </div>
                 </nav>
@@ -1636,7 +1833,9 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                     } else {
                                                         variant = previewVariants[baseEl.elementId];
                                                     }
-                                                    const el = variant ? getEffectiveElement(baseEl, variant.id) : baseEl;
+                                                    const overrides = variant ? getEffectiveElement(baseEl, variant.id) : baseEl;
+                                                    const timing = elementTimings.get(baseEl.elementId) || { startTime: baseEl.startTime, duration: baseEl.duration };
+                                                    const el = { ...overrides, ...timing };
                                                     return { el, variant };
                                                 })
                                                 .filter(({ el }) => (el.visible !== false) && el.collectionType !== 'audio')
@@ -1746,7 +1945,9 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                     } else {
                                                         variant = previewVariants[baseEl.elementId];
                                                     }
-                                                    const el = variant ? getEffectiveElement(baseEl, variant.id) : baseEl;
+                                                    const overrides = variant ? getEffectiveElement(baseEl, variant.id) : baseEl;
+                                                    const timing = elementTimings.get(baseEl.elementId) || { startTime: baseEl.startTime, duration: baseEl.duration };
+                                                    const el = { ...overrides, ...timing };
                                                     const isActive = currentTime >= el.startTime && currentTime < el.startTime + el.duration;
                                                     return (
                                                         <audio
@@ -1948,35 +2149,35 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                         const isMediaAllMode = isMediaEl && activeVariantMode === 'all';
 
                                                                         // Compute effectiveEl for display:
-                                                                        // - Specific variant: merge that variant's overrides
-                                                                        // - "All" mode for media: use max variant duration as fixed placeholder
-                                                                        // - Non-media: use base element
+                                                                        const timing = elementTimings.get(el.elementId) || { startTime: el.startTime, duration: el.duration };
                                                                         let effectiveEl = el;
+                                                                        
                                                                         if (isMediaEl && el.variantOverrides) {
                                                                             if (activeVariantMode !== 'all' && el.variantOverrides[activeVariantMode]) {
-                                                                                effectiveEl = { ...el, ...el.variantOverrides[activeVariantMode] } as CanvasElement;
+                                                                                effectiveEl = { ...el, ...el.variantOverrides[activeVariantMode], ...timing } as CanvasElement;
                                                                             } else {
-                                                                                // In 'all' mode, show max duration across all variants as placeholder
-                                                                                let maxDur = el.duration;
-                                                                                let placeholderStart = el.startTime;
-                                                                                for (const override of Object.values(el.variantOverrides)) {
-                                                                                    if (override.duration !== undefined && override.duration > maxDur) maxDur = override.duration;
-                                                                                    if (override.startTime !== undefined) placeholderStart = override.startTime;
-                                                                                }
-                                                                                effectiveEl = { ...el, startTime: placeholderStart, duration: maxDur } as CanvasElement;
+                                                                                effectiveEl = { ...el, ...timing } as CanvasElement;
                                                                             }
+                                                                        } else {
+                                                                            effectiveEl = { ...el, ...timing } as CanvasElement;
                                                                         }
 
                                                                         // Collect snap points from OTHER elements
                                                                         const snapPoints = elements
                                                                             .filter(o => o.elementId !== el.elementId)
-                                                                            .flatMap(o => [o.startTime, o.startTime + o.duration]);
+                                                                            .flatMap(o => {
+                                                                                const t = elementTimings.get(o.elementId) || { startTime: o.startTime, duration: o.duration };
+                                                                                return [
+                                                                                    { val: t.startTime, targetId: o.elementId, edge: 'start' as const },
+                                                                                    { val: t.startTime + t.duration, targetId: o.elementId, edge: 'end' as const }
+                                                                                ];
+                                                                            });
 
                                                                         const snapValue = (val: number) => {
                                                                             for (const sp of snapPoints) {
-                                                                                if (Math.abs(val - sp) < SNAP_THRESHOLD) return sp;
+                                                                                if (Math.abs(val - sp.val) < SNAP_THRESHOLD) return sp;
                                                                             }
-                                                                            return val;
+                                                                            return null;
                                                                         };
 
                                                                         const handleSegmentDrag = (e: React.PointerEvent) => {
@@ -1986,10 +2187,23 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                             const track = target?.parentElement;
                                                                             if (!track) return;
                                                                             const startX = e.clientX;
-                                                                            const origStart = effectiveEl.startTime;
+                                                                            const origStart = effectiveEl.startTime; // resolved position at drag start
                                                                             const dur = effectiveEl.duration;
+                                                                            const varMode = getVariantMode(el.elementId);
 
                                                                             (e.target as HTMLElement).setPointerCapture(e.pointerId);
+
+                                                                            // STEP 1: At drag start, break any existing syncWith constraint.
+                                                                            // Set startTime to the current resolved position so the clip stays in place visually.
+                                                                            // This ensures the element is free to move independently during the drag.
+                                                                            setElements(prev => prev.map(x => x.elementId === el.elementId
+                                                                                ? applyToElement(x, { startTime: origStart, syncWith: null }, varMode)
+                                                                                : x));
+
+                                                                            // Track where we'll snap to — stored in a closure variable, NOT state.
+                                                                            // Writing to state every frame causes elementTimings to recompute,
+                                                                            // which creates oscillation between snapped/unsnapped mid-drag.
+                                                                            let pendingSnapTarget: { targetId: string, edge: 'start' | 'end' } | null = null;
 
                                                                             const onMove = (ev: PointerEvent) => {
                                                                                 const trackRect = track.getBoundingClientRect();
@@ -1997,19 +2211,40 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                                 const dTime = (dx / trackRect.width) * TOTAL;
                                                                                 let newStart = Math.max(0, Math.min(TOTAL - dur, origStart + dTime));
                                                                                 const activeSnaps: number[] = [];
-                                                                                // Snap start edge
-                                                                                const snappedStart = snapValue(newStart);
-                                                                                if (snappedStart !== newStart) { newStart = snappedStart; activeSnaps.push(snappedStart); }
-                                                                                // Snap end edge
-                                                                                const snappedEnd = snapValue(newStart + dur);
-                                                                                if (snappedEnd !== newStart + dur) { newStart = snappedEnd - dur; activeSnaps.push(snappedEnd); }
+
+                                                                                pendingSnapTarget = null;
+                                                                                const startSnap = snapValue(newStart);
+                                                                                if (startSnap) {
+                                                                                    newStart = startSnap.val;
+                                                                                    activeSnaps.push(startSnap.val);
+                                                                                    pendingSnapTarget = { targetId: startSnap.targetId, edge: startSnap.edge };
+                                                                                } else {
+                                                                                    const endSnap = snapValue(newStart + dur);
+                                                                                    if (endSnap) {
+                                                                                        newStart = endSnap.val - dur;
+                                                                                        activeSnaps.push(endSnap.val);
+                                                                                        // End-edge snap: no syncWith (we only create syncWith for start-edge snaps)
+                                                                                    }
+                                                                                }
+
                                                                                 newStart = Math.max(0, Math.min(TOTAL - dur, newStart));
                                                                                 setTimelineSnapLines(activeSnaps);
-                                                                                const varMode = getVariantMode(el.elementId);
-                                                                                setElements(prev => prev.map(x => x.elementId === el.elementId ? applyToElement(x, { startTime: Math.round(newStart * 10) / 10 }, varMode) : x));
+
+                                                                                // ONLY update startTime during drag — no syncWith changes.
+                                                                                // This prevents elementTimings from recomputing and causing oscillation.
+                                                                                setElements(prev => prev.map(x => x.elementId === el.elementId
+                                                                                    ? applyToElement(x, { startTime: Math.round(newStart * 10) / 10 }, varMode)
+                                                                                    : x));
                                                                             };
                                                                             const onUp = () => {
                                                                                 setTimelineSnapLines([]);
+                                                                                // STEP 3: On release, commit the snap relationship (or leave as absolute).
+                                                                                if (pendingSnapTarget) {
+                                                                                    setElements(prev => prev.map(x => x.elementId === el.elementId
+                                                                                        ? applyToElement(x, { syncWith: pendingSnapTarget }, varMode)
+                                                                                        : x));
+                                                                                }
+                                                                                // If not snapped, syncWith is already null from drag-start — nothing more to do.
                                                                                 window.removeEventListener('pointermove', onMove);
                                                                                 window.removeEventListener('pointerup', onUp);
                                                                             };
@@ -2040,7 +2275,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
 
                                                                                     if (newDur < 0.5) { newStart = origStart + origDur - 0.5; newDur = 0.5; }
                                                                                     const snapped = snapValue(newStart);
-                                                                                    if (snapped !== newStart) { newDur += (newStart - snapped); newStart = snapped; setTimelineSnapLines([snapped]); } else { setTimelineSnapLines([]); }
+                                                                                    if (snapped) { newDur += (newStart - snapped.val); newStart = snapped.val; setTimelineSnapLines([snapped.val]); } else { setTimelineSnapLines([]); }
 
                                                                                     if (isMediaEl) {
                                                                                         const maxAllowedDur = getMediaDurationLimit(el, activeVariantMode, collections, TOTAL_DURATION);
@@ -2051,7 +2286,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                                     }
 
                                                                                     const varMode = getVariantMode(el.elementId);
-                                                                                    const updates: Partial<CanvasElement> = { startTime: Math.round(newStart * 10) / 10, duration: Math.round(newDur * 10) / 10 };
+                                                                                    const updates: Partial<CanvasElement> = { startTime: Math.round(newStart * 10) / 10, duration: Math.round(newDur * 10) / 10, syncWith: null };
                                                                                     // Adjust mediaOffset when trimming left edge of media
                                                                                     if (isMediaEl) {
                                                                                         const startDelta = newStart - origStart;
@@ -2062,7 +2297,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                                     let newDur = Math.max(0.5, Math.min(TOTAL - origStart, origDur + dTime));
 
                                                                                     const snappedEnd = snapValue(origStart + newDur);
-                                                                                    if (snappedEnd !== origStart + newDur) { newDur = snappedEnd - origStart; setTimelineSnapLines([snappedEnd]); } else { setTimelineSnapLines([]); }
+                                                                                    if (snappedEnd) { newDur = snappedEnd.val - origStart; setTimelineSnapLines([snappedEnd.val]); } else { setTimelineSnapLines([]); }
                                                                                     newDur = Math.max(0.5, newDur);
 
                                                                                     if (isMediaEl) {
@@ -2095,9 +2330,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                                 <div
                                                                                     className={cn(
                                                                                         "absolute top-0 bottom-0 rounded flex items-center shrink-0 min-w-[20px] transition-colors",
-                                                                                        isMediaAllMode
-                                                                                            ? "cursor-pointer"
-                                                                                            : (timelineTool === 'split' ? "" : "cursor-grab active:cursor-grabbing"),
+                                                                                        timelineTool === 'split' ? "" : "cursor-grab active:cursor-grabbing",
                                                                                         isMediaAllMode
                                                                                             ? (selectedElementId === el.elementId ? 'bg-gray-600/60 border border-gray-400/50' : 'bg-gray-700/40 border border-transparent hover:bg-gray-600/40')
                                                                                             : (selectedElementId === el.elementId ? 'bg-blue-600 border border-blue-400' : 'bg-blue-900 border border-transparent hover:bg-blue-800')
@@ -2115,11 +2348,12 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                                     }}
                                                                                     onPointerDown={(e) => {
                                                                                         e.stopPropagation();
-                                                                                        // In 'all' mode for media, only allow click-to-select, no drag
+                                                                                        
+                                                                                        // Even in ALL mode we can drag now
                                                                                         if (isMediaAllMode) {
                                                                                             setSelectedElementId(el.elementId);
-                                                                                            return;
                                                                                         }
+
                                                                                         if (timelineTool === 'split') {
                                                                                             const track = e.currentTarget.parentElement;
                                                                                             if (!track) return;
@@ -2642,6 +2876,204 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                     </div>
                 ) : null}
             </DragOverlay>
+
+            {/* ── Export Modal ──────────────────────────────────────────────── */}
+            <AnimatePresence>
+                {isExportModalOpen && (
+                    <motion.div
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        exit={{ opacity: 0 }}
+                        className="fixed inset-0 bg-black/70 backdrop-blur-sm z-[200] flex items-center justify-center p-4"
+                        onClick={e => { if (e.target === e.currentTarget && !renderProgress) setIsExportModalOpen(false); }}
+                    >
+                        <motion.div
+                            initial={{ scale: 0.92, opacity: 0, y: 16 }}
+                            animate={{ scale: 1, opacity: 1, y: 0 }}
+                            exit={{ scale: 0.92, opacity: 0, y: 16 }}
+                            transition={{ type: 'spring', stiffness: 380, damping: 30 }}
+                            className="bg-[#0e0e0e] border border-white/10 rounded-2xl w-full max-w-md shadow-2xl overflow-hidden"
+                        >
+                            {/* Header */}
+                            <div className="flex items-center justify-between px-6 py-4 border-b border-white/8">
+                                <div className="flex items-center gap-2.5">
+                                    <div className="w-8 h-8 rounded-lg bg-white/5 flex items-center justify-center">
+                                        <Film className="w-4 h-4 text-white" />
+                                    </div>
+                                    <div>
+                                        <h2 className="text-sm font-semibold text-white">Export Composition</h2>
+                                        <p className="text-[10px] text-gray-500 font-mono">WebM · VP9 + Opus</p>
+                                    </div>
+                                </div>
+                                {!renderProgress && (
+                                    <button onClick={() => setIsExportModalOpen(false)} className="text-gray-600 hover:text-gray-300 transition-colors">
+                                        <X className="w-4 h-4" />
+                                    </button>
+                                )}
+                            </div>
+
+                            {/* Settings (hidden once render starts) */}
+                            {!renderProgress && (
+                                <div className="px-6 py-5 space-y-4">
+                                    {/* Resolution */}
+                                    <div>
+                                        <label className="text-[10px] font-mono uppercase tracking-widest text-gray-500 mb-2 block">Resolution</label>
+                                        <div className="grid grid-cols-3 gap-2">
+                                            {(['1080x1920', '720x1280', '540x960'] as const).map(r => (
+                                                <button
+                                                    key={r}
+                                                    onClick={() => setExportSettings(s => ({ ...s, resolution: r }))}
+                                                    className={`py-2 rounded-lg text-[10px] font-mono border transition-all ${exportSettings.resolution === r
+                                                        ? 'border-white/30 bg-white/10 text-white'
+                                                        : 'border-white/5 bg-white/3 text-gray-500 hover:text-gray-300 hover:border-white/10'}`}
+                                                >
+                                                    {r.replace('x', ' × ')}
+                                                </button>
+                                            ))}
+                                        </div>
+                                    </div>
+
+                                    {/* FPS */}
+                                    <div>
+                                        <label className="text-[10px] font-mono uppercase tracking-widest text-gray-500 mb-2 block">Frame Rate</label>
+                                        <div className="grid grid-cols-3 gap-2">
+                                            {([24, 30, 60] as const).map(f => (
+                                                <button
+                                                    key={f}
+                                                    onClick={() => setExportSettings(s => ({ ...s, fps: f }))}
+                                                    className={`py-2 rounded-lg text-[10px] font-mono border transition-all ${exportSettings.fps === f
+                                                        ? 'border-white/30 bg-white/10 text-white'
+                                                        : 'border-white/5 bg-white/3 text-gray-500 hover:text-gray-300 hover:border-white/10'}`}
+                                                >
+                                                    {f} fps
+                                                </button>
+                                            ))}
+                                        </div>
+                                    </div>
+
+                                    {/* Bitrate */}
+                                    <div>
+                                        <label className="text-[10px] font-mono uppercase tracking-widest text-gray-500 mb-2 block">Quality</label>
+                                        <div className="grid grid-cols-3 gap-2">
+                                            {([{ v: 4, l: 'Draft · 4M' }, { v: 8, l: 'High · 8M' }, { v: 16, l: 'Ultra · 16M' }] as const).map(({ v, l }) => (
+                                                <button
+                                                    key={v}
+                                                    onClick={() => setExportSettings(s => ({ ...s, bitrate: v }))}
+                                                    className={`py-2 rounded-lg text-[10px] font-mono border transition-all ${exportSettings.bitrate === v
+                                                        ? 'border-white/30 bg-white/10 text-white'
+                                                        : 'border-white/5 bg-white/3 text-gray-500 hover:text-gray-300 hover:border-white/10'}`}
+                                                >
+                                                    {l}
+                                                </button>
+                                            ))}
+                                        </div>
+                                    </div>
+
+                                    {/* Info row */}
+                                    <div className="flex items-center gap-2 bg-amber-500/8 border border-amber-500/15 rounded-lg px-3 py-2.5">
+                                        <AlertCircle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                                        <p className="text-[10px] text-amber-300/80 leading-relaxed">
+                                            Export renders frame-by-frame in your browser. Keep the tab active. Large compositions may take a few minutes.
+                                        </p>
+                                    </div>
+
+                                    {/* Estimates */}
+                                    <div className="flex justify-between text-[10px] font-mono text-gray-600">
+                                        <span>Duration: <span className="text-gray-400">{TOTAL_DURATION}s</span></span>
+                                        <span>Frames: <span className="text-gray-400">{TOTAL_DURATION * exportSettings.fps}</span></span>
+                                        <span>~Size: <span className="text-gray-400">{Math.round(exportSettings.bitrate * TOTAL_DURATION / 8)} MB</span></span>
+                                    </div>
+                                </div>
+                            )}
+
+                            {/* Progress area (shown during render) */}
+                            {renderProgress && (
+                                <div className="px-6 py-5 space-y-4">
+                                    {/* Phase icon + message */}
+                                    <div className="flex items-center gap-3">
+                                        <div className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${
+                                            renderProgress.phase === 'done' ? 'bg-emerald-500/20' :
+                                            renderProgress.phase === 'error' ? 'bg-red-500/20' : 'bg-white/5'
+                                        }`}>
+                                            {renderProgress.phase === 'done' ? (
+                                                <CheckCircle2 className="w-5 h-5 text-emerald-400" />
+                                            ) : renderProgress.phase === 'error' ? (
+                                                <AlertCircle className="w-5 h-5 text-red-400" />
+                                            ) : (
+                                                <Loader2 className="w-5 h-5 text-white animate-spin" />
+                                            )}
+                                        </div>
+                                        <div>
+                                            <p className="text-sm text-white font-medium">
+                                                {renderProgress.phase === 'done' ? 'Export Complete!' :
+                                                 renderProgress.phase === 'error' ? 'Export Failed' :
+                                                 renderProgress.phase === 'preparing' ? 'Preparing…' :
+                                                 renderProgress.phase === 'encoding' ? 'Encoding…' : 'Rendering…'}
+                                            </p>
+                                            <p className="text-[10px] text-gray-500 font-mono mt-0.5 truncate max-w-[280px]">{renderProgress.message}</p>
+                                        </div>
+                                    </div>
+
+                                    {/* Progress bar */}
+                                    <div className="w-full bg-white/5 rounded-full h-1.5 overflow-hidden">
+                                        <motion.div
+                                            className={`h-full rounded-full ${
+                                                renderProgress.phase === 'done' ? 'bg-emerald-500' :
+                                                renderProgress.phase === 'error' ? 'bg-red-500' : 'bg-white'
+                                            }`}
+                                            animate={{ width: `${Math.round(renderProgress.progress * 100)}%` }}
+                                            transition={{ ease: 'linear', duration: 0.2 }}
+                                            style={{ width: '0%' }}
+                                        />
+                                    </div>
+                                    <p className="text-right text-[10px] font-mono text-gray-600">{Math.round(renderProgress.progress * 100)}%</p>
+
+                                    {renderProgress.phase === 'error' && renderProgress.error && (
+                                        <div className="bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">
+                                            <code className="text-[9px] text-red-400 font-mono break-all">{renderProgress.error}</code>
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+
+                            {/* Footer buttons */}
+                            <div className="px-6 pb-5 flex gap-2">
+                                {!renderProgress ? (
+                                    <>
+                                        <button
+                                            onClick={() => setIsExportModalOpen(false)}
+                                            className="flex-1 py-2.5 bg-white/5 hover:bg-white/10 text-gray-400 hover:text-white text-xs font-semibold rounded-xl border border-white/8 transition-colors"
+                                        >
+                                            Cancel
+                                        </button>
+                                        <button
+                                            onClick={startRender}
+                                            className="flex-1 py-2.5 bg-white hover:bg-gray-100 text-black text-xs font-semibold rounded-xl transition-colors flex items-center justify-center gap-2"
+                                        >
+                                            <Clapperboard className="w-3.5 h-3.5" />
+                                            Start Export
+                                        </button>
+                                    </>
+                                ) : renderProgress.phase === 'rendering' || renderProgress.phase === 'preparing' || renderProgress.phase === 'encoding' ? (
+                                    <button
+                                        onClick={cancelRender}
+                                        className="flex-1 py-2.5 bg-red-600/20 hover:bg-red-600/30 text-red-400 text-xs font-semibold rounded-xl border border-red-500/20 transition-colors"
+                                    >
+                                        Cancel Render
+                                    </button>
+                                ) : (
+                                    <button
+                                        onClick={() => { setIsExportModalOpen(false); setRenderProgress(null); }}
+                                        className="flex-1 py-2.5 bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-400 text-xs font-semibold rounded-xl border border-emerald-500/20 transition-colors"
+                                    >
+                                        Close
+                                    </button>
+                                )}
+                            </div>
+                        </motion.div>
+                    </motion.div>
+                )}
+            </AnimatePresence>
         </DndContext >
     );
 }
