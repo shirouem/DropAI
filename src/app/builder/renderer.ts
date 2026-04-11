@@ -111,6 +111,17 @@ function evaluateAnimations(el: RenderElement, currentTime: number): AnimatedSty
                     case 'blurIn': result.blur = 10; result.opacity = 0; break;
                 }
             }
+            if (category === 'in' && localTime > end) {
+                switch (anim.type) {
+                    case 'scaleIn': result.scale = anim.to ?? 1; break;
+                    case 'bounceIn': result.scale = anim.to ?? 1; break;
+                }
+            }
+            if (category === 'out' && localTime < start) {
+                switch (anim.type) {
+                    case 'scaleOut': result.scale = anim.from ?? 1; break;
+                }
+            }
             if (category === 'out' && localTime > end) {
                 switch (anim.type) {
                     case 'fadeOut': result.opacity = 0; break;
