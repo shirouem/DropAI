@@ -9,7 +9,7 @@ import {
     Film, Loader2, CheckCircle2, AlertCircle, Clapperboard
 } from "lucide-react";
 import Link from "next/link";
-import { renderComposition, type RenderProgress, type RenderElement } from "./renderer";
+import { renderComposition, type RenderProgress, type RenderElement, type RenderFormat } from "./renderer";
 import {
     DndContext,
     useSensor,
@@ -744,6 +744,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         resolution: '1080x1920' as '1080x1920' | '720x1280' | '540x960',
         fps: 30 as 24 | 30 | 60,
         bitrate: 8 as 4 | 8 | 16,
+        format: 'mp4' as RenderFormat,
     });
 
     // Helper: get the variant mode for an element, auto-selecting single variants
@@ -1457,10 +1458,10 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 collectionType: el.collectionType,
                 startTime,
                 duration,
-                x: (el.x / 1080) * 100,     // canvas coords → percent
-                y: (el.y / 1920) * 100,
-                width: (el.width / 1080) * 100,
-                height: (el.height / 1920) * 100,
+                x: el.x,         // already 0–100 percent of canvas
+                y: el.y,
+                width: el.width,
+                height: el.height,
                 rotation: el.rotation,
                 opacity: el.opacity,
                 content,
@@ -1486,6 +1487,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             height: rh,
             fps: exportSettings.fps,
             videoBitsPerSecond: exportSettings.bitrate * 1_000_000,
+            format: exportSettings.format,
         };
     }, [elements, collections, previewVariants, elementTimings, exportSettings, TOTAL_DURATION]);
 
@@ -2902,7 +2904,9 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                     </div>
                                     <div>
                                         <h2 className="text-sm font-semibold text-white">Export Composition</h2>
-                                        <p className="text-[10px] text-gray-500 font-mono">WebM · VP9 + Opus</p>
+                                        <p className="text-[10px] text-gray-500 font-mono">
+                                            {exportSettings.format === 'mp4' ? 'MP4 · H.264 + AAC' : 'WebM · VP9 + Opus'}
+                                        </p>
                                     </div>
                                 </div>
                                 {!renderProgress && (
@@ -2915,6 +2919,31 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                             {/* Settings (hidden once render starts) */}
                             {!renderProgress && (
                                 <div className="px-6 py-5 space-y-4">
+                                    {/* Format */}
+                                    <div>
+                                        <label className="text-[10px] font-mono uppercase tracking-widest text-gray-500 mb-2 block">Format</label>
+                                        <div className="grid grid-cols-2 gap-2">
+                                            {([
+                                                { v: 'mp4' as RenderFormat, l: 'MP4', sub: 'H.264 + AAC · Universal' },
+                                                { v: 'webm' as RenderFormat, l: 'WebM', sub: 'VP9 + Opus · Browser' },
+                                            ]).map(({ v, l, sub }) => (
+                                                <button
+                                                    key={v}
+                                                    onClick={() => setExportSettings(s => ({ ...s, format: v }))}
+                                                    className={`py-2.5 px-3 rounded-lg text-left border transition-all ${exportSettings.format === v
+                                                        ? 'border-white/30 bg-white/10 text-white'
+                                                        : 'border-white/5 bg-white/3 text-gray-500 hover:text-gray-300 hover:border-white/10'}`}
+                                                >
+                                                    <div className="text-[11px] font-mono font-semibold">{l}</div>
+                                                    <div className="text-[9px] text-gray-500 mt-0.5">{sub}</div>
+                                                </button>
+                                            ))}
+                                        </div>
+                                        {exportSettings.format === 'mp4' && (
+                                            <p className="text-[9px] text-gray-600 mt-1.5 font-mono">Requires Chrome 94+ · Uses WebCodecs API</p>
+                                        )}
+                                    </div>
+
                                     {/* Resolution */}
                                     <div>
                                         <label className="text-[10px] font-mono uppercase tracking-widest text-gray-500 mb-2 block">Resolution</label>

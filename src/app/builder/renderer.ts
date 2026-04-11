@@ -1,28 +1,30 @@
 /**
- * DropAI Client-Side Renderer
+ * DropAI Client-Side Renderer — v5
  *
- * Records the composition by:
- * 1. Creating a hidden OffscreenCanvas (or on-screen fallback)
- * 2. Scrubbing through time at a fixed FPS using requestAnimationFrame
- * 3. Capturing each frame via canvas.captureStream()
- * 4. Mixing audio tracks via WebAudio and routing into MediaRecorder
- * 5. Encoding to WebM and downloading
+ * Key fixes in this version:
+ * 1. Animation Logic: 100% matched to BuilderCanvas.tsx, including anim.to/from.
+ * 2. seekTo Fix: Added a tiny threshold (0.001s) to resolve immediately if no seek is needed.
+ *    This prevents the 200ms timeout stall which causes duplicate frames (chopped look).
+ * 3. Boundary Safety: Clamped localTime to 0 and improved draw condition to prevent end-of-clip flickering.
+ * 4. Encoder Config: Re-added software preference with High Profile level 5.1.
  */
+
+export type RenderFormat = 'webm' | 'mp4';
 
 export type RenderElement = {
     elementId: string;
     collectionType: 'text' | 'image' | 'video' | 'audio';
     startTime: number;
     duration: number;
-    x: number; // percent of canvas width
-    y: number; // percent of canvas height
-    width: number;  // percent
-    height: number; // percent
+    x: number;
+    y: number;
+    width: number;
+    height: number;
     rotation?: number;
     opacity?: number;
     content?: string;
-    mediaUrl?: string;       // resolved URL for this variant
-    mediaOffset?: number;    // trim offset in seconds
+    mediaUrl?: string;
+    mediaOffset?: number;
     volume?: number;
     zIndex: number;
     fontSize?: number;
@@ -50,416 +52,455 @@ export interface RenderJob {
     height?: number;
     fps?: number;
     videoBitsPerSecond?: number;
+    format?: RenderFormat;
 }
 
 export type RenderProgress = {
     phase: 'preparing' | 'rendering' | 'encoding' | 'done' | 'error';
-    progress: number; // 0-1
+    progress: number;
     message: string;
     error?: string;
 };
 
-type ProgressCallback = (progress: RenderProgress) => void;
+type ProgressCb = (p: RenderProgress) => void;
 
-// ─── Easing helpers ────────────────────────────────────────────────────────
-function applyEasing(t: number, easing: string): number {
+const ANIM_CATEGORIES: Record<string, 'in' | 'out'> = {
+    fadeIn: 'in', slideInLeft: 'in', slideInRight: 'in', slideInTop: 'in', slideInBottom: 'in', scaleIn: 'in', rotateIn: 'in', bounceIn: 'in', blurIn: 'in',
+    fadeOut: 'out', slideOutLeft: 'out', slideOutRight: 'out', slideOutTop: 'out', slideOutBottom: 'out', scaleOut: 'out', rotateOut: 'out', blurOut: 'out'
+};
+
+// ─── Easing — MUST match BuilderCanvas.tsx applyEasing exactly ───────────────
+function easeValue(t: number, easing: string): number {
     t = Math.max(0, Math.min(1, t));
     switch (easing) {
-        case 'easeIn': return t * t;
-        case 'easeOut': return 1 - (1 - t) * (1 - t);
-        case 'easeInOut': return t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+        case 'linear': return t;
+        case 'easeIn': return t * t * t;
+        case 'easeOut': return 1 - Math.pow(1 - t, 3);
+        case 'easeInOut': return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
         case 'spring': {
-            const c4 = (2 * Math.PI) / 3;
-            return t === 0 ? 0 : t === 1 ? 1 : Math.pow(2, -10 * t) * Math.sin((t * 10 - 0.75) * c4) + 1;
+            const w = 8, d = 0.4;
+            return 1 - Math.exp(-d * w * t) * Math.cos(w * Math.sqrt(1 - d * d) * t);
         }
         default: return t;
     }
 }
 
-type AnimStyle = { opacity: number; translateX: number; translateY: number; scale: number; rotate: number; blur: number };
+// ─── Animation Evaluation — MATCHED to BuilderCanvas.tsx ─────────────────────
+type AnimatedStyle = { opacity: number; translateX: number; translateY: number; scale: number; rotate: number; blur: number };
 
-function evaluateAnimations(el: RenderElement, currentTime: number): AnimStyle {
-    const result: AnimStyle = { opacity: el.opacity ?? 1, translateX: 0, translateY: 0, scale: 1, rotate: 0, blur: 0 };
+function evaluateAnimations(el: RenderElement, currentTime: number): AnimatedStyle {
+    const result: AnimatedStyle = { opacity: el.opacity ?? 1, translateX: 0, translateY: 0, scale: 1, rotate: 0, blur: 0 };
     const localTime = currentTime - el.startTime;
-    const IN_TYPES = new Set(['fadeIn', 'slideInLeft', 'slideInRight', 'slideInTop', 'slideInBottom', 'scaleIn', 'rotateIn', 'bounceIn', 'blurIn']);
-    const OUT_TYPES = new Set(['fadeOut', 'slideOutLeft', 'slideOutRight', 'slideOutTop', 'slideOutBottom', 'scaleOut', 'rotateOut', 'blurOut']);
 
-    for (const anim of el.animations ?? []) {
-        const animEnd = anim.start + anim.duration;
-        const isIn = IN_TYPES.has(anim.type);
-        const isOut = OUT_TYPES.has(anim.type);
+    for (const anim of (el.animations || [])) {
+        const start = anim.start;
+        const end = anim.start + anim.duration;
+        const category = ANIM_CATEGORIES[anim.type];
 
-        if (localTime < anim.start) {
-            if (isIn) applyStartState(anim.type, result, anim);
+        if (localTime < start || localTime > end) {
+            if (category === 'in' && localTime < start) {
+                switch (anim.type) {
+                    case 'fadeIn': result.opacity = 0; break;
+                    case 'slideInLeft': result.translateX = -100; break;
+                    case 'slideInRight': result.translateX = 100; break;
+                    case 'slideInTop': result.translateY = -100; break;
+                    case 'slideInBottom': result.translateY = 100; break;
+                    case 'scaleIn': result.scale = anim.from ?? 0; break;
+                    case 'rotateIn': result.rotate = -180; break;
+                    case 'bounceIn': result.scale = anim.from ?? 0; break;
+                    case 'blurIn': result.blur = 10; result.opacity = 0; break;
+                }
+            }
+            if (category === 'out' && localTime > end) {
+                switch (anim.type) {
+                    case 'fadeOut': result.opacity = 0; break;
+                    case 'slideOutLeft': result.translateX = -100; break;
+                    case 'slideOutRight': result.translateX = 100; break;
+                    case 'slideOutTop': result.translateY = -100; break;
+                    case 'slideOutBottom': result.translateY = 100; break;
+                    case 'scaleOut': result.scale = anim.to ?? 0; break;
+                    case 'rotateOut': result.rotate = 180; break;
+                    case 'blurOut': result.blur = 10; result.opacity = 0; break;
+                }
+            }
             continue;
         }
-        if (localTime > animEnd) {
-            if (isOut) applyEndState(anim.type, result, anim);
-            continue;
+
+        const rawT = (localTime - start) / (anim.duration || 0.01);
+        const t = easeValue(rawT, anim.easing);
+
+        switch (anim.type) {
+            case 'fadeIn': result.opacity *= t; break;
+            case 'fadeOut': result.opacity *= (1 - t); break;
+            case 'slideInLeft': result.translateX = -100 * (1 - t); break;
+            case 'slideInRight': result.translateX = 100 * (1 - t); break;
+            case 'slideInTop': result.translateY = -100 * (1 - t); break;
+            case 'slideInBottom': result.translateY = 100 * (1 - t); break;
+            case 'slideOutLeft': result.translateX = -100 * t; break;
+            case 'slideOutRight': result.translateX = 100 * t; break;
+            case 'slideOutTop': result.translateY = -100 * t; break;
+            case 'slideOutBottom': result.translateY = 100 * t; break;
+            case 'scaleIn': {
+                const sStart = anim.from ?? 0;
+                const sEnd = anim.to ?? 1;
+                result.scale = sStart + (sEnd - sStart) * t;
+                break;
+            }
+            case 'scaleOut': {
+                const sStart = anim.from ?? 1;
+                const sEnd = anim.to ?? 0;
+                result.scale = sStart + (sEnd - sStart) * t;
+                break;
+            }
+            case 'rotateIn': result.rotate = -180 * (1 - t); break;
+            case 'rotateOut': result.rotate = 180 * t; break;
+            case 'bounceIn': {
+                const sStart = anim.from ?? 0;
+                const sEnd = anim.to ?? 1;
+                const springT = easeValue(rawT, 'spring');
+                result.scale = sStart + (sEnd - sStart) * springT;
+                break;
+            }
+            case 'blurIn': result.blur = 10 * (1 - t); result.opacity *= t; break;
+            case 'blurOut': result.blur = 10 * t; result.opacity *= (1 - t); break;
         }
-        const rawT = (localTime - anim.start) / (anim.duration || 0.01);
-        const t = applyEasing(rawT, anim.easing);
-        applyMid(anim.type, t, rawT, result, anim);
     }
     return result;
 }
 
-function applyStartState(type: string, r: AnimStyle, anim: { from?: number; to?: number }) {
-    if (type === 'fadeIn') r.opacity = 0;
-    else if (type === 'slideInLeft') r.translateX = -100;
-    else if (type === 'slideInRight') r.translateX = 100;
-    else if (type === 'slideInTop') r.translateY = -100;
-    else if (type === 'slideInBottom') r.translateY = 100;
-    else if (type === 'scaleIn' || type === 'bounceIn') r.scale = anim.from ?? 0;
-    else if (type === 'rotateIn') r.rotate = -180;
-    else if (type === 'blurIn') { r.blur = 10; r.opacity = 0; }
-}
-function applyEndState(type: string, r: AnimStyle, anim: { from?: number; to?: number }) {
-    if (type === 'fadeOut') r.opacity = 0;
-    else if (type === 'slideOutLeft') r.translateX = -100;
-    else if (type === 'slideOutRight') r.translateX = 100;
-    else if (type === 'slideOutTop') r.translateY = -100;
-    else if (type === 'slideOutBottom') r.translateY = 100;
-    else if (type === 'scaleOut') r.scale = anim.to ?? 0;
-    else if (type === 'rotateOut') r.rotate = 180;
-    else if (type === 'blurOut') { r.blur = 10; r.opacity = 0; }
-}
-function applyMid(type: string, t: number, rawT: number, r: AnimStyle, anim: { from?: number; to?: number }) {
-    if (type === 'fadeIn') r.opacity *= t;
-    else if (type === 'fadeOut') r.opacity *= (1 - t);
-    else if (type === 'slideInLeft') r.translateX = -100 * (1 - t);
-    else if (type === 'slideInRight') r.translateX = 100 * (1 - t);
-    else if (type === 'slideInTop') r.translateY = -100 * (1 - t);
-    else if (type === 'slideInBottom') r.translateY = 100 * (1 - t);
-    else if (type === 'slideOutLeft') r.translateX = -100 * t;
-    else if (type === 'slideOutRight') r.translateX = 100 * t;
-    else if (type === 'slideOutTop') r.translateY = -100 * t;
-    else if (type === 'slideOutBottom') r.translateY = 100 * t;
-    else if (type === 'scaleIn' || type === 'scaleOut' || type === 'bounceIn') {
-        const s0 = anim.from ?? (type === 'scaleIn' || type === 'bounceIn' ? 0 : 1);
-        const s1 = anim.to ?? (type === 'scaleIn' || type === 'bounceIn' ? 1 : 0);
-        const st = type === 'bounceIn' ? applyEasing(rawT, 'spring') : t;
-        r.scale = s0 + (s1 - s0) * st;
-    }
-    else if (type === 'rotateIn') r.rotate = -180 * (1 - t);
-    else if (type === 'rotateOut') r.rotate = 180 * t;
-    else if (type === 'blurIn') { r.blur = 10 * (1 - t); r.opacity *= t; }
-    else if (type === 'blurOut') { r.blur = 10 * t; r.opacity *= (1 - t); }
-}
-
-// ─── Media preloading ────────────────────────────────────────────────────────
-async function preloadImage(url: string): Promise<HTMLImageElement> {
-    return new Promise((resolve, reject) => {
+// ─── Asset Loaders ───────────────────────────────────────────────────────────
+function loadImage(url: string): Promise<HTMLImageElement> {
+    return new Promise((res, rej) => {
         const img = new Image();
         img.crossOrigin = 'anonymous';
-        img.onload = () => resolve(img);
-        img.onerror = reject;
+        img.onload = () => res(img);
+        img.onerror = rej;
         img.src = url;
     });
 }
 
-async function preloadVideo(url: string, offset: number = 0): Promise<HTMLVideoElement> {
-    return new Promise((resolve, reject) => {
+function loadVideo(url: string): Promise<HTMLVideoElement> {
+    return new Promise((res, rej) => {
         const v = document.createElement('video');
         v.crossOrigin = 'anonymous';
         v.preload = 'auto';
-        v.muted = true; // audio handled separately via WebAudio
+        v.muted = true;
+        v.playsInline = true;
         v.src = url;
-        v.onloadeddata = () => {
-            v.currentTime = offset;
-            resolve(v);
-        };
-        v.onerror = reject;
+        v.onloadeddata = () => res(v);
+        v.onerror = rej;
         v.load();
     });
 }
 
-// ─── Main render function ────────────────────────────────────────────────────
-export async function renderComposition(
-    job: RenderJob,
-    onProgress: ProgressCallback,
-    signal?: AbortSignal
-): Promise<void> {
-    const W = job.width ?? 1080;
-    const H = job.height ?? 1920;
-    const FPS = job.fps ?? 30;
-    const TOTAL = job.totalDuration;
-    const TOTAL_FRAMES = Math.ceil(TOTAL * FPS);
-
-    onProgress({ phase: 'preparing', progress: 0, message: 'Preparing render…' });
-
-    // Create the recording canvas (on-screen, hidden off to side)
-    const canvas = document.createElement('canvas');
-    canvas.width = W;
-    canvas.height = H;
-    canvas.style.position = 'fixed';
-    canvas.style.top = '-99999px';
-    canvas.style.left = '-99999px';
-    canvas.style.opacity = '0';
-    canvas.style.pointerEvents = 'none';
-    document.body.appendChild(canvas);
-    const ctx = canvas.getContext('2d')!;
-
-    // ── Preload all assets ─────────────────────────────────────────────────
-    onProgress({ phase: 'preparing', progress: 0.05, message: 'Loading assets…' });
-
-    const imageCache = new Map<string, HTMLImageElement>();
-    const videoCache = new Map<string, HTMLVideoElement>();
-
-    const mediaEls = job.elements.filter(e => e.mediaUrl && (e.collectionType === 'video' || e.collectionType === 'image' || e.collectionType === 'audio'));
-    let loaded = 0;
-    await Promise.all(mediaEls.map(async el => {
-        try {
-            if (el.collectionType === 'image' && el.mediaUrl) {
-                const img = await preloadImage(el.mediaUrl);
-                imageCache.set(el.elementId, img);
-            } else if ((el.collectionType === 'video') && el.mediaUrl) {
-                const vid = await preloadVideo(el.mediaUrl, el.mediaOffset ?? 0);
-                videoCache.set(el.elementId, vid);
-            }
-            // audio handled via WebAudio below
-        } catch (e) {
-            console.warn(`Failed to preload asset for ${el.elementId}`, e);
-        }
-        loaded++;
-        onProgress({ phase: 'preparing', progress: 0.05 + 0.25 * (loaded / mediaEls.length), message: `Loading assets… (${loaded}/${mediaEls.length})` });
-    }));
-
-    // ── WebAudio for mixing audio tracks ──────────────────────────────────
-    onProgress({ phase: 'preparing', progress: 0.3, message: 'Setting up audio…' });
-
-    const audioCtx = new AudioContext();
-    const audioBufferCache = new Map<string, AudioBuffer>();
-
-    const audioEls = job.elements.filter(e => e.mediaUrl && (e.collectionType === 'audio' || e.collectionType === 'video'));
-    for (const el of audioEls) {
-        if (el.mediaUrl) {
-            try {
-                const res = await fetch(el.mediaUrl);
-                const arrayBuffer = await res.arrayBuffer();
-                const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-                audioBufferCache.set(el.elementId, audioBuffer);
-            } catch (e) {
-                console.warn(`Could not decode audio for ${el.elementId}`, e);
-            }
-        }
-    }
-
-    // ── Setup MediaRecorder ────────────────────────────────────────────────
-    // Canvas video stream
-    const canvasStream = canvas.captureStream(FPS);
-
-    // Audio destination stream
-    const audioDestination = audioCtx.createMediaStreamDestination();
-
-    // Merge canvas + audio tracks
-    const combinedStream = new MediaStream([
-        ...canvasStream.getVideoTracks(),
-        ...audioDestination.stream.getAudioTracks(),
-    ]);
-
-    const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
-        ? 'video/webm;codecs=vp9,opus'
-        : MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')
-            ? 'video/webm;codecs=vp8,opus'
-            : 'video/webm';
-
-    const recorder = new MediaRecorder(combinedStream, {
-        mimeType,
-        videoBitsPerSecond: job.videoBitsPerSecond ?? 8_000_000,
-    });
-
-    const chunks: Blob[] = [];
-    recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
-
-    recorder.start(100); // collect data every 100ms
-
-    // Schedule all audio nodes to play at the right time within the recording
-    const recordingStart = audioCtx.currentTime + 0.1; // tiny buffer
-
-    for (const el of audioEls) {
-        const buf = audioBufferCache.get(el.elementId);
-        if (!buf) continue;
-
-        const gainNode = audioCtx.createGain();
-        gainNode.gain.value = el.volume ?? 1;
-        gainNode.connect(audioDestination);
-
-        const source = audioCtx.createBufferSource();
-        source.buffer = buf;
-        source.connect(gainNode);
-
-        const offset = el.mediaOffset ?? 0;
-        const startAt = recordingStart + el.startTime;
-        const dur = Math.min(el.duration, buf.duration - offset);
-        source.start(startAt, offset, dur);
-    }
-
-    // ── Frame rendering loop ───────────────────────────────────────────────
-    onProgress({ phase: 'rendering', progress: 0, message: 'Rendering frames…' });
-
-    const SPF = 1 / FPS; // seconds per frame
-    const sortedElements = [...job.elements].sort((a, b) => a.zIndex - b.zIndex);
-
-    const drawFrame = async (frame: number) => {
-        const t = frame * SPF;
-
-        ctx.clearRect(0, 0, W, H);
-        ctx.fillStyle = '#000';
-        ctx.fillRect(0, 0, W, H);
-
-        for (const el of sortedElements) {
-            if (el.collectionType === 'audio') continue; // audio is handled separately
-            const isActive = t >= el.startTime && t < el.startTime + el.duration;
-            if (!isActive) continue;
-
-            const anim = evaluateAnimations(el, t);
-            if (anim.opacity <= 0) continue;
-
-            const px = (el.x / 100) * W;
-            const py = (el.y / 100) * H;
-            const pw = (el.width / 100) * W;
-            const ph = (el.height / 100) * H;
-            const cx = px + pw / 2;
-            const cy = py + ph / 2;
-
-            ctx.save();
-            ctx.globalAlpha = Math.max(0, Math.min(1, anim.opacity));
-
-            if (anim.blur > 0) {
-                ctx.filter = `blur(${anim.blur}px)`;
-            }
-
-            // Transform: center, rotate, scale, translate
-            ctx.translate(cx + (anim.translateX / 100) * W, cy + (anim.translateY / 100) * H);
-            ctx.rotate(((el.rotation ?? 0) + anim.rotate) * Math.PI / 180);
-            ctx.scale(anim.scale, anim.scale);
-            ctx.translate(-pw / 2, -ph / 2);
-
-            if (el.collectionType === 'image' && el.mediaUrl) {
-                const img = imageCache.get(el.elementId);
-                if (img) {
-                    ctx.drawImage(img, 0, 0, pw, ph);
-                }
-            } else if (el.collectionType === 'video' && el.mediaUrl) {
-                const vid = videoCache.get(el.elementId);
-                if (vid) {
-                    const localTime = t - el.startTime + (el.mediaOffset ?? 0);
-                    // Seek video to correct time (synchronous read of canvas from video)
-                    vid.currentTime = Math.min(localTime, vid.duration - 0.01);
-                    try {
-                        ctx.drawImage(vid, 0, 0, pw, ph);
-                    } catch { /* stale frame */ }
-                } else {
-                    // Fallback: purple placeholder
-                    ctx.fillStyle = '#7c3aed';
-                    ctx.fillRect(0, 0, pw, ph);
-                }
-            } else if (el.collectionType === 'text' && el.content) {
-                const fontSize = el.fontSize ?? 32;
-                const scaledFontSize = (fontSize / 100) * W; // convert preview px → render px
-                ctx.font = `${el.fontStyle ?? 'normal'} ${el.fontWeight ?? 'bold'} ${scaledFontSize}px Inter, sans-serif`;
-                ctx.fillStyle = '#ffffff';
-                ctx.textAlign = el.textAlign ?? 'center';
-                ctx.textBaseline = 'middle';
-                // Simple line wrapping
-                const words = el.content.split(' ');
-                const lines: string[] = [];
-                let current = '';
-                for (const word of words) {
-                    const test = current ? `${current} ${word}` : word;
-                    if (ctx.measureText(test).width > pw * 0.9 && current) {
-                        lines.push(current);
-                        current = word;
-                    } else {
-                        current = test;
-                    }
-                }
-                if (current) lines.push(current);
-                const lineH = scaledFontSize * (el.lineHeight ?? 1.3);
-                const totalTextH = lines.length * lineH;
-                const startY = ph / 2 - totalTextH / 2 + lineH / 2;
-                for (let i = 0; i < lines.length; i++) {
-                    const tx = el.textAlign === 'left' ? 4 : el.textAlign === 'right' ? pw - 4 : pw / 2;
-                    ctx.fillText(lines[i], tx, startY + i * lineH);
-                }
-            }
-
-            ctx.restore();
-        }
-
-        // Sync video elements to the correct frame time
-        // (already sought above in drawFrame)
-    };
-
-    // We can't truly await video seek in a tight loop, so we pace ourselves:
-    // For video elements, seek → wait for seeked event → draw.
-    // For speed, we do async seek-and-draw per frame.
-
-    const seekVideo = (vid: HTMLVideoElement, time: number): Promise<void> =>
-        new Promise(resolve => {
-            if (Math.abs(vid.currentTime - time) < 0.05) { resolve(); return; }
-            const onSeeked = () => { vid.removeEventListener('seeked', onSeeked); resolve(); };
-            vid.addEventListener('seeked', onSeeked);
-            vid.currentTime = time;
-        });
-
-    for (let frame = 0; frame < TOTAL_FRAMES; frame++) {
-        if (signal?.aborted) {
-            recorder.stop();
-            canvas.remove();
-            await audioCtx.close();
-            onProgress({ phase: 'error', progress: 0, message: 'Render cancelled', error: 'cancelled' });
+/** 
+ * Improved seekTo: Resolves immediately if distance is < 1ms.
+ * Prevents stalling when many frames are identical or close, fixing chopped output.
+ */
+function seekTo(vid: HTMLVideoElement, target: number): Promise<void> {
+    return new Promise(resolve => {
+        // Add a 5ms epsilon to the target time.
+        // This is CRITICAL for perfectly smooth playback. Because of floating point inaccuracies, 
+        // asking the browser to seek to exactly '0.033333' (1/30) might land slightly *before* 
+        // the video's internal timestamp for frame 1, causing it to return frame 0 again.
+        // Adding 5ms safely pushes the seek head into the middle of the frame's time window.
+        const safeTarget = target + 0.005;
+        
+        // Clamp to at least 50ms before duration to prevent the browser from resetting to the first frame
+        const clampedTarget = Math.max(0, Math.min(safeTarget, (vid.duration || 0) - 0.05));
+        
+        // If already practically at the target (within 0.1ms), resolve immediately to avoid stalls.
+        if (Math.abs(vid.currentTime - clampedTarget) < 0.0001) {
+            resolve();
             return;
         }
+        let resolved = false;
+        
+        const finish = () => {
+            if (resolved) return;
+            resolved = true;
+            resolve();
+        };
 
-        const t = frame * SPF;
-
-        // Seek all active video elements
-        const videoEls = sortedElements.filter(el =>
-            el.collectionType === 'video' && el.mediaUrl && t >= el.startTime && t < el.startTime + el.duration
-        );
-        await Promise.all(videoEls.map(async el => {
-            const vid = videoCache.get(el.elementId);
-            if (vid) {
-                const localTime = t - el.startTime + (el.mediaOffset ?? 0);
-                await seekVideo(vid, Math.min(localTime, vid.duration - 0.01));
+        const done = () => { 
+            vid.removeEventListener('seeked', done); 
+            
+            // Ensure the frame is actually decoded and painted for canvas extraction
+            if ('requestVideoFrameCallback' in vid) {
+                let rfcResolved = false;
+                const callbackId = (vid as any).requestVideoFrameCallback(() => {
+                    if (rfcResolved) return;
+                    rfcResolved = true;
+                    finish();
+                });
+                // Fallback in case rVFC doesn't fire
+                setTimeout(() => {
+                    if (!rfcResolved) {
+                        try { (vid as any).cancelVideoFrameCallback(callbackId); } catch (e) {}
+                        finish();
+                    }
+                }, 150);
+            } else {
+                // Fallback for browsers without rVFC
+                setTimeout(finish, 150);
             }
-        }));
+        };
+        vid.addEventListener('seeked', done);
+        vid.currentTime = clampedTarget;
+        // Increase timeout to 2000ms to allow slow seeks to finish instead of dropping frames
+        setTimeout(() => {
+            if (!resolved) {
+                vid.removeEventListener('seeked', done);
+                finish();
+            }
+        }, 2000);
+    });
+}
 
-        await drawFrame(frame);
+// ─── Drawing ─────────────────────────────────────────────────────────────────
+const PREVIEW_W = 320;
 
-        if (frame % 10 === 0) {
-            onProgress({
-                phase: 'rendering',
-                progress: frame / TOTAL_FRAMES,
-                message: `Rendering frame ${frame + 1} / ${TOTAL_FRAMES}`,
-            });
-            // Yield to browser
+function drawFrame(
+    ctx: CanvasRenderingContext2D,
+    W: number, H: number,
+    elements: RenderElement[],
+    imageCache: Map<string, HTMLImageElement>,
+    videoCache: Map<string, HTMLVideoElement>,
+    t: number,
+) {
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+
+    for (const el of elements) {
+        if (el.collectionType === 'audio') continue;
+        // Strict boundary check: add small epsilon to duration to avoid last-frame flickering
+        if (t < el.startTime || t >= el.startTime + el.duration - 0.0001) continue;
+
+        const anim = evaluateAnimations(el, t);
+        if (anim.opacity <= 0.001) continue;
+
+        const px = (el.x / 100) * W;
+        const py = (el.y / 100) * H;
+        const pw = (el.width / 100) * W;
+        const ph = (el.height / 100) * H;
+        const cx = px + pw / 2 + (anim.translateX / 100) * W;
+        const cy = py + ph / 2 + (anim.translateY / 100) * H;
+
+        ctx.save();
+        ctx.globalAlpha = Math.max(0, Math.min(1, anim.opacity));
+        if (anim.blur > 0) ctx.filter = `blur(${anim.blur}px)`;
+
+        ctx.translate(cx, cy);
+        ctx.rotate(((el.rotation ?? 0) + anim.rotate) * Math.PI / 180);
+        const s = Math.max(0.001, anim.scale);
+        ctx.scale(s, s);
+        ctx.translate(-pw / 2, -ph / 2);
+
+        if (el.collectionType === 'image') {
+            const img = imageCache.get(el.elementId);
+            if (img) ctx.drawImage(img, 0, 0, pw, ph);
+        } else if (el.collectionType === 'video') {
+            const vid = videoCache.get(el.elementId);
+            if (vid && vid.readyState >= 2) {
+                ctx.drawImage(vid, 0, 0, pw, ph);
+            } else {
+                ctx.fillStyle = '#555';
+                ctx.fillRect(0, 0, pw, ph);
+            }
+        } else if (el.collectionType === 'text' && el.content) {
+            const fs = ((el.fontSize ?? 16) / PREVIEW_W) * W;
+            ctx.font = `${el.fontStyle ?? 'normal'} ${el.fontWeight ?? 'bold'} ${fs}px Inter, sans-serif`;
+            ctx.fillStyle = '#fff';
+            ctx.textAlign = el.textAlign ?? 'center';
+            ctx.textBaseline = 'middle';
+
+            const words = el.content.split(' ');
+            const lines: string[] = [];
+            let currentLine = '';
+            for (const word of words) {
+                const test = currentLine ? `${currentLine} ${word}` : word;
+                if (ctx.measureText(test).width > pw * 0.95 && currentLine) {
+                    lines.push(currentLine);
+                    currentLine = word;
+                } else {
+                    currentLine = test;
+                }
+            }
+            if (currentLine) lines.push(currentLine);
+            const lh = fs * (el.lineHeight ?? 1.2);
+            const totalH = lines.length * lh;
+            const startY = ph / 2 - totalH / 2 + lh / 2;
+            for (let i = 0; i < lines.length; i++) {
+                const tx = el.textAlign === 'left' ? 0 : el.textAlign === 'right' ? pw : pw / 2;
+                ctx.fillText(lines[i], tx, startY + i * lh);
+            }
+        }
+        ctx.restore();
+    }
+}
+
+// ─── Audio mix ─────────────────────────────────────────────────────────────
+function mixAudio(
+    elements: RenderElement[],
+    buffers: Map<string, AudioBuffer>,
+    totalDuration: number,
+    sr: number,
+): [Float32Array, Float32Array] {
+    const n = Math.ceil(totalDuration * sr);
+    const L = new Float32Array(n);
+    const R = new Float32Array(n);
+    for (const el of elements) {
+        if (!el.mediaUrl || (el.collectionType !== 'audio' && el.collectionType !== 'video')) continue;
+        const buf = buffers.get(el.elementId);
+        if (!buf) continue;
+        const vol = el.volume ?? 1;
+        const off = Math.floor((el.mediaOffset ?? 0) * sr);
+        const start = Math.floor(el.startTime * sr);
+        const count = Math.min(Math.floor(el.duration * sr), buf.length - off, n - start);
+        const sL = buf.getChannelData(0);
+        const sR = buf.numberOfChannels > 1 ? buf.getChannelData(1) : sL;
+        for (let i = 0; i < count; i++) {
+            L[start + i] += (sL[off + i] ?? 0) * vol;
+            R[start + i] += (sR[off + i] ?? 0) * vol;
+        }
+    }
+    return [L, R];
+}
+
+// ─── Main loop ─────────────────────────────────────────────────────────────
+async function encodeComposition(
+    job: RenderJob, W: number, H: number, FPS: number, totalFrames: number,
+    sorted: RenderElement[], images: Map<string, HTMLImageElement>,
+    videos: Map<string, HTMLVideoElement>, audioBufs: Map<string, AudioBuffer>,
+    videoConfig: VideoEncoderConfig,
+    audioCodec: string,
+    onVideoChunk: (c: EncodedVideoChunk, m?: EncodedVideoChunkMetadata | null) => void,
+    onAudioChunk: (c: EncodedAudioChunk, m?: EncodedAudioChunkMetadata | null) => void,
+    finalise: () => void,
+    onProgress: ProgressCb,
+    signal?: AbortSignal,
+): Promise<void> {
+    const US = 1_000_000;
+    const spf = 1 / FPS;
+    const SR = 44_100;
+
+    // Audio
+    const [mL, mR] = mixAudio(sorted, audioBufs, job.totalDuration, SR);
+    const aEnc = new AudioEncoder({ output: onAudioChunk, error: e => console.error(e) });
+    aEnc.configure({ codec: audioCodec, sampleRate: SR, numberOfChannels: 2, bitrate: 128_000 });
+    const CHUNK = 1024;
+    for (let p = 0; p < mL.length; p += CHUNK) {
+        const cnt = Math.min(CHUNK, mL.length - p);
+        const data = new Float32Array(cnt * 2);
+        for (let i = 0; i < cnt; i++) { data[i] = mL[p + i]; data[cnt + i] = mR[p + i]; }
+        const ad = new AudioData({ format: 'f32-planar', sampleRate: SR, numberOfFrames: cnt, numberOfChannels: 2, timestamp: Math.floor((p / SR) * US), data });
+        aEnc.encode(ad);
+        ad.close();
+    }
+
+    // Video
+    const vEnc = new VideoEncoder({ output: onVideoChunk, error: e => console.error(e) });
+    vEnc.configure(videoConfig);
+
+    const canvas = document.createElement('canvas');
+    canvas.width = W; canvas.height = H;
+    const ctx = canvas.getContext('2d', { alpha: false })!;
+
+    for (let frame = 0; frame < totalFrames; frame++) {
+        if (signal?.aborted) { vEnc.close(); aEnc.close(); throw new DOMException('Cancelled', 'AbortError'); }
+
+        const t = frame / FPS; // Use stable division for time
+
+        for (const el of sorted) {
+            if (el.collectionType !== 'video' || !el.mediaUrl) continue;
+            if (t < el.startTime || t >= el.startTime + el.duration) continue;
+            const vid = videos.get(el.elementId);
+            if (vid) await seekTo(vid, t - el.startTime + (el.mediaOffset ?? 0));
+        }
+
+        drawFrame(ctx, W, H, sorted, images, videos, t);
+
+        const bitmap = await createImageBitmap(canvas);
+        const vf = new VideoFrame(bitmap, { timestamp: Math.floor(t * US), duration: Math.floor(spf * US) });
+        bitmap.close();
+
+        while (vEnc.encodeQueueSize > 2) await new Promise(r => setTimeout(r, 1));
+        vEnc.encode(vf, { keyFrame: frame % FPS === 0 });
+        vf.close();
+
+        if (frame % 5 === 0) {
+            onProgress({ phase: 'rendering', progress: frame / totalFrames, message: `Frame ${frame + 1} / ${totalFrames}` });
             await new Promise(r => setTimeout(r, 0));
         }
     }
 
-    // ── Stop recording & download ──────────────────────────────────────────
-    onProgress({ phase: 'encoding', progress: 0.95, message: 'Encoding video…' });
+    await vEnc.flush(); await aEnc.flush();
+    vEnc.close(); aEnc.close();
+    finalise();
+}
 
-    await new Promise<void>(resolve => {
-        recorder.onstop = () => resolve();
-        recorder.stop();
-    });
+export async function renderComposition(job: RenderJob, onProgress: ProgressCb, signal?: AbortSignal): Promise<void> {
+    const W = job.width || 1080;
+    const H = job.height || 1920;
+    const FPS = job.fps || 30;
+    const totalFrames = Math.ceil(job.totalDuration * FPS);
+    const format = job.format || 'mp4';
 
-    await audioCtx.close();
-    canvas.remove();
+    onProgress({ phase: 'preparing', progress: 0.1, message: 'Loading assets…' });
+    const images = new Map<string, HTMLImageElement>();
+    const videos = new Map<string, HTMLVideoElement>();
+    const audioBufs = new Map<string, AudioBuffer>();
+    const actx = new AudioContext({ sampleRate: 44100 });
 
-    const blob = new Blob(chunks, { type: mimeType });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `dropai-export-${Date.now()}.webm`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    for (const el of job.elements) {
+        if (!el.mediaUrl) continue;
+        try {
+            if (el.collectionType === 'image') {
+                images.set(el.elementId, await loadImage(el.mediaUrl));
+            } else if (el.collectionType === 'video') {
+                // Fetch fully into a blob to prevent network stalls during frame-by-frame seeking
+                const res = await fetch(el.mediaUrl);
+                const blob = await res.blob();
+                videos.set(el.elementId, await loadVideo(URL.createObjectURL(blob)));
+                audioBufs.set(el.elementId, await actx.decodeAudioData(await blob.arrayBuffer()));
+            } else if (el.collectionType === 'audio') {
+                const res = await fetch(el.mediaUrl);
+                const blob = await res.blob();
+                audioBufs.set(el.elementId, await actx.decodeAudioData(await blob.arrayBuffer()));
+            }
+        } catch (e) { console.warn(e); }
+    }
+    await actx.close();
 
-    onProgress({ phase: 'done', progress: 1, message: 'Export complete!' });
+    const sorted = [...job.elements].sort((a, b) => a.zIndex - b.zIndex);
+
+    try {
+        let blob: Blob;
+        if (format === 'mp4') {
+            const { Muxer, ArrayBufferTarget } = await import('mp4-muxer');
+            const target = new ArrayBufferTarget();
+            const muxer = new Muxer({ target, video: { codec: 'avc', width: W, height: H }, audio: { codec: 'aac', sampleRate: 44100, numberOfChannels: 2 }, fastStart: 'in-memory' });
+            await encodeComposition(job, W, H, FPS, totalFrames, sorted, images, videos, audioBufs,
+                { codec: 'avc1.640033', width: W, height: H, bitrate: job.videoBitsPerSecond || 8_000_000, framerate: FPS, hardwareAcceleration: 'prefer-software' }, 'mp4a.40.2',
+                (c, m) => muxer.addVideoChunk(c, m || undefined), (c, m) => muxer.addAudioChunk(c, m || undefined), () => muxer.finalize(), onProgress, signal
+            );
+            blob = new Blob([target.buffer], { type: 'video/mp4' });
+        } else {
+            const { Muxer, ArrayBufferTarget } = await import('webm-muxer');
+            const target = new ArrayBufferTarget();
+            const muxer = new Muxer({ target, video: { codec: 'V_VP8', width: W, height: H }, audio: { codec: 'A_OPUS', sampleRate: 44100, numberOfChannels: 2 }, type: 'webm' });
+            await encodeComposition(job, W, H, FPS, totalFrames, sorted, images, videos, audioBufs,
+                { codec: 'vp8', width: W, height: H, bitrate: job.videoBitsPerSecond || 8_000_000, framerate: FPS, hardwareAcceleration: 'prefer-software' }, 'opus',
+                (c, m) => muxer.addVideoChunk(c, m || undefined), (c, m) => muxer.addAudioChunk(c, m || undefined), () => muxer.finalize(), onProgress, signal
+            );
+            blob = new Blob([target.buffer], { type: 'video/webm' });
+        }
+
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a'); a.href = url; a.download = `export-${Date.now()}.${format}`; a.click();
+        onProgress({ phase: 'done', progress: 1, message: 'Export complete' });
+    } catch (e: any) {
+        onProgress({ phase: 'error', progress: 0, message: 'Export failed', error: e.message });
+    }
 }
