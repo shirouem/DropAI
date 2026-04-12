@@ -5,7 +5,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import {
     Play, Pause, Plus, Image as ImageIcon, Music, Download, Upload,
     Layers, X, Type, MonitorPlay, SlidersHorizontal, GripVertical, Shuffle, SkipBack, Video, Trash2, Sparkles, ChevronDown, Eye, EyeOff,
-    Bold, Italic, Underline, AlignLeft, AlignCenter, AlignRight, Scissors, MousePointer2, Settings, Lock, Unlock,
+    Bold, Italic, Underline, AlignLeft, AlignCenter, AlignRight, Scissors, MousePointer2, Settings, Lock, Unlock, ArrowUp, ArrowDown,
     Film, Loader2, CheckCircle2, AlertCircle, Clapperboard
 } from "lucide-react";
 import Link from "next/link";
@@ -84,7 +84,12 @@ const ANIMATION_PRESETS: Record<AnimationType, { label: string; category: 'in' |
     blurOut: { label: 'Blur Out', category: 'out' },
 };
 
-interface CanvasElement {
+export interface TrackConfig {
+    id: string;
+    magnet: boolean;
+}
+
+export interface CanvasElement {
     elementId: string;
     collectionId: string;
     collectionType: CollectionType;
@@ -97,6 +102,7 @@ interface CanvasElement {
     content?: string;
     startTime: number;
     duration: number;
+    trackId?: string;
     rotation?: number;
     opacity?: number;
     aspectRatioLocked?: boolean;
@@ -114,7 +120,7 @@ interface CanvasElement {
     sourceElementId?: string;
     volume?: number; // Volume from 0 to 1
     mediaOffset?: number; // Offset into source media file (seconds), used after splitting
-    syncWith?: { targetId: string; edge: 'start' | 'end' } | null;
+    syncWith?: { targetId: string; targetEdge: 'start' | 'end'; myEdge: 'start' | 'end'; edge?: 'start' | 'end' } | null;
 }
 
 // --- Collection Type Styling ---
@@ -160,11 +166,12 @@ const SEED_COLLECTIONS: CollectionItem[] = [
 
 
 // --- Draggable Collection Card ---
-function CollectionCard({ collection, onAddItem, onDeleteItem, onUpdateItem }: {
+function CollectionCard({ collection, onAddItem, onDeleteItem, onUpdateItem, onDeleteCollection }: {
     collection: CollectionItem;
     onAddItem: (collectionId: string, label: string, value: string, duration?: number) => void;
     onDeleteItem: (collectionId: string, variantId: string) => void;
     onUpdateItem: (collectionId: string, variantId: string, newValue: string, duration?: number) => void;
+    onDeleteCollection: (collectionId: string) => void;
 }) {
     const [isOpen, setIsOpen] = useState(false);
     const [isAdding, setIsAdding] = useState(false);
@@ -278,12 +285,20 @@ function CollectionCard({ collection, onAddItem, onDeleteItem, onUpdateItem }: {
             <div
                 {...listeners}
                 {...attributes}
-                className="flex items-center gap-2 p-3 cursor-grab active:cursor-grabbing select-none touch-none"
+                className="flex items-center gap-2 p-3 cursor-grab active:cursor-grabbing select-none touch-none group/colheader"
                 onClick={(e) => { e.stopPropagation(); }}
             >
                 <span className={cn(colors.icon)}>{COLLECTION_ICONS[collection.type]}</span>
                 <span className="text-[11px] font-mono text-gray-200 font-medium flex-1 truncate">{collection.title}</span>
                 <span className="text-[9px] font-mono text-gray-500 bg-white/5 px-1.5 py-0.5 rounded">{collection.items.length} items</span>
+                <button
+                    onClick={(e) => { e.stopPropagation(); e.preventDefault(); onDeleteCollection(collection.id); }}
+                    onPointerDown={(e) => e.stopPropagation()}
+                    className="opacity-0 group-hover/colheader:opacity-100 text-gray-600 hover:text-red-400 transition-all ml-1"
+                    title="Delete Collection"
+                >
+                    <Trash2 className="w-3.5 h-3.5" />
+                </button>
                 <button
                     onClick={(e) => { e.stopPropagation(); e.preventDefault(); setIsOpen(!isOpen); }}
                     onPointerDown={(e) => e.stopPropagation()}
@@ -654,63 +669,62 @@ function evaluateAnimations(el: CanvasElement, currentTime: number): AnimatedSty
 
 export function resolveElementTimings(
     elements: CanvasElement[],
+    tracks: TrackConfig[],
     getVariantMode: (elId: string) => string
 ): Map<string, { startTime: number, duration: number }> {
     const timings = new Map<string, { startTime: number, duration: number }>();
-    const visited = new Set<string>();
 
-    const resolve = (elId: string): { startTime: number, duration: number } => {
-        if (timings.has(elId)) return timings.get(elId)!;
-        const el = elements.find(e => e.elementId === elId);
-        if (!el) {
-            const fallback = { startTime: 0, duration: 0 };
-            timings.set(elId, fallback);
-            return fallback;
-        }
-        if (visited.has(elId)) {
-            // Cycle detected, use base times
-            const fallback = { startTime: el.startTime, duration: el.duration };
-            timings.set(elId, fallback);
-            return fallback;
-        }
-        visited.add(elId);
-
-        const varMode = getVariantMode(elId);
-        let baseTime = el.startTime;
+    // First pass: calculate base duration and intrinsic startTime for each element
+    const initialTimings = elements.map(el => {
+        const varMode = getVariantMode(el.elementId);
+        const baseTime = el.startTime;
         let baseDur = el.duration;
         const isMedia = el.collectionType === 'video' || el.collectionType === 'audio';
 
         if (isMedia && el.variantOverrides) {
             if (varMode !== 'all' && el.variantOverrides[varMode]) {
-                // Specific variant selected — use that variant's timing overrides
-                if (el.variantOverrides[varMode].startTime !== undefined) baseTime = el.variantOverrides[varMode].startTime;
-                if (el.variantOverrides[varMode].duration !== undefined) baseDur = el.variantOverrides[varMode].duration;
+                if (el.variantOverrides[varMode].duration !== undefined) baseDur = el.variantOverrides[varMode].duration!;
             } else if (varMode === 'all') {
-                // In 'all' mode, use the base element's startTime as the canonical position.
-                // Only pick up the max duration across variants for the placeholder width.
                 let maxDur = el.duration;
                 for (const override of Object.values(el.variantOverrides)) {
                     if (override.duration !== undefined && override.duration > maxDur) maxDur = override.duration;
                 }
-                // baseTime stays as el.startTime (already set above)
                 baseDur = maxDur;
             }
         }
+        return { el, startTime: baseTime, duration: baseDur };
+    });
 
-        // syncWith overrides the start time regardless of variant mode
-        if (el.syncWith) {
-            const tgt = resolve(el.syncWith.targetId);
-            baseTime = el.syncWith.edge === 'end' ? tgt.startTime + tgt.duration : tgt.startTime;
-        }
-
-        const res = { startTime: baseTime, duration: baseDur };
-        timings.set(elId, res);
-        return res;
-    };
-
-    for (const el of elements) {
-        resolve(el.elementId);
+    // Group elements by track
+    const tracksMap = new Map<string, typeof initialTimings>();
+    for (const item of initialTimings) {
+        const tid = item.el.trackId || 'track-0';
+        if (!tracksMap.has(tid)) tracksMap.set(tid, []);
+        tracksMap.get(tid)!.push(item);
     }
+
+    // Process per track
+    for (const [tid, items] of tracksMap.entries()) {
+        const trackConfig = tracks.find(t => t.id === tid);
+        
+        if (trackConfig?.magnet) {
+            // MAGNET ON: Sort by intrinsic startTime, then stack left-to-right
+            items.sort((a, b) => a.startTime - b.startTime);
+            const anchor = items.length > 0 ? items[0].startTime : 0;
+            let cursor = anchor;
+            
+            for (const item of items) {
+                timings.set(item.el.elementId, { startTime: Math.round(cursor * 100) / 100, duration: item.duration });
+                cursor += item.duration;
+            }
+        } else {
+            // MAGNET OFF: pass through intrinsic times as-is
+            for (const item of items) {
+                timings.set(item.el.elementId, { startTime: item.startTime, duration: item.duration });
+            }
+        }
+    }
+
     return timings;
 }
 
@@ -739,6 +753,7 @@ function getMediaDurationLimit(el: CanvasElement, variantMode: string, collectio
 // --- Main Builder (inner, only rendered on client) ---
 function BuilderInner({ compositionId }: { compositionId?: string }) {
     const [elements, setElements] = useState<CanvasElement[]>([]);
+    const [tracks, setTracks] = useState<TrackConfig[]>([{ id: 'track-0', magnet: false }]);
     const [collections, setCollections] = useState<CollectionItem[]>(SEED_COLLECTIONS);
     const [selectedElementId, setSelectedElementId] = useState<string | null>(null);
     const [centerView, setCenterView] = useState<"canvas" | "preview">("canvas");
@@ -746,6 +761,12 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     const [inspectorLocked, setInspectorLocked] = useState(false);
     const [saving, setSaving] = useState(false);
     const [fetching, setFetching] = useState(false);
+    const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+
+    const showToast = (message: string, type: 'success' | 'error') => {
+        setToast({ message, type });
+        setTimeout(() => setToast(null), 3000);
+    };
 
     // --- Export / Render state ---
     const [isExportModalOpen, setIsExportModalOpen] = useState(false);
@@ -789,6 +810,12 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 .then(data => {
                     if (data.elements) {
                         try { setElements(typeof data.elements === 'string' ? JSON.parse(data.elements) : data.elements); } catch (e) { }
+                    }
+                    if (data.tracks) {
+                        try { 
+                            const parsedTracks = typeof data.tracks === 'string' ? JSON.parse(data.tracks) : data.tracks; 
+                            if (parsedTracks && parsedTracks.length > 0) setTracks(parsedTracks);
+                        } catch (e) { }
                     }
                     if (data.collections?.length) {
                         try {
@@ -870,16 +897,17 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     const activeVariantModes = useMemo(() => {
         const modes: Record<string, string> = {};
         for (const el of elements) {
-            modes[el.elementId] = centerView === 'preview'
+            const userMode = getVariantMode(el.elementId);
+            modes[el.elementId] = userMode === 'all'
                 ? (previewVariants[el.elementId]?.id || 'all')
-                : getVariantMode(el.elementId);
+                : userMode;
         }
         return modes;
-    }, [elements, centerView, previewVariants, getVariantMode]);
+    }, [elements, previewVariants, getVariantMode]);
 
     const elementTimings = useMemo(() => {
-        return resolveElementTimings(elements, elId => activeVariantModes[elId] || 'all');
-    }, [elements, activeVariantModes]);
+        return resolveElementTimings(elements, tracks, elId => activeVariantModes[elId] || 'all');
+    }, [elements, tracks, activeVariantModes]);
 
     const randomizeVariants = useCallback(() => {
         setVariantSeed(s => s + 1);
@@ -1011,37 +1039,21 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         const isMedia = el.collectionType === 'video' || el.collectionType === 'audio';
 
         if (variantMode === 'all') {
-            // Track whether caller wants to clear syncWith (null = clear, object = set, absent = don't touch)
-            const shouldClearSyncWith = 'syncWith' in updates && updates.syncWith === null;
-            const shouldSetSyncWith = 'syncWith' in updates && updates.syncWith !== null && updates.syncWith !== undefined;
-            const isUpdatingStart = 'startTime' in updates || 'syncWith' in updates;
-
-            // Build safeUpdates without syncWith — we handle it manually below
-            const { syncWith: _sw, ...restUpdates } = updates as any;
-            const safeUpdates: Partial<CanvasElement> = restUpdates;
-
-            if (shouldSetSyncWith) {
-                (safeUpdates as any).syncWith = updates.syncWith;
-            }
+            const isUpdatingStart = 'startTime' in updates;
 
             if (isMedia && el.variantOverrides) {
                 const preservedOverrides: Record<string, Partial<CanvasElement>> = {};
                 for (const [vid, overrides] of Object.entries(el.variantOverrides)) {
                     const timingOnly: Partial<CanvasElement> = {};
-                    // When dragging in ALL mode (isUpdatingStart=true), DON'T preserve per-variant startTime.
-                    // This ensures dragging the ALL placeholder actually moves all variants.
                     if (!isUpdatingStart && overrides.startTime !== undefined) timingOnly.startTime = overrides.startTime;
                     if (overrides.duration !== undefined) timingOnly.duration = overrides.duration;
                     if ((overrides as any).mediaOffset !== undefined) (timingOnly as any).mediaOffset = (overrides as any).mediaOffset;
                     if (Object.keys(timingOnly).length > 0) preservedOverrides[vid] = timingOnly;
                 }
-                const newEl = { ...el, ...safeUpdates, variantOverrides: preservedOverrides };
-                // Always delete syncWith when clearing — el.syncWith bleeds through the spread otherwise
-                if (shouldClearSyncWith) delete (newEl as any).syncWith;
+                const newEl = { ...el, ...updates, variantOverrides: preservedOverrides };
                 return newEl;
             }
-            const newEl = { ...el, ...safeUpdates, variantOverrides: {} };
-            if (shouldClearSyncWith) delete (newEl as any).syncWith;
+            const newEl = { ...el, ...updates, variantOverrides: {} };
             return newEl;
         } else if (isMedia) {
             // For media elements with a specific variant, store timing in overrides
@@ -1338,6 +1350,19 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             const baseDuration = isMedia
                 ? (col.items[0]?.duration || 5)
                 : 5;
+            // Place on the first track by default
+            const targetTrackId = tracks.length > 0 ? tracks[0].id : 'track-0';
+            
+            // Find a non-overlapping start time on the target track
+            const trackSiblings = elements.filter(e => (e.trackId || 'track-0') === targetTrackId);
+            let bestStart = 0;
+            // Place after the last element in the track
+            for (const sib of trackSiblings) {
+                const sibTiming = elementTimings.get(sib.elementId) || { startTime: sib.startTime, duration: sib.duration };
+                const sibEnd = sibTiming.startTime + sibTiming.duration;
+                if (sibEnd > bestStart) bestStart = sibEnd;
+            }
+
             const newEl: CanvasElement = {
                 elementId: newId,
                 sourceElementId: newId,
@@ -1350,8 +1375,9 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 height: h,
                 zIndex: elements.length + 1,
                 content: col.type === 'text' ? col.items[0]?.value || "YOUR TEXT HERE" : undefined,
-                startTime: 0,
+                startTime: Math.round(bestStart * 10) / 10,
                 duration: baseDuration,
+                trackId: targetTrackId,
                 rotation: 0,
                 opacity: 1,
                 visible: true,
@@ -1534,11 +1560,12 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify(payload),
             });
-            if (res.ok) alert("Composition saved successfully!");
-            else alert("Failed to save composition.");
-        } catch { alert("Failed to save."); }
-        finally { setSaving(false); }
-    };
+
+            if (res.ok) showToast("Composition saved successfully!", "success");
+            else showToast("Failed to save composition.", "error");
+            } catch { showToast("Failed to save.", "error"); }
+            finally { setSaving(false); }
+            };
 
     return (
         <DndContext sensors={sensors} onDragStart={handleDragStart} onDragMove={handleDragMove} onDragEnd={handleDragEnd} collisionDetection={pointerWithin}>
@@ -1707,6 +1734,13 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                         setCollections(prev => prev.map(c =>
                                             c.id === colId ? { ...c, items: c.items.map(v => v.id === variantId ? { ...v, value: newValue, duration: duration !== undefined ? duration : v.duration } : v) } : c
                                         ));
+                                    }}
+                                    onDeleteCollection={(colId) => {
+                                        setCollections(prev => prev.filter(c => c.id !== colId));
+                                        setElements(prev => prev.filter(el => el.collectionId !== colId));
+                                        if (elements.find(el => el.id === selectedElementId && el.collectionId === colId)) {
+                                            setSelectedElementId(null);
+                                        }
                                     }}
                                 />
                             ))}
@@ -2100,348 +2134,489 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                             {isTimelineOpen && (
                                                 <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="p-4 bg-[#0a0a0a] overflow-hidden">
                                                     {/* Scrollable timeline container */}
-                                                    <div className="relative overflow-x-auto custom-scrollbar">
-                                                        <div style={{ width: `${Math.max(100, TOTAL_DURATION * 20)}px`, minWidth: '100%' }}>
-                                                            {/* Tick marks */}
-                                                            <div className="relative h-4 text-[9px] font-mono text-gray-600 mb-1">
-                                                                {Array.from({ length: Math.floor(TOTAL_DURATION / 10) + 1 }, (_, i) => i * 10).map((t, idx, arr) => (
-                                                                    <span key={t} className="absolute" style={{ left: `${(t / TOTAL_DURATION) * 100}%`, transform: idx === 0 ? 'none' : idx === arr.length - 1 ? 'translateX(-100%)' : 'translateX(-50%)' }}>{t}s</span>
-                                                                ))}
+                                                    <div className="relative w-full h-[300px] flex border border-white/5 bg-[#0a0a0a] rounded-md overflow-hidden mt-4">
+                                                        {/* Left Column - Fixed Width 150px */}
+                                                        <div className="w-[150px] shrink-0 border-r border-white/10 flex flex-col bg-[#0a0a0a] z-20">
+                                                            {/* Top Left Header */}
+                                                            <div className="h-[28px] border-b border-white/10 shrink-0 flex items-center px-4 bg-[#111]">
+                                                                <span className="text-[10px] text-gray-500 font-mono tracking-widest">TIMELINE</span>
                                                             </div>
-                                                            <div
-                                                                className="relative w-full bg-white/5 h-32 rounded-md border border-white/5 overflow-hidden mt-4 cursor-crosshair"
-                                                                onPointerDown={(e) => {
-                                                                    e.preventDefault();
-                                                                    const container = e.currentTarget;
-                                                                    container.setPointerCapture(e.pointerId);
+                                                            {/* Left Tracks Scrollable */}
+                                                            <div 
+                                                                className="flex-1 overflow-y-hidden custom-scrollbar py-2 space-y-1 bg-[#0a0a0a]"
+                                                                id="track-headers-scroll"
+                                                            >
+                                                                {tracks.map((track, tIndex) => (
+                                                                    <div key={track.id} className="h-10 px-2 flex items-center justify-between bg-white/5 rounded-r mr-1 shrink-0">
+                                                                        <span className="text-[10px] text-gray-500 font-mono">Track {tIndex + 1}</span>
+                                                                        <button 
+                                                                            onClick={(e) => {
+                                                                                e.stopPropagation();
+                                                                                setElements(prevElements => prevElements.map(el => {
+                                                                                    if ((el.trackId || 'track-0') === track.id) {
+                                                                                        const currentTiming = elementTimings.get(el.elementId);
+                                                                                        if (currentTiming) {
+                                                                                            const mode = getVariantModeRef.current(el.elementId);
+                                                                                            return applyToElement(el, { startTime: currentTiming.startTime }, mode);
+                                                                                        }
+                                                                                    }
+                                                                                    return el;
+                                                                                }));
+                                                                                setTracks(prev => prev.map(t => t.id === track.id ? { ...t, magnet: !t.magnet } : t));
+                                                                            }}
+                                                                            onPointerDown={(e) => e.stopPropagation()}
+                                                                            className={cn("px-1.5 py-0.5 rounded transition-colors text-[9px]", track.magnet ? "bg-pink-500/20 text-pink-400 font-bold border border-pink-500/50" : "hover:bg-white/10")}
+                                                                        >
+                                                                            🧲 {track.magnet ? 'ON' : 'OFF'}
+                                                                        </button>
+                                                                    </div>
+                                                                ))}
+                                                                <button 
+                                                                    onClick={(e) => {
+                                                                        e.stopPropagation();
+                                                                        setTracks(prev => [...prev, { id: `track-${Date.now()}`, magnet: false }]);
+                                                                    }}
+                                                                    onPointerDown={(e) => e.stopPropagation()}
+                                                                    className="w-[140px] mx-auto block py-2 text-[9px] font-mono font-bold text-gray-500 hover:bg-white/5 border border-dashed border-white/10 rounded transition-colors mt-2"
+                                                                >
+                                                                    + NEW TRACK
+                                                                </button>
+                                                            </div>
+                                                        </div>
 
-                                                                    const seek = (clientX: number) => {
-                                                                        const rect = container.getBoundingClientRect();
-                                                                        const pct = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-                                                                        const t = pct * TOTAL_DURATION;
-                                                                        setCurrentTime(t);
-                                                                    };
-                                                                    seek(e.clientX);
-                                                                    const onMove = (ev: PointerEvent) => seek(ev.clientX);
-                                                                    const onUp = () => {
-                                                                        container.removeEventListener('pointermove', onMove);
-                                                                        container.removeEventListener('pointerup', onUp);
-                                                                    };
-                                                                    container.addEventListener('pointermove', onMove);
-                                                                    container.addEventListener('pointerup', onUp);
+                                                        {/* Right Column - Flex 1 */}
+                                                        <div className="flex-1 flex flex-col min-w-0 bg-[#111]">
+                                                            {/* Timeline X-Scroll Wrapper */}
+                                                            <div className="flex-1 overflow-x-auto overflow-y-auto custom-scrollbar relative flex flex-col"
+                                                                onScroll={(e) => {
+                                                                    const leftHeaders = document.getElementById('track-headers-scroll');
+                                                                    if (leftHeaders) {
+                                                                        leftHeaders.scrollTop = e.currentTarget.scrollTop;
+                                                                    }
                                                                 }}
                                                             >
-                                                                {/* Timeline Grid — every 10s */}
-                                                                <div className="absolute inset-0 opacity-[0.2]" style={{ backgroundImage: 'linear-gradient(90deg, rgba(255,255,255,0.1) 1px, transparent 1px)', backgroundSize: `${(10 / TOTAL_DURATION) * 100}% 100%` }} />
+                                                                <div style={{ width: `${Math.max(100, TOTAL_DURATION * 20)}px`, minWidth: '100%', minHeight: '100%' }} className="flex flex-col relative">
+                                                                    {/* Playhead vertical line (Entire height) */}
+                                                                    <div
+                                                                        className="absolute top-0 bottom-0 w-[1px] bg-red-500 z-40 transition-none pointer-events-none"
+                                                                        style={{ left: `${(currentTime / TOTAL_DURATION) * 100}%`, boxShadow: '0 0 6px rgba(239,68,68,0.6)' }}
+                                                                    />
 
-                                                                {/* Playhead — draggable */}
-                                                                <div
-                                                                    className="absolute top-0 bottom-0 w-[2px] bg-red-500 z-40 transition-none"
-                                                                    style={{ left: `${(currentTime / TOTAL_DURATION) * 100}%`, boxShadow: '0 0 6px rgba(239,68,68,0.6)' }}
-                                                                >
-                                                                    <div className="absolute -top-1.5 left-1/2 -translate-x-1/2 w-3 h-3 bg-red-500 rounded-full cursor-grab active:cursor-grabbing hover:scale-125 transition-transform pointer-events-auto z-50" />
-                                                                </div>
-
-                                                                {/* Tracks */}
-                                                                <div className="absolute inset-0 py-1 space-y-1 overflow-y-auto custom-scrollbar">
-                                                                    {elements.length === 0 && (
-                                                                        <div className="w-full h-full flex flex-col items-center justify-center text-gray-600 opacity-50 relative pointer-events-none mt-2">
-                                                                            <Layers className="w-5 h-5 mb-1 opacity-50" />
-                                                                            <span className="text-[9px] font-mono tracking-widest text-[#222] bg-[#0a0a0a]">DROP ASSETS TO START</span>
-                                                                            <div className="absolute top-1/2 w-full border-t border-dashed border-white/5 -z-10" />
-                                                                        </div>
-                                                                    )}
-                                                                    {[...elements].sort((a, b) => b.zIndex - a.zIndex).map((el, i) => {
-                                                                        const TOTAL = TOTAL_DURATION;
-                                                                        const SNAP_THRESHOLD = 0.3; // seconds
-
-                                                                        // For media elements, resolve effective timing from variant overrides
-                                                                        const isMediaEl = el.collectionType === 'video' || el.collectionType === 'audio';
-                                                                        const activeVariantMode = getVariantMode(el.elementId);
-                                                                        // In 'all' mode for media, timeline is a non-interactive placeholder
-                                                                        const isMediaAllMode = isMediaEl && activeVariantMode === 'all';
-
-                                                                        // Compute effectiveEl for display:
-                                                                        const timing = elementTimings.get(el.elementId) || { startTime: el.startTime, duration: el.duration };
-                                                                        let effectiveEl = el;
-                                                                        
-                                                                        if (isMediaEl && el.variantOverrides) {
-                                                                            if (activeVariantMode !== 'all' && el.variantOverrides[activeVariantMode]) {
-                                                                                effectiveEl = { ...el, ...el.variantOverrides[activeVariantMode], ...timing } as CanvasElement;
-                                                                            } else {
-                                                                                effectiveEl = { ...el, ...timing } as CanvasElement;
-                                                                            }
-                                                                        } else {
-                                                                            effectiveEl = { ...el, ...timing } as CanvasElement;
-                                                                        }
-
-                                                                        // Collect snap points from OTHER elements
-                                                                        const snapPoints = elements
-                                                                            .filter(o => o.elementId !== el.elementId)
-                                                                            .flatMap(o => {
-                                                                                const t = elementTimings.get(o.elementId) || { startTime: o.startTime, duration: o.duration };
-                                                                                return [
-                                                                                    { val: t.startTime, targetId: o.elementId, edge: 'start' as const },
-                                                                                    { val: t.startTime + t.duration, targetId: o.elementId, edge: 'end' as const }
-                                                                                ];
-                                                                            });
-
-                                                                        const snapValue = (val: number) => {
-                                                                            for (const sp of snapPoints) {
-                                                                                if (Math.abs(val - sp.val) < SNAP_THRESHOLD) return sp;
-                                                                            }
-                                                                            return null;
-                                                                        };
-
-                                                                        const handleSegmentDrag = (e: React.PointerEvent) => {
-                                                                            e.stopPropagation();
+                                                                    {/* Top Ticks */}
+                                                                    <div className="sticky top-0 h-[28px] shrink-0 border-b border-white/10 bg-[#111] z-50 cursor-crosshair"
+                                                                        onPointerDown={(e) => {
                                                                             e.preventDefault();
-                                                                            const target = (e.currentTarget as HTMLElement).closest('.relative.h-6') as HTMLElement;
-                                                                            const track = target?.parentElement;
-                                                                            if (!track) return;
-                                                                            const startX = e.clientX;
-                                                                            const origStart = effectiveEl.startTime; // resolved position at drag start
-                                                                            const dur = effectiveEl.duration;
-                                                                            const varMode = getVariantMode(el.elementId);
+                                                                            const container = e.currentTarget;
+                                                                            container.setPointerCapture(e.pointerId);
 
-                                                                            (e.target as HTMLElement).setPointerCapture(e.pointerId);
-
-                                                                            // STEP 1: At drag start, break any existing syncWith constraint.
-                                                                            // Set startTime to the current resolved position so the clip stays in place visually.
-                                                                            // This ensures the element is free to move independently during the drag.
-                                                                            setElements(prev => prev.map(x => x.elementId === el.elementId
-                                                                                ? applyToElement(x, { startTime: origStart, syncWith: null }, varMode)
-                                                                                : x));
-
-                                                                            // Track where we'll snap to — stored in a closure variable, NOT state.
-                                                                            // Writing to state every frame causes elementTimings to recompute,
-                                                                            // which creates oscillation between snapped/unsnapped mid-drag.
-                                                                            let pendingSnapTarget: { targetId: string, edge: 'start' | 'end' } | null = null;
-
-                                                                            const onMove = (ev: PointerEvent) => {
-                                                                                const trackRect = track.getBoundingClientRect();
-                                                                                const dx = ev.clientX - startX;
-                                                                                const dTime = (dx / trackRect.width) * TOTAL;
-                                                                                let newStart = Math.max(0, Math.min(TOTAL - dur, origStart + dTime));
-                                                                                const activeSnaps: number[] = [];
-
-                                                                                pendingSnapTarget = null;
-                                                                                const startSnap = snapValue(newStart);
-                                                                                if (startSnap) {
-                                                                                    newStart = startSnap.val;
-                                                                                    activeSnaps.push(startSnap.val);
-                                                                                    pendingSnapTarget = { targetId: startSnap.targetId, edge: startSnap.edge };
-                                                                                } else {
-                                                                                    const endSnap = snapValue(newStart + dur);
-                                                                                    if (endSnap) {
-                                                                                        newStart = endSnap.val - dur;
-                                                                                        activeSnaps.push(endSnap.val);
-                                                                                        // End-edge snap: no syncWith (we only create syncWith for start-edge snaps)
-                                                                                    }
-                                                                                }
-
-                                                                                newStart = Math.max(0, Math.min(TOTAL - dur, newStart));
-                                                                                setTimelineSnapLines(activeSnaps);
-
-                                                                                // ONLY update startTime during drag — no syncWith changes.
-                                                                                // This prevents elementTimings from recomputing and causing oscillation.
-                                                                                setElements(prev => prev.map(x => x.elementId === el.elementId
-                                                                                    ? applyToElement(x, { startTime: Math.round(newStart * 10) / 10 }, varMode)
-                                                                                    : x));
+                                                                            const seek = (clientX: number) => {
+                                                                                const rect = container.getBoundingClientRect();
+                                                                                const pct = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+                                                                                const t = pct * TOTAL_DURATION;
+                                                                                setCurrentTime(t);
                                                                             };
+                                                                            seek(e.clientX);
+                                                                            const onMove = (ev: PointerEvent) => seek(ev.clientX);
                                                                             const onUp = () => {
-                                                                                setTimelineSnapLines([]);
-                                                                                // STEP 3: On release, commit the snap relationship (or leave as absolute).
-                                                                                if (pendingSnapTarget) {
-                                                                                    setElements(prev => prev.map(x => x.elementId === el.elementId
-                                                                                        ? applyToElement(x, { syncWith: pendingSnapTarget }, varMode)
-                                                                                        : x));
-                                                                                }
-                                                                                // If not snapped, syncWith is already null from drag-start — nothing more to do.
-                                                                                window.removeEventListener('pointermove', onMove);
-                                                                                window.removeEventListener('pointerup', onUp);
+                                                                                container.removeEventListener('pointermove', onMove);
+                                                                                container.removeEventListener('pointerup', onUp);
                                                                             };
-                                                                            window.addEventListener('pointermove', onMove);
-                                                                            window.addEventListener('pointerup', onUp);
-                                                                        };
-
-                                                                        const handleEdgeDrag = (edge: 'left' | 'right', e: React.PointerEvent) => {
-                                                                            e.stopPropagation();
-                                                                            e.preventDefault();
-                                                                            const target = (e.currentTarget as HTMLElement).closest('.relative.h-6') as HTMLElement;
-                                                                            const track = target?.parentElement;
-                                                                            if (!track) return;
-                                                                            const startX = e.clientX;
-                                                                            const origStart = effectiveEl.startTime;
-                                                                            const origDur = effectiveEl.duration;
-
-                                                                            (e.target as HTMLElement).setPointerCapture(e.pointerId);
-
-                                                                            const onMove = (ev: PointerEvent) => {
-                                                                                const trackRect = track.getBoundingClientRect();
-                                                                                const dx = ev.clientX - startX;
-                                                                                const dTime = (dx / trackRect.width) * TOTAL;
-
-                                                                                if (edge === 'left') {
-                                                                                    let newStart = Math.max(0, origStart + dTime);
-                                                                                    let newDur = origDur - (newStart - origStart);
-
-                                                                                    if (newDur < 0.5) { newStart = origStart + origDur - 0.5; newDur = 0.5; }
-                                                                                    const snapped = snapValue(newStart);
-                                                                                    if (snapped) { newDur += (newStart - snapped.val); newStart = snapped.val; setTimelineSnapLines([snapped.val]); } else { setTimelineSnapLines([]); }
-
-                                                                                    if (isMediaEl) {
-                                                                                        const maxAllowedDur = getMediaDurationLimit(el, activeVariantMode, collections, TOTAL_DURATION);
-                                                                                        if (newDur > maxAllowedDur) {
-                                                                                            newDur = maxAllowedDur;
-                                                                                            newStart = origStart + origDur - newDur;
-                                                                                        }
-                                                                                    }
-
-                                                                                    const varMode = getVariantMode(el.elementId);
-                                                                                    const updates: Partial<CanvasElement> = { startTime: Math.round(newStart * 10) / 10, duration: Math.round(newDur * 10) / 10, syncWith: null };
-                                                                                    // Adjust mediaOffset when trimming left edge of media
-                                                                                    if (isMediaEl) {
-                                                                                        const startDelta = newStart - origStart;
-                                                                                        updates.mediaOffset = Math.max(0, Math.round(((effectiveEl.mediaOffset ?? 0) + startDelta) * 10) / 10);
-                                                                                    }
-                                                                                    setElements(prev => prev.map(x => x.elementId === el.elementId ? applyToElement(x, updates, varMode) : x));
-                                                                                } else {
-                                                                                    let newDur = Math.max(0.5, Math.min(TOTAL - origStart, origDur + dTime));
-
-                                                                                    const snappedEnd = snapValue(origStart + newDur);
-                                                                                    if (snappedEnd) { newDur = snappedEnd.val - origStart; setTimelineSnapLines([snappedEnd.val]); } else { setTimelineSnapLines([]); }
-                                                                                    newDur = Math.max(0.5, newDur);
-
-                                                                                    if (isMediaEl) {
-                                                                                        const maxAllowedDur = getMediaDurationLimit(el, activeVariantMode, collections, TOTAL_DURATION);
-                                                                                        newDur = Math.min(newDur, maxAllowedDur);
-                                                                                    }
-
-                                                                                    const varMode = getVariantMode(el.elementId);
-                                                                                    setElements(prev => prev.map(x => x.elementId === el.elementId ? applyToElement(x, { duration: Math.round(newDur * 10) / 10 }, varMode) : x));
-                                                                                }
-                                                                            };
-                                                                            const onUp = () => {
-                                                                                setTimelineSnapLines([]);
-                                                                                window.removeEventListener('pointermove', onMove);
-                                                                                window.removeEventListener('pointerup', onUp);
-                                                                            };
-                                                                            window.addEventListener('pointermove', onMove);
-                                                                            window.addEventListener('pointerup', onUp);
-                                                                        };
-
-                                                                        const colors = COLLECTION_COLORS[el.collectionType];
-                                                                        const isSelected = selectedElementId === el.elementId;
-                                                                        const col = collections.find(c => c.id === el.collectionId);
-                                                                        const elVarMode = getVariantMode(el.elementId);
-                                                                        const editingVariantStr = elVarMode !== 'all' ? col?.items.find(v => v.id === elVarMode)?.label : null;
-                                                                        const displayText = editingVariantStr ? `${el.title} [${editingVariantStr}]` : el.title;
-
-                                                                        return (
-                                                                            <div key={el.elementId} className="relative h-6 rounded overflow-hidden bg-black border border-white/10 shrink-0">
-                                                                                <div
-                                                                                    className={cn(
-                                                                                        "absolute top-0 bottom-0 rounded flex items-center shrink-0 min-w-[20px] transition-colors",
-                                                                                        timelineTool === 'split' ? "" : "cursor-grab active:cursor-grabbing",
-                                                                                        isMediaAllMode
-                                                                                            ? (selectedElementId === el.elementId ? 'bg-gray-600/60 border border-gray-400/50' : 'bg-gray-700/40 border border-transparent hover:bg-gray-600/40')
-                                                                                            : (selectedElementId === el.elementId ? 'bg-blue-600 border border-blue-400' : 'bg-blue-900 border border-transparent hover:bg-blue-800')
-                                                                                    )}
-                                                                                    style={{
-                                                                                        left: `${(effectiveEl.startTime / TOTAL) * 100}%`,
-                                                                                        width: `${(effectiveEl.duration / TOTAL) * 100}%`,
-                                                                                        cursor: timelineTool === 'split' ? `url('data:image/svg+xml;utf8,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><line x1="20" y1="4" x2="8.12" y2="15.88"/><line x1="14.47" y1="14.48" x2="20" y2="20"/><line x1="8.12" y1="8.12" x2="12" y2="12"/></svg>')}') 12 12, crosshair` : undefined
-                                                                                    }}
-                                                                                    onClick={(e) => {
-                                                                                        e.stopPropagation();
-                                                                                        if (timelineTool === 'pointer') {
-                                                                                            setSelectedElementId(el.elementId);
-                                                                                        }
-                                                                                    }}
-                                                                                    onPointerDown={(e) => {
-                                                                                        e.stopPropagation();
-                                                                                        
-                                                                                        // Even in ALL mode we can drag now
-                                                                                        if (isMediaAllMode) {
-                                                                                            setSelectedElementId(el.elementId);
-                                                                                        }
-
-                                                                                        if (timelineTool === 'split') {
-                                                                                            const track = e.currentTarget.parentElement;
-                                                                                            if (!track) return;
-                                                                                            const trackRect = track.getBoundingClientRect();
-                                                                                            const px = e.clientX - trackRect.left;
-                                                                                            const splitPxTime = (px / trackRect.width) * TOTAL;
-                                                                                            handleSplit(el.elementId, splitPxTime);
-                                                                                            return;
-                                                                                        }
-                                                                                        handleSegmentDrag(e);
-                                                                                    }}
-                                                                                    onPointerMove={(e) => {
-                                                                                        if (timelineTool === 'split') {
-                                                                                            const track = e.currentTarget.parentElement;
-                                                                                            if (!track) return;
-                                                                                            const trackRect = track.getBoundingClientRect();
-                                                                                            const px = e.clientX - trackRect.left;
-                                                                                            const hoverTime = (px / trackRect.width) * TOTAL;
-                                                                                            if (hoverTime > effectiveEl.startTime + 0.1 && hoverTime < effectiveEl.startTime + effectiveEl.duration - 0.1) {
-                                                                                                setSplitHoverPosition({ elementId: el.elementId, time: hoverTime, relativePx: px });
-                                                                                            } else {
-                                                                                                setSplitHoverPosition(null);
-                                                                                            }
-                                                                                        }
-                                                                                    }}
-                                                                                    onPointerLeave={() => {
-                                                                                        if (timelineTool === 'split' && splitHoverPosition?.elementId === el.elementId) {
-                                                                                            setSplitHoverPosition(null);
-                                                                                        }
-                                                                                    }}
-                                                                                >
-                                                                                    {/* Left resize handle — hidden in 'all' mode for media */}
-                                                                                    {!isMediaAllMode && (
-                                                                                        <div
-                                                                                            className={cn("absolute left-0 top-0 bottom-0 w-2 hover:bg-white/30 z-10", timelineTool === 'split' ? "pointer-events-none" : "cursor-ew-resize")}
-                                                                                            onPointerDown={(e) => {
-                                                                                                if (timelineTool === 'split') return;
-                                                                                                handleEdgeDrag('left', e);
-                                                                                            }}
-                                                                                        />
-                                                                                    )}
-                                                                                    {/* Waveform visualization for audio/video */}
-                                                                                    {(el.collectionType === 'audio' || el.collectionType === 'video') && (
-                                                                                        <TimelineWaveform
-                                                                                            elementId={el.elementId}
-                                                                                            collectionType={el.collectionType}
-                                                                                            segPxWidth={Math.round((effectiveEl.duration / TOTAL) * Math.max(100, TOTAL_DURATION * 20))}
-                                                                                        />
-                                                                                    )}
-                                                                                    {/* Content */}
-                                                                                    <span className="text-[9px] font-mono text-white/90 truncate px-2 select-none z-[1] pointer-events-none relative">
-                                                                                        {isMediaAllMode ? `${displayText} ⬦` : displayText}
-                                                                                    </span>
-                                                                                    {/* Right resize handle — hidden in 'all' mode for media */}
-                                                                                    {!isMediaAllMode && (
-                                                                                        <div
-                                                                                            className={cn("absolute right-0 top-0 bottom-0 w-2 hover:bg-white/30 z-10", timelineTool === 'split' ? "pointer-events-none" : "cursor-ew-resize")}
-                                                                                            onPointerDown={(e) => {
-                                                                                                if (timelineTool === 'split') return;
-                                                                                                handleEdgeDrag('right', e);
-                                                                                            }}
-                                                                                        />
-                                                                                    )}
-                                                                                </div>
-
-                                                                                {/* Split Hover Indicator */}
-                                                                                {timelineTool === 'split' && splitHoverPosition?.elementId === el.elementId && (
-                                                                                    <div
-                                                                                        className="absolute top-0 bottom-0 w-[1px] border-l border-dashed border-red-500 z-50 pointer-events-none"
-                                                                                        style={{ left: `${(splitHoverPosition.time / TOTAL) * 100}%` }}
-                                                                                    />
-                                                                                )}
+                                                                            container.addEventListener('pointermove', onMove);
+                                                                            container.addEventListener('pointerup', onUp);
+                                                                        }}
+                                                                    >
+                                                                        <div className="relative w-full h-full text-[9px] font-mono text-gray-600">
+                                                                            {Array.from({ length: Math.floor(TOTAL_DURATION / 10) + 1 }, (_, i) => i * 10).map((t, idx, arr) => (
+                                                                                <span key={t} className="absolute bottom-1" style={{ left: `${(t / TOTAL_DURATION) * 100}%`, transform: idx === 0 ? 'none' : idx === arr.length - 1 ? 'translateX(-100%)' : 'translateX(-50%)' }}>
+                                                                                    {t}s
+                                                                                </span>
+                                                                            ))}
+                                                                            
+                                                                            {/* Playhead Handle */}
+                                                                            <div
+                                                                                className="absolute top-0 bottom-0 z-50 pointer-events-auto"
+                                                                                style={{ left: `${(currentTime / TOTAL_DURATION) * 100}%` }}
+                                                                            >
+                                                                                <div className="absolute top-0 left-1/2 -translate-x-1/2 w-3 h-full bg-red-500/80 cursor-grab active:cursor-grabbing hover:bg-red-400 transition-colors" />
                                                                             </div>
-                                                                        );
-                                                                    })}
+                                                                        </div>
+                                                                    </div>
+
+                                                                    {/* Tracks Area (Scrubber) */}
+                                                                    <div 
+                                                                        className="relative flex-1 py-2 space-y-1 cursor-crosshair"
+                                                                        onPointerDown={(e) => {
+                                                                            if ((e.target as HTMLElement).closest('.track-element-clip')) return;
+                                                                            e.preventDefault();
+                                                                            const container = e.currentTarget;
+                                                                            container.setPointerCapture(e.pointerId);
+
+                                                                            const seek = (clientX: number) => {
+                                                                                const rect = container.getBoundingClientRect();
+                                                                                const pct = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+                                                                                const t = pct * TOTAL_DURATION;
+                                                                                setCurrentTime(t);
+                                                                            };
+                                                                            seek(e.clientX);
+                                                                            const onMove = (ev: PointerEvent) => seek(ev.clientX);
+                                                                            const onUp = () => {
+                                                                                container.removeEventListener('pointermove', onMove);
+                                                                                container.removeEventListener('pointerup', onUp);
+                                                                            };
+                                                                            container.addEventListener('pointermove', onMove);
+                                                                            container.addEventListener('pointerup', onUp);
+                                                                        }}
+                                                                    >
+                                                                        {/* Background Grid */}
+                                                                        <div className="absolute inset-0 opacity-[0.2] pointer-events-none" style={{ backgroundImage: 'linear-gradient(90deg, rgba(255,255,255,0.1) 1px, transparent 1px)', backgroundSize: `${(10 / TOTAL_DURATION) * 100}% 100%` }} />
+
+                                                                        {/* Empty state */}
+                                                                        {elements.length === 0 && (
+                                                                            <div className="absolute top-1/2 -translate-y-1/2 left-1/2 -translate-x-1/2 pointer-events-none flex flex-col items-center justify-center text-gray-600 opacity-50 z-20">
+                                                                                <Layers className="w-5 h-5 mb-1 opacity-50" />
+                                                                                <span className="text-[9px] font-mono tracking-widest text-[#222]">DROP ASSETS TO START</span>
+                                                                            </div>
+                                                                        )}
+
+                                                                        {tracks.map((track) => {
+                                                                            const trackElements = elements.filter(el => (el.trackId || 'track-0') === track.id);
+                                                                            return (
+                                                                                <div key={track.id} data-track-id={track.id} className="relative h-10 px-1 w-full bg-white/5 rounded border border-white/5 shrink-0 flex items-center track-row">
+                                                                                    <div className="relative h-8 w-full bg-black/50 rounded overflow-hidden">
+                                                                                    {trackElements.sort((a, b) => b.zIndex - a.zIndex).map((el, i) => {
+                                                                                        const TOTAL = TOTAL_DURATION;
+
+                                                                                        const isMediaEl = el.collectionType === 'video' || el.collectionType === 'audio';
+                                                                                        const activeVariantMode = getVariantMode(el.elementId);
+                                                                                        const isMediaAllMode = isMediaEl && activeVariantMode === 'all';
+
+                                                                                        const timing = elementTimings.get(el.elementId) || { startTime: el.startTime, duration: el.duration };
+                                                                                        let effectiveEl = el;
+                                                                                        
+                                                                                        if (isMediaEl && el.variantOverrides) {
+                                                                                            if (activeVariantMode !== 'all' && el.variantOverrides[activeVariantMode]) {
+                                                                                                effectiveEl = { ...el, ...el.variantOverrides[activeVariantMode], ...timing } as CanvasElement;
+                                                                                            } else {
+                                                                                                effectiveEl = { ...el, ...timing } as CanvasElement;
+                                                                                            }
+                                                                                        } else {
+                                                                                            effectiveEl = { ...el, ...timing } as CanvasElement;
+                                                                                        }
+
+                                                                                        const handleSegmentDrag = (e: React.PointerEvent) => {
+                                                                                            e.stopPropagation();
+                                                                                            e.preventDefault();
+                                                                                            // In magnet mode, order is controlled by resolveElementTimings — don't allow free drag
+                                                                                            if (track.magnet) {
+                                                                                                setSelectedElementId(el.elementId);
+                                                                                                return;
+                                                                                            }
+                                                                                            const target = (e.currentTarget as HTMLElement).closest('.relative.h-8') as HTMLElement;
+                                                                                            if (!target) return;
+                                                                                            const startX = e.clientX;
+                                                                                            const resolvedTiming = elementTimings.get(el.elementId) || { startTime: el.startTime, duration: el.duration };
+                                                                                            const origStart = resolvedTiming.startTime;
+                                                                                            const dur = resolvedTiming.duration;
+                                                                                            const varMode = getVariantMode(el.elementId);
+
+                                                                                            // Precalculate gaps for all tracks at drag start
+                                                                                            const gapsByTrack: Record<string, {start: number, end: number}[]> = {};
+                                                                                            for (const t of tracks) {
+                                                                                                const occupied = elements
+                                                                                                    .filter(o => o.elementId !== el.elementId && (o.trackId || 'track-0') === t.id)
+                                                                                                    .map(o => {
+                                                                                                        const tm = elementTimings.get(o.elementId) || { startTime: o.startTime, duration: o.duration };
+                                                                                                        return { start: tm.startTime, end: tm.startTime + tm.duration };
+                                                                                                    })
+                                                                                                    .sort((a, b) => a.start - b.start);
+
+                                                                                                const merged: { start: number; end: number }[] = [];
+                                                                                                for (const occ of occupied) {
+                                                                                                    if (merged.length > 0 && occ.start <= merged[merged.length - 1].end + 0.01) {
+                                                                                                        merged[merged.length - 1].end = Math.max(merged[merged.length - 1].end, occ.end);
+                                                                                                    } else {
+                                                                                                        merged.push({ ...occ });
+                                                                                                    }
+                                                                                                }
+
+                                                                                                const gaps: { start: number; end: number }[] = [];
+                                                                                                let cursor = 0;
+                                                                                                for (const m of merged) {
+                                                                                                    if (m.start > cursor + 0.01) gaps.push({ start: cursor, end: m.start });
+                                                                                                    cursor = Math.max(cursor, m.end);
+                                                                                                }
+                                                                                                if (cursor < TOTAL - 0.01) gaps.push({ start: cursor, end: TOTAL });
+                                                                                                gapsByTrack[t.id] = gaps;
+                                                                                            }
+
+                                                                                            const allTrackElements = Array.from(document.querySelectorAll('.track-row')) as HTMLElement[];
+                                                                                            const trackBounds = allTrackElements.map(tel => ({
+                                                                                                id: tel.getAttribute('data-track-id')!,
+                                                                                                rect: tel.getBoundingClientRect()
+                                                                                            }));
+
+                                                                                            let currentHoveredTrackId = el.trackId || 'track-0';
+                                                                                            const initialGaps = gapsByTrack[currentHoveredTrackId] || [{ start: 0, end: TOTAL }];
+                                                                                            let currentActiveGap = initialGaps.sort((a, b) => {
+                                                                                                const overlapA = Math.max(0, Math.min(a.end, origStart + dur) - Math.max(a.start, origStart));
+                                                                                                const overlapB = Math.max(0, Math.min(b.end, origStart + dur) - Math.max(b.start, origStart));
+                                                                                                if (overlapA !== overlapB) return overlapB - overlapA;
+                                                                                                const elemCenter = origStart + dur / 2;
+                                                                                                return Math.abs((a.start + a.end) / 2 - elemCenter) - Math.abs((b.start + b.end) / 2 - elemCenter);
+                                                                                            })[0];
+
+                                                                                            (e.target as HTMLElement).setPointerCapture(e.pointerId);
+
+                                                                                            const onMove = (ev: PointerEvent) => {
+                                                                                                const trackRect = target.getBoundingClientRect();
+                                                                                                const dx = ev.clientX - startX;
+                                                                                                const dTime = (dx / trackRect.width) * TOTAL;
+                                                                                                const projectedStart = origStart + dTime;
+                                                                                                
+                                                                                                let hoveredTrackId = currentHoveredTrackId;
+                                                                                                for (const tb of trackBounds) {
+                                                                                                    if (ev.clientY >= tb.rect.top && ev.clientY <= tb.rect.bottom) {
+                                                                                                        hoveredTrackId = tb.id;
+                                                                                                        break;
+                                                                                                    }
+                                                                                                }
+
+                                                                                                if (hoveredTrackId !== currentHoveredTrackId) {
+                                                                                                    currentHoveredTrackId = hoveredTrackId;
+                                                                                                    const gaps = gapsByTrack[hoveredTrackId] || [{ start: 0, end: TOTAL }];
+                                                                                                    currentActiveGap = gaps.sort((a, b) => {
+                                                                                                        const overlapA = Math.max(0, Math.min(a.end, projectedStart + dur) - Math.max(a.start, projectedStart));
+                                                                                                        const overlapB = Math.max(0, Math.min(b.end, projectedStart + dur) - Math.max(b.start, projectedStart));
+                                                                                                        if (overlapA !== overlapB) return overlapB - overlapA;
+                                                                                                        const elemCenter = projectedStart + dur / 2;
+                                                                                                        return Math.abs((a.start + a.end) / 2 - elemCenter) - Math.abs((b.start + b.end) / 2 - elemCenter);
+                                                                                                    })[0];
+                                                                                                }
+
+                                                                                                let safeStart = projectedStart;
+                                                                                                const hoveredTrackConfig = tracks.find(t => t.id === hoveredTrackId);
+                                                                                                
+                                                                                                if (hoveredTrackConfig && !hoveredTrackConfig.magnet) {
+                                                                                                    const leftWall = currentActiveGap ? currentActiveGap.start : 0;
+                                                                                                    const rightWall = currentActiveGap ? currentActiveGap.end : TOTAL;
+                                                                                                    const safeRight = Math.max(leftWall, rightWall - dur);
+                                                                                                    safeStart = Math.max(leftWall, Math.min(safeRight, projectedStart));
+                                                                                                }
+
+                                                                                                const varMode = getVariantMode(el.elementId);
+                                                                                                setElements(prev => prev.map(x => 
+                                                                                                    x.elementId === el.elementId 
+                                                                                                        ? applyToElement({ ...x, trackId: hoveredTrackId }, { startTime: Math.round(safeStart * 1000) / 1000 }, varMode) 
+                                                                                                        : x
+                                                                                                ));
+                                                                                            };
+                                                                                            const onUp = () => {
+                                                                                                window.removeEventListener('pointermove', onMove);
+                                                                                                window.removeEventListener('pointerup', onUp);
+                                                                                            };
+                                                                                            window.addEventListener('pointermove', onMove);
+                                                                                            window.addEventListener('pointerup', onUp);
+                                                                                        };
+
+                                                                                        const handleEdgeDrag = (edge: 'left' | 'right', e: React.PointerEvent) => {
+                                                                                            e.stopPropagation();
+                                                                                            e.preventDefault();
+                                                                                            if (track.magnet) return;
+                                                                                            const target = (e.currentTarget as HTMLElement).closest('.relative.h-8') as HTMLElement;
+                                                                                            if (!target) return;
+                                                                                            const startX = e.clientX;
+                                                                                            const origStart = effectiveEl.startTime;
+                                                                                            const origDur = effectiveEl.duration;
+
+                                                                                            const occupied = elements
+                                                                                                .filter(o => o.elementId !== el.elementId && (o.trackId || 'track-0') === (el.trackId || 'track-0'))
+                                                                                                .map(o => {
+                                                                                                    const t = elementTimings.get(o.elementId) || { startTime: o.startTime, duration: o.duration };
+                                                                                                    return { start: t.startTime, end: t.startTime + t.duration };
+                                                                                                })
+                                                                                                .sort((a, b) => a.start - b.start);
+
+                                                                                            const merged: { start: number; end: number }[] = [];
+                                                                                            for (const occ of occupied) {
+                                                                                                if (merged.length > 0 && occ.start <= merged[merged.length - 1].end + 0.01) {
+                                                                                                    merged[merged.length - 1].end = Math.max(merged[merged.length - 1].end, occ.end);
+                                                                                                } else {
+                                                                                                    merged.push({ ...occ });
+                                                                                                }
+                                                                                            }
+
+                                                                                            const gaps: { start: number; end: number }[] = [];
+                                                                                            let gapCursor = 0;
+                                                                                            for (const m of merged) {
+                                                                                                if (m.start > gapCursor + 0.01) {
+                                                                                                    gaps.push({ start: gapCursor, end: m.start });
+                                                                                                }
+                                                                                                gapCursor = Math.max(gapCursor, m.end);
+                                                                                            }
+                                                                                            if (gapCursor < TOTAL - 0.01) {
+                                                                                                gaps.push({ start: gapCursor, end: TOTAL });
+                                                                                            }
+
+                                                                                            let activeGap = gaps.sort((a, b) => {
+                                                                                                const overlapA = Math.max(0, Math.min(a.end, origStart + origDur) - Math.max(a.start, origStart));
+                                                                                                const overlapB = Math.max(0, Math.min(b.end, origStart + origDur) - Math.max(b.start, origStart));
+                                                                                                if (overlapA !== overlapB) return overlapB - overlapA;
+                                                                                                const elemCenter = origStart + origDur / 2;
+                                                                                                return Math.abs((a.start + a.end) / 2 - elemCenter) - Math.abs((b.start + b.end) / 2 - elemCenter);
+                                                                                            })[0];
+                                                                                            const leftLimit = activeGap ? activeGap.start : 0;
+                                                                                            const rightLimit = activeGap ? activeGap.end : TOTAL;
+                                                                                            
+                                                                                            (e.target as HTMLElement).setPointerCapture(e.pointerId);
+                                                                                            
+                                                                                            const onMove = (ev: PointerEvent) => {
+                                                                                                const trackRect = target.getBoundingClientRect();
+                                                                                                const dx = ev.clientX - startX;
+                                                                                                const dTime = (dx / trackRect.width) * TOTAL;
+                                                                                            
+                                                                                                if (edge === 'left') {
+                                                                                                    let newStart = Math.max(leftLimit, origStart + dTime);
+                                                                                                    let newDur = origDur - (newStart - origStart);
+                                                                                                    if (newDur < 0.5) { newStart = origStart + origDur - 0.5; newDur = 0.5; }
+                                                                                            
+                                                                                                    if (isMediaEl) {
+                                                                                                        const maxAllowedDur = getMediaDurationLimit(el, activeVariantMode, collections, TOTAL_DURATION);
+                                                                                                        if (newDur > maxAllowedDur) { newDur = maxAllowedDur; newStart = origStart + origDur - newDur; }
+                                                                                                    }
+                                                                                            
+                                                                                                    const varMode = getVariantMode(el.elementId);
+                                                                                                    const updates: Partial<CanvasElement> = { startTime: Math.round(newStart * 1000) / 1000, duration: Math.round(newDur * 1000) / 1000 };
+                                                                                                    if (isMediaEl) {
+                                                                                                        const startDelta = newStart - origStart;
+                                                                                                        updates.mediaOffset = Math.max(0, Math.round(((effectiveEl.mediaOffset ?? 0) + startDelta) * 1000) / 1000);
+                                                                                                    }
+                                                                                                    setElements(prev => prev.map(x => x.elementId === el.elementId ? applyToElement(x, updates, varMode) : x));
+                                                                                                } else {
+                                                                                                    let newDur = Math.max(0.5, Math.min(rightLimit - origStart, origDur + dTime));
+                                                                                                    if (isMediaEl) {
+                                                                                                        const maxAllowedDur = getMediaDurationLimit(el, activeVariantMode, collections, TOTAL_DURATION);
+                                                                                                        newDur = Math.min(newDur, maxAllowedDur);
+                                                                                                    }
+                                                                                                    const varMode = getVariantMode(el.elementId);
+                                                                                                    setElements(prev => prev.map(x => x.elementId === el.elementId ? applyToElement(x, { duration: Math.round(newDur * 1000) / 1000 }, varMode) : x));
+                                                                                                }
+                                                                                            };
+                                                                                            const onUp = () => {
+                                                                                                window.removeEventListener('pointermove', onMove);
+                                                                                                window.removeEventListener('pointerup', onUp);
+                                                                                            };
+                                                                                            window.addEventListener('pointermove', onMove);
+                                                                                            window.addEventListener('pointerup', onUp);
+                                                                                        };
+
+                                                                                        const colors = COLLECTION_COLORS[el.collectionType];
+                                                                                        const isSelected = selectedElementId === el.elementId;
+                                                                                        const col = collections.find(c => c.id === el.collectionId);
+                                                                                        const elVarMode = getVariantMode(el.elementId);
+                                                                                        const editingVariantStr = elVarMode !== 'all' ? col?.items.find(v => v.id === elVarMode)?.label : null;
+                                                                                        const displayText = editingVariantStr ? `${el.title} [${editingVariantStr}]` : el.title;
+
+                                                                                        return (
+                                                                                            <div key={el.elementId} className="track-element-clip absolute top-1 bottom-1 rounded overflow-hidden bg-black border border-white/10 shrink-0"
+                                                                                                style={{
+                                                                                                    left: `${(effectiveEl.startTime / TOTAL) * 100}%`,
+                                                                                                    width: `${(effectiveEl.duration / TOTAL) * 100}%`,
+                                                                                                    zIndex: el.zIndex
+                                                                                                }}>
+                                                                                                <div
+                                                                                                    className={cn(
+                                                                                                        "absolute inset-0 rounded flex items-center shrink-0 min-w-[20px] transition-colors",
+                                                                                                        timelineTool === 'split' ? "" : "cursor-grab active:cursor-grabbing",
+                                                                                                        isMediaAllMode
+                                                                                                            ? (selectedElementId === el.elementId ? 'bg-gray-600/60 border border-gray-400/50' : 'bg-gray-700/40 border border-transparent hover:bg-gray-600/40')
+                                                                                                            : (selectedElementId === el.elementId ? 'bg-blue-600 border border-blue-400' : 'bg-blue-900 border border-transparent hover:bg-blue-800')
+                                                                                                    )}
+                                                                                                    style={{
+                                                                                                        cursor: timelineTool === 'split' ? `url('data:image/svg+xml;utf8,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><line x1="20" y1="4" x2="8.12" y2="15.88"/><line x1="14.47" y1="14.48" x2="20" y2="20"/><line x1="8.12" y1="8.12" x2="12" y2="12"/></svg>')}') 12 12, crosshair` : undefined
+                                                                                                    }}
+                                                                                                    onClick={(e) => {
+                                                                                                        e.stopPropagation();
+                                                                                                        if (timelineTool === 'pointer') {
+                                                                                                            setSelectedElementId(el.elementId);
+                                                                                                        }
+                                                                                                    }}
+                                                                                                    onPointerDown={(e) => {
+                                                                                                        e.stopPropagation();
+                                                                                                        if (isMediaAllMode) setSelectedElementId(el.elementId);
+                                                                                                        if (timelineTool === 'split') {
+                                                                                                            const trackElement = e.currentTarget.parentElement?.parentElement;
+                                                                                                            if (!trackElement) return;
+                                                                                                            const trackRect = trackElement.getBoundingClientRect();
+                                                                                                            const px = e.clientX - trackRect.left;
+                                                                                                            const splitPxTime = (px / trackRect.width) * TOTAL;
+                                                                                                            handleSplit(el.elementId, splitPxTime);
+                                                                                                            return;
+                                                                                                        }
+                                                                                                        handleSegmentDrag(e);
+                                                                                                    }}
+                                                                                                    onPointerMove={(e) => {
+                                                                                                        if (timelineTool === 'split') {
+                                                                                                            const trackElement = e.currentTarget.parentElement?.parentElement;
+                                                                                                            if (!trackElement) return;
+                                                                                                            const trackRect = trackElement.getBoundingClientRect();
+                                                                                                            const px = e.clientX - trackRect.left;
+                                                                                                            const hoverTime = (px / trackRect.width) * TOTAL;
+                                                                                                            if (hoverTime > effectiveEl.startTime + 0.1 && hoverTime < effectiveEl.startTime + effectiveEl.duration - 0.1) {
+                                                                                                                setSplitHoverPosition({ elementId: el.elementId, time: hoverTime, relativePx: px });
+                                                                                                            } else {
+                                                                                                                setSplitHoverPosition(null);
+                                                                                                            }
+                                                                                                        }
+                                                                                                    }}
+                                                                                                    onPointerLeave={() => {
+                                                                                                        if (timelineTool === 'split' && splitHoverPosition?.elementId === el.elementId) {
+                                                                                                            setSplitHoverPosition(null);
+                                                                                                        }
+                                                                                                    }}
+                                                                                                >
+                                                                                                    {!isMediaAllMode && (
+                                                                                                        <div
+                                                                                                            className={cn("absolute left-0 top-0 bottom-0 w-2 hover:bg-white/30 z-10", timelineTool === 'split' ? "pointer-events-none" : "cursor-ew-resize")}
+                                                                                                            onPointerDown={(e) => {
+                                                                                                                if (timelineTool === 'split') return;
+                                                                                                                handleEdgeDrag('left', e);
+                                                                                                            }}
+                                                                                                        />
+                                                                                                    )}
+                                                                                                    {(el.collectionType === 'audio' || el.collectionType === 'video') && (
+                                                                                                        <TimelineWaveform
+                                                                                                            elementId={el.elementId}
+                                                                                                            collectionType={el.collectionType}
+                                                                                                            segPxWidth={Math.round((effectiveEl.duration / TOTAL) * Math.max(100, TOTAL_DURATION * 20))}
+                                                                                                        />
+                                                                                                    )}
+                                                                                                    <span className="text-[9px] font-mono text-white/90 truncate px-2 select-none z-[1] pointer-events-none relative">
+                                                                                                        {isMediaAllMode ? `${displayText} ⬦` : displayText}
+                                                                                                    </span>
+                                                                                                    {!isMediaAllMode && (
+                                                                                                        <div
+                                                                                                            className={cn("absolute right-0 top-0 bottom-0 w-2 hover:bg-white/30 z-10", timelineTool === 'split' ? "pointer-events-none" : "cursor-ew-resize")}
+                                                                                                            onPointerDown={(e) => {
+                                                                                                                if (timelineTool === 'split') return;
+                                                                                                                handleEdgeDrag('right', e);
+                                                                                                            }}
+                                                                                                        />
+                                                                                                    )}
+                                                                                                </div>
+                                                                                                {timelineTool === 'split' && splitHoverPosition?.elementId === el.elementId && (
+                                                                                                    <div
+                                                                                                        className="absolute top-0 bottom-0 w-[1px] border-l border-dashed border-red-500 z-50 pointer-events-none"
+                                                                                                        style={{ left: `${((splitHoverPosition.time - effectiveEl.startTime) / effectiveEl.duration) * 100}%` }}
+                                                                                                    />
+                                                                                                )}
+                                                                                            </div>
+                                                                                        );
+                                                                                    })}
+                                                                                    </div>
+                                                                                </div>
+                                                                            );
+                                                                        })}
+                                                                    </div>
                                                                 </div>
                                                             </div>
                                                         </div>
@@ -2490,6 +2665,34 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                 title={inspectorLocked ? "Unlock Selection" : "Lock Selection"}
                                             >
                                                 {inspectorLocked ? <Lock className="w-3.5 h-3.5" /> : <Unlock className="w-3.5 h-3.5" />}
+                                            </button>
+                                            <button
+                                                onClick={() => {
+                                                    const curTrackId = selectedElement.trackId || 'track-0';
+                                                    const curIdx = tracks.findIndex(t => t.id === curTrackId);
+                                                    if (curIdx > 0) {
+                                                        const newTrackId = tracks[curIdx - 1].id;
+                                                        setElements(prev => prev.map(e => e.elementId === selectedElement.elementId ? { ...e, trackId: newTrackId } : e));
+                                                    }
+                                                }}
+                                                className="p-1.5 bg-white/5 text-white/50 hover:bg-white/10 hover:text-white rounded-md transition-colors"
+                                                title="Move Element to Track Above"
+                                            >
+                                                <ArrowUp className="w-4 h-4" />
+                                            </button>
+                                            <button
+                                                onClick={() => {
+                                                    const curTrackId = selectedElement.trackId || 'track-0';
+                                                    const curIdx = tracks.findIndex(t => t.id === curTrackId);
+                                                    if (curIdx >= 0 && curIdx < tracks.length - 1) {
+                                                        const newTrackId = tracks[curIdx + 1].id;
+                                                        setElements(prev => prev.map(e => e.elementId === selectedElement.elementId ? { ...e, trackId: newTrackId } : e));
+                                                    }
+                                                }}
+                                                className="p-1.5 bg-white/5 text-white/50 hover:bg-white/10 hover:text-white rounded-md transition-colors"
+                                                title="Move Element to Track Below"
+                                            >
+                                                <ArrowDown className="w-4 h-4" />
                                             </button>
                                             <button onClick={removeSelected} className="p-1.5 bg-red-500/10 text-red-500 rounded-md hover:bg-red-500/20 transition-colors" title="Delete">
                                                 <X className="w-4 h-4" />
@@ -3111,6 +3314,25 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                 )}
                             </div>
                         </motion.div>
+                    </motion.div>
+                )}
+            </AnimatePresence>
+            <AnimatePresence>
+                {toast && (
+                    <motion.div
+                        initial={{ opacity: 0, y: 50, scale: 0.9 }}
+                        animate={{ opacity: 1, y: 0, scale: 1 }}
+                        exit={{ opacity: 0, scale: 0.9, transition: { duration: 0.2 } }}
+                        className={cn(
+                            "fixed bottom-6 right-6 z-[300] px-4 py-3 rounded-xl shadow-2xl flex items-center gap-3 border",
+                            toast.type === 'success' ? "bg-emerald-950/80 border-emerald-500/30 text-emerald-400" : "bg-red-950/80 border-red-500/30 text-red-400"
+                        )}
+                    >
+                        {toast.type === 'success' ? <CheckCircle2 className="w-5 h-5" /> : <AlertCircle className="w-5 h-5" />}
+                        <span className="text-sm font-medium">{toast.message}</span>
+                        <button onClick={() => setToast(null)} className="ml-2 opacity-60 hover:opacity-100 transition-opacity">
+                            <X className="w-4 h-4" />
+                        </button>
                     </motion.div>
                 )}
             </AnimatePresence>

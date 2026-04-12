@@ -24,6 +24,7 @@ model Composition {
   angle       String?
   duration    Float    @default(15.0)
   elements    String   // Store array of elements as JSON string
+  tracks      String   @default("[]") // Store array of tracks as JSON string
   collections String   // Store array of collections to preserve uploaded assets
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt

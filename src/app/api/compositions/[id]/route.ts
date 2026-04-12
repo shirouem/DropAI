@@ -28,6 +28,7 @@ export async function PUT(request: Request, context: { params: Promise<{ id: str
         if (body.angle !== undefined) updateData.angle = body.angle;
         if (body.duration !== undefined) updateData.duration = body.duration;
         if (body.elements !== undefined) updateData.elements = JSON.stringify(body.elements);
+        if (body.tracks !== undefined) updateData.tracks = JSON.stringify(body.tracks);
         if (body.collections !== undefined) updateData.collections = JSON.stringify(body.collections);
 
         const composition = await prisma.composition.update({

@@ -21,6 +21,7 @@ export async function POST(request: Request) {
                 angle: body.angle,
                 duration: body.duration || 15.0,
                 elements: JSON.stringify(body.elements || []),
+                tracks: JSON.stringify(body.tracks || []),
                 collections: JSON.stringify(body.collections || [])
             }
         });
