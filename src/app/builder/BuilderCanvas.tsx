@@ -1947,7 +1947,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                         
                                                         // Merge the variant override value into the content/mediaUrl for Remotion
                                                         const mediaUrl = (baseEl.collectionType === 'image' || baseEl.collectionType === 'video' || baseEl.collectionType === 'audio') 
-                                                            ? (variant?.value || baseEl.mediaUrl) 
+                                                            ? (variant?.value || baseEl.content) 
                                                             : undefined;
                                                         const content = baseEl.collectionType === 'text' 
                                                             ? (variant?.value || baseEl.content) 

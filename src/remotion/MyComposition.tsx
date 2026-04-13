@@ -152,19 +152,17 @@ const RenderedElement: React.FC<{ el: ElementProps }> = ({ el }) => {
 
     const baseStyle: React.CSSProperties = {
         position: 'absolute',
-        left: `${el.x}%`,
-        top: `${el.y}%`,
+        left: `${el.x + anims.translateX}%`,
+        top: `${el.y + anims.translateY}%`,
         width: `${el.width}%`,
         height: `${el.height}%`,
         zIndex: el.zIndex,
         opacity: Math.max(0, Math.min(1, anims.opacity)),
         transform: `
-            translate(-50%, -50%)
-            translate(${anims.translateX}%, ${anims.translateY}%)
             rotate(${(el.rotation ?? 0) + anims.rotate}deg)
             scale(${Math.max(0.001, anims.scale)})
         `,
-        transformOrigin: 'top left',
+        transformOrigin: 'center center',
         filter: anims.blur > 0 ? `blur(${anims.blur}px)` : undefined,
     };
 
@@ -221,8 +219,9 @@ export const MyComposition: React.FC<z.infer<typeof myCompSchema>> = ({ elements
     return (
         <AbsoluteFill style={{ backgroundColor: 'black' }}>
             {sorted.map((el, i) => {
-                const startFrame = Math.floor(el.startTime * fps);
-                const durationInFrames = Math.max(1, Math.floor(el.duration * fps));
+                const startFrame = Math.round(el.startTime * fps);
+                const endFrame = Math.round((el.startTime + el.duration) * fps);
+                const durationInFrames = Math.max(1, endFrame - startFrame);
 
                 return (
                     <Sequence key={`${el.elementId}-${i}`} from={startFrame} durationInFrames={durationInFrames}>
