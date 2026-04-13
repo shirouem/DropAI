@@ -675,6 +675,7 @@ function evaluateAnimations(el: CanvasElement, currentTime: number): AnimatedSty
 export function resolveElementTimings(
     elements: CanvasElement[],
     tracks: TrackConfig[],
+    collections: CollectionItem[],
     getVariantMode: (elId: string) => string
 ): Map<string, { startTime: number, duration: number }> {
     const timings = new Map<string, { startTime: number, duration: number }>();
@@ -686,15 +687,36 @@ export function resolveElementTimings(
         let baseDur = el.duration;
         const isMedia = el.collectionType === 'video' || el.collectionType === 'audio';
 
-        if (isMedia && el.variantOverrides) {
-            if (varMode !== 'all' && el.variantOverrides[varMode]) {
-                if (el.variantOverrides[varMode].duration !== undefined) baseDur = el.variantOverrides[varMode].duration!;
-            } else if (varMode === 'all') {
-                let maxDur = el.duration;
-                for (const override of Object.values(el.variantOverrides)) {
-                    if (override.duration !== undefined && override.duration > maxDur) maxDur = override.duration;
+        if (isMedia) {
+            // Default to underlying variant native duration if not overridden
+            if (varMode !== 'all') {
+                const col = collections.find(c => c.id === el.collectionId);
+                const variant = col?.items.find(v => v.id === varMode);
+                if (variant && variant.duration !== undefined) {
+                    baseDur = variant.duration;
                 }
-                baseDur = maxDur;
+            } else {
+                const col = collections.find(c => c.id === el.collectionId);
+                if (col && col.items.length > 0) {
+                    let maxDur = baseDur;
+                    for (const v of col.items) {
+                        if (v.duration !== undefined && v.duration > maxDur) maxDur = v.duration;
+                    }
+                    baseDur = maxDur;
+                }
+            }
+
+            // User overrides take precedence
+            if (el.variantOverrides) {
+                if (varMode !== 'all' && el.variantOverrides[varMode]) {
+                    if (el.variantOverrides[varMode].duration !== undefined) baseDur = el.variantOverrides[varMode].duration!;
+                } else if (varMode === 'all') {
+                    let maxDur = baseDur;
+                    for (const override of Object.values(el.variantOverrides)) {
+                        if (override.duration !== undefined && override.duration > maxDur) maxDur = override.duration;
+                    }
+                    baseDur = maxDur;
+                }
             }
         }
         return { el, startTime: baseTime, duration: baseDur };
@@ -723,9 +745,13 @@ export function resolveElementTimings(
                 cursor += item.duration;
             }
         } else {
-            // MAGNET OFF: pass through intrinsic times as-is
+            // MAGNET OFF: Elements stay at their intrinsic times, but push each other if they would overlap
+            items.sort((a, b) => a.startTime - b.startTime);
+            let cursor = 0;
             for (const item of items) {
-                timings.set(item.el.elementId, { startTime: item.startTime, duration: item.duration });
+                const effectiveStart = Math.max(item.startTime, cursor);
+                timings.set(item.el.elementId, { startTime: Math.round(effectiveStart * 100) / 100, duration: item.duration });
+                cursor = effectiveStart + item.duration;
             }
         }
     }
@@ -911,8 +937,8 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     }, [elements, previewVariants, getVariantMode]);
 
     const elementTimings = useMemo(() => {
-        return resolveElementTimings(elements, tracks, elId => activeVariantModes[elId] || 'all');
-    }, [elements, tracks, activeVariantModes]);
+        return resolveElementTimings(elements, tracks, collections, elId => activeVariantModes[elId] || 'all');
+    }, [elements, tracks, collections, activeVariantModes]);
 
     const randomizeVariants = useCallback(() => {
         setVariantSeed(s => s + 1);
