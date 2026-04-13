@@ -10,6 +10,8 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { renderComposition, type RenderProgress, type RenderElement, type RenderFormat } from "./renderer";
+import { Player } from '@remotion/player';
+import { MyComposition } from '../../remotion/MyComposition';
 import {
     DndContext,
     useSensor,
@@ -1918,221 +1920,55 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                     <div className="w-full max-w-[320px] space-y-4 shrink-0 z-10">
                                         <div className="w-full aspect-[9/16] bg-black rounded-lg border border-white/10 relative overflow-hidden shadow-2xl">
                                             <div className="absolute inset-0 opacity-[0.03] pointer-events-none" style={{ backgroundImage: 'linear-gradient(rgba(255,255,255,0.3) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.3) 1px, transparent 1px)', backgroundSize: '10% 10%' }} />
-                                            {elements
-                                                .map(baseEl => {
-                                                    // When a specific variant is selected in inspector, use it for preview
-                                                    // When 'all', fall back to random seed-based preview
-                                                    let variant: CollectionVariant | null = null;
-                                                    const elMode = getVariantMode(baseEl.elementId);
-                                                    if (elMode !== 'all') {
-                                                        const col = collections.find(c => c.id === baseEl.collectionId);
-                                                        variant = col?.items.find(v => v.id === elMode) ?? previewVariants[baseEl.elementId];
-                                                    } else {
-                                                        variant = previewVariants[baseEl.elementId];
-                                                    }
-                                                    const overrides = variant ? getEffectiveElement(baseEl, variant.id) : baseEl;
-                                                    const timing = elementTimings.get(baseEl.elementId) || { startTime: baseEl.startTime, duration: baseEl.duration };
-                                                    const el = { ...overrides, ...timing };
-                                                    return { el, variant };
-                                                })
-                                                .filter(({ el }) => (el.visible !== false) && el.collectionType !== 'audio')
-                                                .sort((a, b) => {
-                                                    const ta = tracks.findIndex(t => t.id === (a.el.trackId || 'track-0'));
-                                                    const tb = tracks.findIndex(t => t.id === (b.el.trackId || 'track-0'));
-                                                    if (ta !== tb) return tb - ta;
-                                                    return a.el.zIndex - b.el.zIndex;
-                                                })
-                                                .map(({ el: rawEl, variant }) => {
-                                                    const isActive = currentTime >= rawEl.startTime && currentTime < rawEl.startTime + rawEl.duration;
-                                                    const colors = COLLECTION_COLORS[rawEl.collectionType];
-                                                    const animStyle = evaluateAnimations(rawEl, currentTime);
-                                                    
-                                                    const trackIndex = tracks.findIndex(t => t.id === (rawEl.trackId || 'track-0'));
-                                                    const baseZ = 1000 - (Math.max(0, trackIndex) * 10);
-                                                    const el = { ...rawEl, zIndex: baseZ + (rawEl.zIndex || 0) };
+                                            
+                                            <Player
+                                                component={MyComposition}
+                                                durationInFrames={Math.max(1, Math.floor(TOTAL_DURATION * 30))}
+                                                compositionWidth={1080}
+                                                compositionHeight={1920}
+                                                fps={30}
+                                                style={{ width: '100%', height: '100%' }}
+                                                controls
+                                                autoPlay
+                                                loop
+                                                inputProps={{
+                                                    totalDuration: TOTAL_DURATION,
+                                                    elements: elements.map(baseEl => {
+                                                        const elMode = getVariantMode(baseEl.elementId);
+                                                        let variant = null;
+                                                        if (elMode !== 'all') {
+                                                            const col = collections.find(c => c.id === baseEl.collectionId);
+                                                            variant = col?.items.find(v => v.id === elMode) ?? previewVariants[baseEl.elementId];
+                                                        } else {
+                                                            variant = previewVariants[baseEl.elementId];
+                                                        }
+                                                        const overrides = variant ? getEffectiveElement(baseEl, variant.id) : baseEl;
+                                                        const timing = elementTimings.get(baseEl.elementId) || { startTime: baseEl.startTime, duration: baseEl.duration };
+                                                        
+                                                        // Merge the variant override value into the content/mediaUrl for Remotion
+                                                        const mediaUrl = (baseEl.collectionType === 'image' || baseEl.collectionType === 'video' || baseEl.collectionType === 'audio') 
+                                                            ? (variant?.value || baseEl.mediaUrl) 
+                                                            : undefined;
+                                                        const content = baseEl.collectionType === 'text' 
+                                                            ? (variant?.value || baseEl.content) 
+                                                            : undefined;
+                                                            
+                                                        return { ...overrides, ...timing, mediaUrl, content } as any;
+                                                    }).filter(el => el.visible !== false)
+                                                }}
+                                            />
 
-                                                    return (
-                                                        <div
-                                                            key={el.elementId}
-                                                            className="absolute overflow-hidden"
-                                                            style={{
-                                                                left: `${el.x}%`,
-                                                                top: `${el.y}%`,
-                                                                width: `${el.width}%`,
-                                                                height: `${el.height}%`,
-                                                                zIndex: el.zIndex,
-                                                                opacity: isActive ? animStyle.opacity : 0,
-                                                                pointerEvents: isActive ? 'auto' : 'none',
-                                                                transform: `rotate(${el.rotation || 0}deg) scale(${animStyle.scale}) rotate(${animStyle.rotate}deg)`,
-                                                                filter: animStyle.blur > 0 ? `blur(${animStyle.blur}px)` : undefined,
-                                                            }}
-                                                        >
-                                                            {el.collectionType === 'text' ? (
-                                                                <div className="w-full h-full flex items-center justify-center px-2">
-                                                                    <span className="text-white text-sm drop-shadow-[0_2px_6px_rgba(0,0,0,0.9)] w-full" style={{ fontSize: el.fontSize ? `${el.fontSize}px` : undefined, fontWeight: el.fontWeight || 'bold', fontStyle: el.fontStyle || 'normal', textDecoration: el.textDecoration || 'none', letterSpacing: el.letterSpacing ? `${el.letterSpacing}px` : undefined, lineHeight: el.lineHeight ? el.lineHeight : undefined, textAlign: el.textAlign || 'center', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
-                                                                        {variant?.value || el.content || "TEXT"}
-                                                                    </span>
-                                                                </div>
-                                                            ) : el.collectionType === 'image' ? (
-                                                                variant?.value ? (
-                                                                    <img src={variant.value} className="w-full h-full object-cover" alt={variant.label} />
-                                                                ) : (
-                                                                    <div className="w-full h-full flex items-center justify-center" style={{ backgroundColor: colors.bg }}>
-                                                                        <ImageIcon className={cn("w-6 h-6 opacity-40", colors.icon)} />
-                                                                    </div>
-                                                                )
-                                                            ) : el.collectionType === 'video' ? (
-                                                                variant?.value ? (
-                                                                    <video
-                                                                        key={`vid-${el.elementId}-${variant?.value || 'base'}`}
-                                                                        src={variant.value}
-                                                                        className="w-full h-full object-cover"
-                                                                        playsInline
-                                                                        preload="auto"
-                                                                        loop
-                                                                        ref={(videoEl) => {
-                                                                            if (!videoEl) return;
-                                                                            const rawDur = (videoEl.duration && !isNaN(videoEl.duration)) ? videoEl.duration : Infinity;
-                                                                            const localTime = Math.max(0, currentTime - el.startTime) + (el.mediaOffset ?? 0);
-                                                                            const safeLocalTime = rawDur !== Infinity ? (localTime % rawDur) : localTime;
-                                                                            // Sync time if scrubbing or drifting out of sync
-                                                                            if (Math.abs(videoEl.currentTime - safeLocalTime) > 0.2) {
-                                                                                videoEl.currentTime = safeLocalTime;
-                                                                            }
-                                                                            if (videoEl.volume !== (el.volume ?? 1)) {
-                                                                                videoEl.volume = el.volume ?? 1;
-                                                                            }
-                                                                            if (isPlaying && isActive) {
-                                                                                if (videoEl.paused) videoEl.play().catch(() => { });
-                                                                            }
-                                                                            else {
-                                                                                if (!videoEl.paused) videoEl.pause();
-                                                                            }
-                                                                        }}
-                                                                    />
-                                                                ) : (
-                                                                    <div className="w-full h-full flex items-center justify-center" style={{ backgroundColor: colors.bg }}>
-                                                                        <Video className={cn("w-6 h-6 opacity-40", colors.icon)} />
-                                                                    </div>
-                                                                )
-                                                            ) : el.collectionType === 'audio' ? (
-                                                                <audio
-                                                                    src={variant?.value || el.content}
-                                                                    loop
-                                                                    ref={(audioEl) => {
-                                                                        if (!audioEl) return;
-                                                                        const rawDur = (audioEl.duration && !isNaN(audioEl.duration)) ? audioEl.duration : Infinity;
-                                                                        const localTime = Math.max(0, currentTime - el.startTime);
-                                                                        const safeLocalTime = rawDur !== Infinity ? (localTime % rawDur) : localTime;
-                                                                        if (Math.abs(audioEl.currentTime - safeLocalTime) > 0.2) {
-                                                                            audioEl.currentTime = safeLocalTime;
-                                                                        }
-                                                                        if (audioEl.volume !== (el.volume ?? 1)) {
-                                                                            audioEl.volume = el.volume ?? 1;
-                                                                        }
-                                                                        if (isPlaying && isActive) {
-                                                                            if (audioEl.paused) audioEl.play().catch(() => { });
-                                                                        } else {
-                                                                            if (!audioEl.paused) audioEl.pause();
-                                                                        }
-                                                                    }}
-                                                                />
-                                                            ) : null}
-                                                        </div>
-                                                    );
-                                                })}
-
-                                            {/* Hidden audio elements for playback */}
-                                            {elements
-                                                .filter(baseEl => baseEl.collectionType === 'audio' && baseEl.visible !== false)
-                                                .map(baseEl => {
-                                                    let variant: CollectionVariant | null = null;
-                                                    const elMode = getVariantMode(baseEl.elementId);
-                                                    if (elMode !== 'all') {
-                                                        const col = collections.find(c => c.id === baseEl.collectionId);
-                                                        variant = col?.items.find(v => v.id === elMode) ?? previewVariants[baseEl.elementId];
-                                                    } else {
-                                                        variant = previewVariants[baseEl.elementId];
-                                                    }
-                                                    const overrides = variant ? getEffectiveElement(baseEl, variant.id) : baseEl;
-                                                    const timing = elementTimings.get(baseEl.elementId) || { startTime: baseEl.startTime, duration: baseEl.duration };
-                                                    const el = { ...overrides, ...timing };
-                                                    const isActive = currentTime >= el.startTime && currentTime < el.startTime + el.duration;
-                                                    return (
-                                                        <audio
-                                                            key={`aud-${el.elementId}-${variant?.value || el.content || 'base'}`}
-                                                            src={variant?.value || el.content}
-                                                            loop
-                                                            ref={(audioEl) => {
-                                                                if (!audioEl) return;
-                                                                const rawDur = (audioEl.duration && !isNaN(audioEl.duration)) ? audioEl.duration : Infinity;
-                                                                const localTime = Math.max(0, currentTime - el.startTime) + (el.mediaOffset ?? 0);
-                                                                const safeLocalTime = rawDur !== Infinity ? (localTime % rawDur) : localTime;
-                                                                if (Math.abs(audioEl.currentTime - safeLocalTime) > 0.2) {
-                                                                    audioEl.currentTime = safeLocalTime;
-                                                                }
-                                                                if (audioEl.volume !== (el.volume ?? 1)) {
-                                                                    audioEl.volume = el.volume ?? 1;
-                                                                }
-                                                                if (isPlaying && isActive) {
-                                                                    if (audioEl.paused) audioEl.play().catch(() => { });
-                                                                } else {
-                                                                    if (!audioEl.paused) audioEl.pause();
-                                                                }
-                                                            }}
-                                                        />
-                                                    );
-                                                })}
                                             {elements.length === 0 && (
-                                                <div className="absolute inset-0 flex flex-col items-center justify-center text-gray-600">
+                                                <div className="absolute inset-0 flex flex-col items-center justify-center text-gray-600 pointer-events-none">
                                                     <MonitorPlay className="w-8 h-8 mb-2 opacity-30" />
                                                     <span className="text-[10px] font-mono">No elements</span>
                                                 </div>
                                             )}
-
-                                            <div className="absolute top-2 right-2 bg-black/70 backdrop-blur-sm rounded px-2 py-1 text-[9px] font-mono text-gray-400 z-50">
-                                                {currentTime.toFixed(1)}s
-                                            </div>
                                         </div>
 
-                                        {/* Transport Controls */}
+                                        {/* Transport Controls (Delegated to Remotion Player natively now) */}
                                         <div className="space-y-3">
-                                            <div className="relative">
-                                                <input
-                                                    type="range"
-                                                    min={0}
-                                                    max={TOTAL_DURATION}
-                                                    step={0.1}
-                                                    value={currentTime}
-                                                    onChange={(e) => {
-                                                        setCurrentTime(Number(e.target.value));
-                                                    }}
-                                                    className="w-full h-1.5 bg-white/10 rounded-full appearance-none cursor-pointer accent-blue-500"
-                                                />
-                                                <div className="flex justify-between text-[8px] font-mono text-gray-600 mt-1">
-                                                    <span>{formatTime(currentTime)}</span>
-                                                    <span>{formatTime(TOTAL_DURATION)}</span>
-                                                </div>
-                                            </div>
                                             <div className="flex items-center justify-center gap-3">
-                                                <button
-                                                    onClick={() => { setCurrentTime(0); }}
-                                                    className="p-2 rounded-lg bg-white/5 hover:bg-white/10 text-gray-400 hover:text-white transition-colors"
-                                                    title="Restart"
-                                                >
-                                                    <SkipBack className="w-4 h-4" />
-                                                </button>
-                                                <button
-                                                    onClick={handlePlayPause}
-                                                    className={cn(
-                                                        "p-3 rounded-full transition-all shadow-lg",
-                                                        isPlaying
-                                                            ? "bg-white text-black hover:bg-gray-200"
-                                                            : "bg-blue-600 text-white hover:bg-blue-500"
-                                                    )}
-                                                >
-                                                    {isPlaying ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5 ml-0.5" />}
-                                                </button>
                                                 <button
                                                     onClick={() => { randomizeVariants(); }}
                                                     className="p-2 rounded-lg bg-white/5 hover:bg-white/10 text-gray-400 hover:text-white transition-colors"
