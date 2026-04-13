@@ -2541,7 +2541,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                                                 gaps.push({ start: gapCursor, end: TOTAL });
                                                                                             }
 
-                                                                                            let activeGap = gaps.sort((a, b) => {
+                                                                                            const activeGap = gaps.sort((a, b) => {
                                                                                                 const overlapA = Math.max(0, Math.min(a.end, origStart + origDur) - Math.max(a.start, origStart));
                                                                                                 const overlapB = Math.max(0, Math.min(b.end, origStart + origDur) - Math.max(b.start, origStart));
                                                                                                 if (overlapA !== overlapB) return overlapB - overlapA;

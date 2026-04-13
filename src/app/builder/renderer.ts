@@ -1,12 +1,9 @@
 /**
- * DropAI Client-Side Renderer — v5
- *
- * Key fixes in this version:
- * 1. Animation Logic: 100% matched to BuilderCanvas.tsx, including anim.to/from.
- * 2. seekTo Fix: Added a tiny threshold (0.001s) to resolve immediately if no seek is needed.
- *    This prevents the 200ms timeout stall which causes duplicate frames (chopped look).
- * 3. Boundary Safety: Clamped localTime to 0 and improved draw condition to prevent end-of-clip flickering.
- * 4. Encoder Config: Re-added software preference with High Profile level 5.1.
+ * DropAI Client-Side Renderer — v7 (Optimized Single-Threaded)
+ * 
+ * Fixes laptop freezing by removing heavy Web Worker image transfers
+ * and redundant HTMLVideoElement pools. Restores strict frame queue
+ * throttling to prevent memory (RAM) exhaustion during long exports.
  */
 
 export type RenderFormat = 'webm' | 'mp4';
@@ -205,22 +202,14 @@ function loadVideo(url: string): Promise<HTMLVideoElement> {
 }
 
 /** 
- * Improved seekTo: Resolves immediately if distance is < 1ms.
- * Prevents stalling when many frames are identical or close, fixing chopped output.
+ * Optimized seekTo: Prevents seeking completely if the video is already exactly where we want it.
  */
 function seekTo(vid: HTMLVideoElement, target: number): Promise<void> {
     return new Promise(resolve => {
-        // Add a 5ms epsilon to the target time.
-        // This is CRITICAL for perfectly smooth playback. Because of floating point inaccuracies, 
-        // asking the browser to seek to exactly '0.033333' (1/30) might land slightly *before* 
-        // the video's internal timestamp for frame 1, causing it to return frame 0 again.
-        // Adding 5ms safely pushes the seek head into the middle of the frame's time window.
         const safeTarget = target + 0.005;
-        
-        // Clamp to at least 50ms before duration to prevent the browser from resetting to the first frame
         const clampedTarget = Math.max(0, Math.min(safeTarget, (vid.duration || 0) - 0.05));
         
-        // If already practically at the target (within 0.1ms), resolve immediately to avoid stalls.
+        // Skip seek if already there
         if (Math.abs(vid.currentTime - clampedTarget) < 0.0001) {
             resolve();
             return;
@@ -235,30 +224,25 @@ function seekTo(vid: HTMLVideoElement, target: number): Promise<void> {
 
         const done = () => { 
             vid.removeEventListener('seeked', done); 
-            
-            // Ensure the frame is actually decoded and painted for canvas extraction
             if ('requestVideoFrameCallback' in vid) {
                 let rfcResolved = false;
-                const callbackId = (vid as any).requestVideoFrameCallback(() => {
+                const callbackId = (vid as HTMLVideoElement & { requestVideoFrameCallback: (cb: () => void) => number }).requestVideoFrameCallback(() => {
                     if (rfcResolved) return;
                     rfcResolved = true;
                     finish();
                 });
-                // Fallback in case rVFC doesn't fire
                 setTimeout(() => {
                     if (!rfcResolved) {
-                        try { (vid as any).cancelVideoFrameCallback(callbackId); } catch (e) {}
+                        try { (vid as HTMLVideoElement & { cancelVideoFrameCallback: (id: number) => void }).cancelVideoFrameCallback(callbackId); } catch (e) {}
                         finish();
                     }
                 }, 150);
             } else {
-                // Fallback for browsers without rVFC
                 setTimeout(finish, 150);
             }
         };
         vid.addEventListener('seeked', done);
         vid.currentTime = clampedTarget;
-        // Increase timeout to 2000ms to allow slow seeks to finish instead of dropping frames
         setTimeout(() => {
             if (!resolved) {
                 vid.removeEventListener('seeked', done);
@@ -285,7 +269,6 @@ function drawFrame(
 
     for (const el of elements) {
         if (el.collectionType === 'audio') continue;
-        // Strict boundary check: add small epsilon to duration to avoid last-frame flickering
         if (t < el.startTime || t >= el.startTime + el.duration - 0.0001) continue;
 
         const anim = evaluateAnimations(el, t);
@@ -416,7 +399,9 @@ async function encodeComposition(
 
     const canvas = document.createElement('canvas');
     canvas.width = W; canvas.height = H;
-    const ctx = canvas.getContext('2d', { alpha: false })!;
+    const ctx = canvas.getContext('2d', { alpha: false, willReadFrequently: true })!;
+
+    let lastProgressTime = Date.now();
 
     for (let frame = 0; frame < totalFrames; frame++) {
         if (signal?.aborted) { vEnc.close(); aEnc.close(); throw new DOMException('Cancelled', 'AbortError'); }
@@ -436,14 +421,24 @@ async function encodeComposition(
         const vf = new VideoFrame(bitmap, { timestamp: Math.floor(t * US), duration: Math.floor(spf * US) });
         bitmap.close();
 
-        while (vEnc.encodeQueueSize > 2) await new Promise(r => setTimeout(r, 1));
+        // CRITICAL PERFORMANCE FIX: Prevent OOM freezes by pausing the frame loop until encoder queue drains
+        while (vEnc.encodeQueueSize > 2) {
+            await new Promise(r => setTimeout(r, 5));
+        }
+
         vEnc.encode(vf, { keyFrame: frame % FPS === 0 });
         vf.close();
 
-        if (frame % 5 === 0) {
-            onProgress({ phase: 'rendering', progress: frame / totalFrames, message: `Frame ${frame + 1} / ${totalFrames}` });
-            await new Promise(r => setTimeout(r, 0));
+        // Throttle UI updates to roughly 10fps to avoid React choking the main thread
+        if (Date.now() - lastProgressTime > 100) {
+            onProgress({ phase: 'rendering', progress: frame / totalFrames, message: `Rendering Frame ${frame + 1} / ${totalFrames}` });
+            lastProgressTime = Date.now();
         }
+    }
+
+    // Drain remaining frames
+    while (vEnc.encodeQueueSize > 0) {
+        await new Promise(r => setTimeout(r, 10));
     }
 
     await vEnc.flush(); await aEnc.flush();
@@ -493,7 +488,7 @@ export async function renderComposition(job: RenderJob, onProgress: ProgressCb, 
             const target = new ArrayBufferTarget();
             const muxer = new Muxer({ target, video: { codec: 'avc', width: W, height: H }, audio: { codec: 'aac', sampleRate: 44100, numberOfChannels: 2 }, fastStart: 'in-memory' });
             await encodeComposition(job, W, H, FPS, totalFrames, sorted, images, videos, audioBufs,
-                { codec: 'avc1.640033', width: W, height: H, bitrate: job.videoBitsPerSecond || 8_000_000, framerate: FPS, hardwareAcceleration: 'prefer-software' }, 'mp4a.40.2',
+                { codec: 'avc1.640033', width: W, height: H, bitrate: job.videoBitsPerSecond || 8_000_000, framerate: FPS, hardwareAcceleration: 'prefer-hardware' }, 'mp4a.40.2',
                 (c, m) => muxer.addVideoChunk(c, m || undefined), (c, m) => muxer.addAudioChunk(c, m || undefined), () => muxer.finalize(), onProgress, signal
             );
             blob = new Blob([target.buffer], { type: 'video/mp4' });
@@ -502,7 +497,7 @@ export async function renderComposition(job: RenderJob, onProgress: ProgressCb, 
             const target = new ArrayBufferTarget();
             const muxer = new Muxer({ target, video: { codec: 'V_VP8', width: W, height: H }, audio: { codec: 'A_OPUS', sampleRate: 44100, numberOfChannels: 2 }, type: 'webm' });
             await encodeComposition(job, W, H, FPS, totalFrames, sorted, images, videos, audioBufs,
-                { codec: 'vp8', width: W, height: H, bitrate: job.videoBitsPerSecond || 8_000_000, framerate: FPS, hardwareAcceleration: 'prefer-software' }, 'opus',
+                { codec: 'vp8', width: W, height: H, bitrate: job.videoBitsPerSecond || 8_000_000, framerate: FPS, hardwareAcceleration: 'prefer-hardware' }, 'opus',
                 (c, m) => muxer.addVideoChunk(c, m || undefined), (c, m) => muxer.addAudioChunk(c, m || undefined), () => muxer.finalize(), onProgress, signal
             );
             blob = new Blob([target.buffer], { type: 'video/webm' });
