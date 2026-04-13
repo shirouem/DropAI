@@ -196,43 +196,47 @@ function CollectionCard({ collection, onAddItem, onDeleteItem, onUpdateItem, onD
 
     const colors = COLLECTION_COLORS[collection.type];
 
-    const handleFileSelected = async (file: File) => {
-        const tempUrl = URL.createObjectURL(file);
-        const label = newLabel.trim() || file.name.replace(/\.[^.]+$/, "");
+    const handleFilesSelected = async (files: File[]) => {
+        setIsAdding(false);
+        setNewLabel("");
+        setNewValue("");
+        
+        files.forEach(file => {
+            const tempUrl = URL.createObjectURL(file);
+            const label = files.length === 1 && newLabel.trim() 
+                ? newLabel.trim() 
+                : file.name.replace(/\.[^.]+$/, "");
 
-        const finishUpload = async (duration?: number) => {
-            const formData = new FormData();
-            formData.append("file", file);
-            try {
-                const res = await fetch('/api/upload', { method: 'POST', body: formData });
-                if (!res.ok) throw new Error("Upload failed");
-                const data = await res.json();
-                onAddItem(collection.id, label, data.url, duration);
-            } catch (e) {
-                console.error("Upload failed", e);
-                alert("Upload failed. Using temporary local URL.");
-                onAddItem(collection.id, label, tempUrl, duration);
-            }
-            setNewLabel("");
-            setNewValue("");
-            setIsAdding(false);
-        };
-
-        if (file.type.startsWith("video/") || file.type.startsWith("audio/")) {
-            const media = document.createElement(file.type.startsWith("video/") ? 'video' : 'audio');
-            media.preload = 'metadata';
-            media.onloadedmetadata = () => {
-                URL.revokeObjectURL(media.src);
-                finishUpload(media.duration);
+            const finishUpload = async (duration?: number) => {
+                const formData = new FormData();
+                formData.append("file", file);
+                try {
+                    const res = await fetch('/api/upload', { method: 'POST', body: formData });
+                    if (!res.ok) throw new Error("Upload failed");
+                    const data = await res.json();
+                    onAddItem(collection.id, label, data.url, duration);
+                } catch (e) {
+                    console.error("Upload failed", e);
+                    onAddItem(collection.id, label, tempUrl, duration);
+                }
             };
-            media.onerror = () => {
-                URL.revokeObjectURL(media.src);
+
+            if (file.type.startsWith("video/") || file.type.startsWith("audio/")) {
+                const media = document.createElement(file.type.startsWith("video/") ? 'video' : 'audio');
+                media.preload = 'metadata';
+                media.onloadedmetadata = () => {
+                    URL.revokeObjectURL(media.src);
+                    finishUpload(media.duration);
+                };
+                media.onerror = () => {
+                    URL.revokeObjectURL(media.src);
+                    finishUpload();
+                }
+                media.src = URL.createObjectURL(file);
+            } else {
                 finishUpload();
             }
-            media.src = URL.createObjectURL(file);
-        } else {
-            finishUpload();
-        }
+        });
     };
 
     const handleUpdateFile = async (file: File, itemId: string) => {
@@ -385,11 +389,12 @@ function CollectionCard({ collection, onAddItem, onDeleteItem, onUpdateItem, onD
                                             <input
                                                 ref={fileInputRef}
                                                 type="file"
+                                                multiple
                                                 accept={acceptMap[collection.type]}
                                                 className="hidden"
                                                 onChange={(e) => {
-                                                    const file = e.target.files?.[0];
-                                                    if (file) handleFileSelected(file);
+                                                    const files = Array.from(e.target.files || []);
+                                                    if (files.length > 0) handleFilesSelected(files);
                                                     e.target.value = "";
                                                 }}
                                             />
@@ -402,7 +407,7 @@ function CollectionCard({ collection, onAddItem, onDeleteItem, onUpdateItem, onD
                                                 )}
                                             >
                                                 <Upload className="w-3.5 h-3.5" />
-                                                <span className="text-[9px] font-mono">Choose {collection.type} file</span>
+                                                <span className="text-[9px] font-mono">Choose {collection.type} file(s)</span>
                                             </button>
                                         </>
                                     ) : (
@@ -1484,7 +1489,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
 
             // Per-variant override for media (duration/offset)
             const variantId = chosenVariant?.id;
-            const variantOverride = variantId && el.variantOverrides?.[variantId];
+            const variantOverride = variantId ? el.variantOverrides?.[variantId] : undefined;
 
             const startTime = timingEntry.startTime;
             const duration = variantOverride?.duration ?? timingEntry.duration;
@@ -1544,12 +1549,13 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         renderAbortRef.current?.abort();
     }, []);
 
-    const saveSkeleton = async () => {
+    const saveSkeleton = async (overrides?: { tracks?: TrackConfig[], silent?: boolean }) => {
         setSaving(true);
         try {
             const payload = {
                 duration: TOTAL_DURATION,
                 elements: elements,
+                tracks: overrides?.tracks || tracks,
                 collections: collections,
             };
             const endpoint = compositionId ? `/api/compositions/${compositionId}` : '/api/compositions';
@@ -1561,9 +1567,9 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 body: JSON.stringify(payload),
             });
 
-            if (res.ok) showToast("Composition saved successfully!", "success");
-            else showToast("Failed to save composition.", "error");
-            } catch { showToast("Failed to save.", "error"); }
+            if (res.ok) { if (!overrides?.silent) showToast("Composition saved successfully!", "success"); }
+            else { if (!overrides?.silent) showToast("Failed to save composition.", "error"); }
+            } catch { if (!overrides?.silent) showToast("Failed to save.", "error"); }
             finally { setSaving(false); }
             };
 
@@ -1625,7 +1631,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                 )}
                             </AnimatePresence>
                         </div>
-                        <button onClick={saveSkeleton} disabled={saving} className="px-4 py-1.5 bg-[#111] hover:bg-[#222] border border-white/5 disabled:opacity-50 text-gray-300 hover:text-white text-xs font-semibold rounded-md transition-colors">
+                        <button onClick={() => saveSkeleton()} disabled={saving} className="px-4 py-1.5 bg-[#111] hover:bg-[#222] border border-white/5 disabled:opacity-50 text-gray-300 hover:text-white text-xs font-semibold rounded-md transition-colors">
                             {saving ? "Saving..." : "Save Changes"}
                         </button>
                         <button
@@ -1722,7 +1728,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                     collection={col}
                                     onAddItem={(colId, label, value, duration) => {
                                         setCollections(prev => prev.map(c =>
-                                            c.id === colId ? { ...c, items: [...c.items, { id: `v-${Date.now()}`, label, value, duration }] } : c
+                                            c.id === colId ? { ...c, items: [...c.items, { id: `v-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, label, value, duration }] } : c
                                         ));
                                     }}
                                     onDeleteItem={(colId, variantId) => {
@@ -1738,7 +1744,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                     onDeleteCollection={(colId) => {
                                         setCollections(prev => prev.filter(c => c.id !== colId));
                                         setElements(prev => prev.filter(el => el.collectionId !== colId));
-                                        if (elements.find(el => el.id === selectedElementId && el.collectionId === colId)) {
+                                        if (elements.find(el => el.elementId === selectedElementId && el.collectionId === colId)) {
                                             setSelectedElementId(null);
                                         }
                                     }}
@@ -1797,33 +1803,51 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                     )}
                                                 </AnimatePresence>
                                                 <div className="absolute inset-0 opacity-[0.06] pointer-events-none" style={{ backgroundImage: 'linear-gradient(rgba(255,255,255,0.3) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.3) 1px, transparent 1px)', backgroundSize: '10% 10%' }} />
-                                                {elements.filter(el => el.elementId !== selectedElementId).map(baseEl => {
-                                                    const elMode = getVariantMode(baseEl.elementId);
-                                                    const el = elMode !== 'all' ? getEffectiveElement(baseEl, elMode) : baseEl;
-                                                    return (
-                                                        <CanvasLayer
-                                                            key={el.elementId}
-                                                            el={el}
-                                                            isSelected={false}
-                                                            collections={collections}
-                                                            currentTime={currentTime}
-                                                            onClick={() => { setSelectedElementId(el.elementId); }}
-                                                            onActionStart={handleActionStart}
-                                                        />
-                                                    )
-                                                })}
+                                                {elements.filter(el => el.elementId !== selectedElementId)
+                                                    .sort((a, b) => {
+                                                        const ta = tracks.findIndex(t => t.id === (a.trackId || 'track-0'));
+                                                        const tb = tracks.findIndex(t => t.id === (b.trackId || 'track-0'));
+                                                        if (ta !== tb) return tb - ta; // Lower track index should map to later array order (to be on top)
+                                                        return a.zIndex - b.zIndex;
+                                                    })
+                                                    .map(baseEl => {
+                                                        const elMode = getVariantMode(baseEl.elementId);
+                                                        const rawEl = elMode !== 'all' ? getEffectiveElement(baseEl, elMode) : baseEl;
+                                                        
+                                                        const trackIndex = tracks.findIndex(t => t.id === (baseEl.trackId || 'track-0'));
+                                                        const baseZ = 1000 - (Math.max(0, trackIndex) * 10);
+                                                        const el = { ...rawEl, zIndex: baseZ + (rawEl.zIndex || 0) };
+
+                                                        return (
+                                                            <CanvasLayer
+                                                                key={el.elementId}
+                                                                el={el}
+                                                                isSelected={false}
+                                                                collections={collections}
+                                                                currentTime={currentTime}
+                                                                onClick={() => { setSelectedElementId(el.elementId); }}
+                                                                onActionStart={handleActionStart}
+                                                            />
+                                                        )
+                                                    })}
                                             </div>
-                                            {selectedElement && (
-                                                <CanvasLayer
-                                                    key={selectedElement.elementId}
-                                                    el={effectiveElement || selectedElement}
-                                                    isSelected={true}
-                                                    collections={collections}
-                                                    currentTime={currentTime}
-                                                    onClick={() => { }}
-                                                    onActionStart={handleActionStart}
-                                                />
-                                            )}
+                                            {selectedElement && (() => {
+                                                const rawEl = effectiveElement || selectedElement;
+                                                const trackIndex = tracks.findIndex(t => t.id === (rawEl.trackId || 'track-0'));
+                                                const baseZ = 1000 - (Math.max(0, trackIndex) * 10);
+                                                const el = { ...rawEl, zIndex: baseZ + (rawEl.zIndex || 0) + 100 }; // Boost selected on top of its track
+                                                return (
+                                                    <CanvasLayer
+                                                        key={el.elementId}
+                                                        el={el}
+                                                        isSelected={true}
+                                                        collections={collections}
+                                                        currentTime={currentTime}
+                                                        onClick={() => { }}
+                                                        onActionStart={handleActionStart}
+                                                    />
+                                                );
+                                            })()}
                                             {elements.length === 0 && (
                                                 <div className="absolute inset-0 flex flex-col items-center justify-center text-gray-600 pointer-events-none">
                                                     <Plus className="w-8 h-8 mb-3 opacity-30" />
@@ -1886,11 +1910,21 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                     return { el, variant };
                                                 })
                                                 .filter(({ el }) => (el.visible !== false) && el.collectionType !== 'audio')
-                                                .sort((a, b) => a.el.zIndex - b.el.zIndex)
-                                                .map(({ el, variant }) => {
-                                                    const isActive = currentTime >= el.startTime && currentTime < el.startTime + el.duration;
-                                                    const colors = COLLECTION_COLORS[el.collectionType];
-                                                    const animStyle = evaluateAnimations(el, currentTime);
+                                                .sort((a, b) => {
+                                                    const ta = tracks.findIndex(t => t.id === (a.el.trackId || 'track-0'));
+                                                    const tb = tracks.findIndex(t => t.id === (b.el.trackId || 'track-0'));
+                                                    if (ta !== tb) return tb - ta;
+                                                    return a.el.zIndex - b.el.zIndex;
+                                                })
+                                                .map(({ el: rawEl, variant }) => {
+                                                    const isActive = currentTime >= rawEl.startTime && currentTime < rawEl.startTime + rawEl.duration;
+                                                    const colors = COLLECTION_COLORS[rawEl.collectionType];
+                                                    const animStyle = evaluateAnimations(rawEl, currentTime);
+                                                    
+                                                    const trackIndex = tracks.findIndex(t => t.id === (rawEl.trackId || 'track-0'));
+                                                    const baseZ = 1000 - (Math.max(0, trackIndex) * 10);
+                                                    const el = { ...rawEl, zIndex: baseZ + (rawEl.zIndex || 0) };
+
                                                     return (
                                                         <div
                                                             key={el.elementId}
@@ -1929,11 +1963,12 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                         className="w-full h-full object-cover"
                                                                         playsInline
                                                                         preload="auto"
+                                                                        loop
                                                                         ref={(videoEl) => {
                                                                             if (!videoEl) return;
-                                                                            const rawDur = videoEl.duration || Infinity;
+                                                                            const rawDur = (videoEl.duration && !isNaN(videoEl.duration)) ? videoEl.duration : Infinity;
                                                                             const localTime = Math.max(0, currentTime - el.startTime) + (el.mediaOffset ?? 0);
-                                                                            const safeLocalTime = Math.min(localTime, rawDur);
+                                                                            const safeLocalTime = rawDur !== Infinity ? (localTime % rawDur) : localTime;
                                                                             // Sync time if scrubbing or drifting out of sync
                                                                             if (Math.abs(videoEl.currentTime - safeLocalTime) > 0.2) {
                                                                                 videoEl.currentTime = safeLocalTime;
@@ -1941,7 +1976,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                             if (videoEl.volume !== (el.volume ?? 1)) {
                                                                                 videoEl.volume = el.volume ?? 1;
                                                                             }
-                                                                            if (isPlaying && isActive && safeLocalTime < rawDur) {
+                                                                            if (isPlaying && isActive) {
                                                                                 if (videoEl.paused) videoEl.play().catch(() => { });
                                                                             }
                                                                             else {
@@ -1957,18 +1992,19 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                             ) : el.collectionType === 'audio' ? (
                                                                 <audio
                                                                     src={variant?.value || el.content}
+                                                                    loop
                                                                     ref={(audioEl) => {
                                                                         if (!audioEl) return;
-                                                                        const rawDur = audioEl.duration || Infinity;
+                                                                        const rawDur = (audioEl.duration && !isNaN(audioEl.duration)) ? audioEl.duration : Infinity;
                                                                         const localTime = Math.max(0, currentTime - el.startTime);
-                                                                        const safeLocalTime = Math.min(localTime, rawDur);
+                                                                        const safeLocalTime = rawDur !== Infinity ? (localTime % rawDur) : localTime;
                                                                         if (Math.abs(audioEl.currentTime - safeLocalTime) > 0.2) {
                                                                             audioEl.currentTime = safeLocalTime;
                                                                         }
                                                                         if (audioEl.volume !== (el.volume ?? 1)) {
                                                                             audioEl.volume = el.volume ?? 1;
                                                                         }
-                                                                        if (isPlaying && isActive && safeLocalTime < rawDur) {
+                                                                        if (isPlaying && isActive) {
                                                                             if (audioEl.paused) audioEl.play().catch(() => { });
                                                                         } else {
                                                                             if (!audioEl.paused) audioEl.pause();
@@ -2000,18 +2036,19 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                         <audio
                                                             key={`aud-${el.elementId}-${variant?.value || el.content || 'base'}`}
                                                             src={variant?.value || el.content}
+                                                            loop
                                                             ref={(audioEl) => {
                                                                 if (!audioEl) return;
-                                                                const rawDur = audioEl.duration || Infinity;
+                                                                const rawDur = (audioEl.duration && !isNaN(audioEl.duration)) ? audioEl.duration : Infinity;
                                                                 const localTime = Math.max(0, currentTime - el.startTime) + (el.mediaOffset ?? 0);
-                                                                const safeLocalTime = Math.min(localTime, rawDur);
+                                                                const safeLocalTime = rawDur !== Infinity ? (localTime % rawDur) : localTime;
                                                                 if (Math.abs(audioEl.currentTime - safeLocalTime) > 0.2) {
                                                                     audioEl.currentTime = safeLocalTime;
                                                                 }
                                                                 if (audioEl.volume !== (el.volume ?? 1)) {
                                                                     audioEl.volume = el.volume ?? 1;
                                                                 }
-                                                                if (isPlaying && isActive && safeLocalTime < rawDur) {
+                                                                if (isPlaying && isActive) {
                                                                     if (audioEl.paused) audioEl.play().catch(() => { });
                                                                 } else {
                                                                     if (!audioEl.paused) audioEl.pause();
@@ -2143,12 +2180,28 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                             </div>
                                                             {/* Left Tracks Scrollable */}
                                                             <div 
-                                                                className="flex-1 overflow-y-hidden custom-scrollbar py-2 space-y-1 bg-[#0a0a0a]"
+                                                                className="flex-1 overflow-y-auto custom-scrollbar py-2 space-y-1 bg-[#0a0a0a]"
                                                                 id="track-headers-scroll"
                                                             >
                                                                 {tracks.map((track, tIndex) => (
-                                                                    <div key={track.id} className="h-10 px-2 flex items-center justify-between bg-white/5 rounded-r mr-1 shrink-0">
-                                                                        <span className="text-[10px] text-gray-500 font-mono">Track {tIndex + 1}</span>
+                                                                    <div key={track.id} className="h-10 px-2 flex items-center gap-2 bg-white/5 rounded-r mr-1 shrink-0 group">
+                                                                        <span className="flex-1 text-[10px] text-gray-500 font-mono">Track {tIndex + 1}</span>
+                                                                        <button
+                                                                            onClick={(e) => {
+                                                                                e.stopPropagation();
+                                                                                setElements(prev => prev.filter(el => (el.trackId || 'track-0') !== track.id));
+                                                                                setTracks(prev => {
+                                                                                    const next = prev.filter(t => t.id !== track.id);
+                                                                                    saveSkeleton({ tracks: next, silent: true });
+                                                                                    return next;
+                                                                                });
+                                                                            }}
+                                                                            onPointerDown={(e) => e.stopPropagation()}
+                                                                            className="opacity-0 group-hover:opacity-100 transition-opacity p-1 hover:bg-white/10 rounded text-gray-400 hover:text-red-400"
+                                                                            title="Delete Track"
+                                                                        >
+                                                                            <Trash2 className="w-3 h-3" />
+                                                                        </button>
                                                                         <button 
                                                                             onClick={(e) => {
                                                                                 e.stopPropagation();
@@ -2171,13 +2224,18 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                         </button>
                                                                     </div>
                                                                 ))}
+                                                                <div className="h-[48px] shrink-0 pointer-events-none" />
+                                                            </div>
+                                                            <div className="p-2 shrink-0 bg-[#0a0a0a] border-t border-[#222]">
                                                                 <button 
                                                                     onClick={(e) => {
                                                                         e.stopPropagation();
-                                                                        setTracks(prev => [...prev, { id: `track-${Date.now()}`, magnet: false }]);
+                                                                        const newTracks = [...tracks, { id: `track-${Date.now()}`, magnet: false }];
+                                                                        setTracks(newTracks);
+                                                                        saveSkeleton({ tracks: newTracks, silent: true });
                                                                     }}
                                                                     onPointerDown={(e) => e.stopPropagation()}
-                                                                    className="w-[140px] mx-auto block py-2 text-[9px] font-mono font-bold text-gray-500 hover:bg-white/5 border border-dashed border-white/10 rounded transition-colors mt-2"
+                                                                    className="w-[140px] mx-auto block py-2 text-[9px] font-mono font-bold text-gray-500 hover:bg-white/5 border border-dashed border-white/10 rounded transition-colors"
                                                                 >
                                                                     + NEW TRACK
                                                                 </button>
@@ -2616,6 +2674,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                                 </div>
                                                                             );
                                                                         })}
+                                                                        <div className="h-[48px] shrink-0 pointer-events-none" />
                                                                     </div>
                                                                 </div>
                                                             </div>
@@ -3088,7 +3147,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             <DragOverlay dropAnimation={null}>
                 {activeCollection ? (
                     <div className="opacity-80 scale-105 pointer-events-none origin-top-left w-[220px]">
-                        <CollectionCard collection={activeCollection} onAddItem={() => { }} onDeleteItem={() => { }} onUpdateItem={() => { }} />
+                        <CollectionCard collection={activeCollection} onAddItem={() => { }} onDeleteItem={() => { }} onUpdateItem={() => { }} onDeleteCollection={() => { }} />
                     </div>
                 ) : null}
             </DragOverlay>
