@@ -6,7 +6,7 @@ import {
     Play, Pause, Plus, Image as ImageIcon, Music, Download, Upload,
     Layers, X, Type, MonitorPlay, SlidersHorizontal, GripVertical, Shuffle, SkipBack, Video, Trash2, Sparkles, ChevronDown, Eye, EyeOff,
     Bold, Italic, Underline, AlignLeft, AlignCenter, AlignRight, Scissors, MousePointer2, Settings, Lock, Unlock, ArrowUp, ArrowDown,
-    Film, Loader2, CheckCircle2, AlertCircle, Clapperboard
+    Film, Loader2, CheckCircle2, AlertCircle, Clapperboard, ListPlus
 } from "lucide-react";
 import Link from "next/link";
 import { renderComposition, type RenderProgress, type RenderElement, type RenderFormat } from "./renderer";
@@ -803,6 +803,9 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     const [isExportModalOpen, setIsExportModalOpen] = useState(false);
     const [renderProgress, setRenderProgress] = useState<RenderProgress | null>(null);
     const renderAbortRef = useRef<AbortController | null>(null);
+    const [renderQueue, setRenderQueue] = useState<{ id: string; name: string; job: RenderJob; usedVariantIds: string[] }[]>([]);
+    const renderQueueRef = useRef(renderQueue);
+    renderQueueRef.current = renderQueue;
     const [exportSettings, setExportSettings] = useState({
         resolution: '1080x1920' as '1080x1920' | '720x1280' | '540x960',
         fps: 30 as 24 | 30 | 60,
@@ -907,8 +910,48 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         return Math.abs(hash);
     };
 
+    function mulberry32(a: number) {
+        return function() {
+            var t = a += 0x6D2B79F5;
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        }
+    }
+
+    const [variantUsage, setVariantUsage] = useState<Record<string, number>>(() => {
+        if (typeof window !== 'undefined') {
+            try { return JSON.parse(localStorage.getItem('dropai_variant_usage') || '{}'); } catch(e) {}
+        }
+        return {};
+    });
+
+    const recordVariantUsage = useCallback((usedVariantIds: string[]) => {
+        setVariantUsage(prev => {
+            const next = { ...prev };
+            for (const id of usedVariantIds) {
+                next[id] = (next[id] || 0) + 1;
+            }
+            if (typeof window !== 'undefined') {
+                localStorage.setItem('dropai_variant_usage', JSON.stringify(next));
+            }
+            return next;
+        });
+    }, []);
+
     const previewVariants = useMemo(() => {
         const variants: Record<string, CollectionVariant | null> = {};
+        
+        // Calculate usage from currently queued items to apply bias even before rendering starts
+        const queueUsages = renderQueueRef.current.reduce((acc, curr) => {
+            if (curr.usedVariantIds) {
+                curr.usedVariantIds.forEach(id => {
+                    acc[id] = (acc[id] || 0) + 1;
+                });
+            }
+            return acc;
+        }, {} as Record<string, number>);
+
         elements.forEach(el => {
             const col = collections.find(c => c.id === el.collectionId);
             if (col && col.items.length > 0) {
@@ -916,14 +959,32 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 // We use sourceElementId to keep variant persistent across splits
                 const srcId = el.sourceElementId || el.elementId;
                 const seededHash = hashString(`${variantSeed}-${srcId}`);
-                const index = seededHash % col.items.length;
+                
+                const random = mulberry32(seededHash);
+                
+                // Calculate weights: rendered assets AND queued assets get a negative bias
+                const weights = col.items.map(v => {
+                    const usage = (variantUsage[v.id] || 0) + (queueUsages[v.id] || 0);
+                    return 100 / Math.pow(10, usage); // Huge penalty per queue/render
+                });
+                
+                const totalWeight = weights.reduce((a, b) => a + b, 0);
+                let rand = random() * totalWeight;
+                let index = 0;
+                for (let i = 0; i < weights.length; i++) {
+                    rand -= weights[i];
+                    if (rand <= 0) {
+                        index = i;
+                        break;
+                    }
+                }
                 variants[el.elementId] = col.items[index];
             } else {
                 variants[el.elementId] = null;
             }
         });
         return variants;
-    }, [elements, collections, variantSeed]);
+    }, [elements, collections, variantSeed, variantUsage]);
 
     const activeVariantModes = useMemo(() => {
         const modes: Record<string, string> = {};
@@ -1475,7 +1536,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         if (selectedVariantMode === 'all' && selectedElement) {
             const isMedia = selectedElement.collectionType === 'video' || selectedElement.collectionType === 'audio';
             if (isMedia) {
-                const { startTime, duration, ...rest } = finalUpdates as any;
+                const { startTime, duration, mediaOffset, ...rest } = finalUpdates as any;
                 finalUpdates = rest;
                 if (Object.keys(finalUpdates).length === 0) return;
             }
@@ -1519,7 +1580,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
 
             const startTime = timingEntry.startTime;
             const duration = variantOverride?.duration ?? timingEntry.duration;
-            const mediaOffset = (variantOverride as any)?.mediaOffset ?? el.mediaOffset ?? 0;
+            const mediaOffset = (variantOverride as Partial<CanvasElement>)?.mediaOffset ?? el.mediaOffset ?? 0;
 
             return {
                 elementId: el.elementId,
@@ -1559,17 +1620,53 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         };
     }, [elements, collections, previewVariants, elementTimings, exportSettings, TOTAL_DURATION]);
 
-    const startRender = useCallback(async () => {
+    const queueCurrentVariant = useCallback(() => {
         const job = buildRenderJob();
+        const currentUsedVariantIds = elements.map(el => activeVariantModes[el.elementId]).filter(id => id !== 'all') as string[];
+        setRenderQueue(prev => [...prev, { id: `job-${Date.now()}`, name: `Variant ${prev.length + 1} (Seed ${variantSeed})`, job, usedVariantIds: currentUsedVariantIds }]);
+        showToast("Variant added to render queue", "success");
+    }, [buildRenderJob, variantSeed, elements, activeVariantModes]);
+
+    const startRender = useCallback(async () => {
+        const currentUsedVariantIds = elements.map(el => activeVariantModes[el.elementId]).filter(id => id !== 'all') as string[];
+        const jobsToRender = renderQueue.length > 0 ? renderQueue : [{ id: 'current', name: 'Current View', job: buildRenderJob(), usedVariantIds: currentUsedVariantIds }];
+        
         const abortCtrl = new AbortController();
         renderAbortRef.current = abortCtrl;
-        setRenderProgress({ phase: 'preparing', progress: 0, message: 'Starting…' });
+        
         try {
-            await renderComposition(job, setRenderProgress, abortCtrl.signal);
-        } catch (e: any) {
-            setRenderProgress({ phase: 'error', progress: 0, message: 'Render failed', error: e?.message ?? String(e) });
+            for (let i = 0; i < jobsToRender.length; i++) {
+                const item = jobsToRender[i];
+                if (abortCtrl.signal.aborted) break;
+                
+                setRenderProgress({ phase: 'preparing', progress: 0, message: jobsToRender.length > 1 ? `[${i + 1}/${jobsToRender.length}] Starting…` : 'Starting…' });
+
+                const progressWrapper = (p: RenderProgress) => {
+                    setRenderProgress({ 
+                        ...p, 
+                        message: jobsToRender.length > 1 
+                            ? `[${i + 1}/${jobsToRender.length}] ${p.message}` 
+                            : p.message 
+                    });
+                };
+                
+                await renderComposition(item.job, progressWrapper, abortCtrl.signal);
+                
+                // Record usage for negative bias in future randomizations
+                recordVariantUsage(item.usedVariantIds);
+
+                // Remove from queue if successful
+                if (jobsToRender.length > 1) {
+                    setRenderQueue(prev => prev.filter(q => q.id !== item.id));
+                }
+            }
+            if (!abortCtrl.signal.aborted) {
+                setRenderProgress({ phase: 'done', progress: 1, message: jobsToRender.length > 1 ? 'All exports complete!' : 'Export complete!' });
+            }
+        } catch (e: unknown) {
+            setRenderProgress({ phase: 'error', progress: 0, message: 'Render failed', error: e instanceof Error ? e.message : String(e) });
         }
-    }, [buildRenderJob]);
+    }, [buildRenderJob, renderQueue]);
 
     const cancelRender = useCallback(() => {
         renderAbortRef.current?.abort();
@@ -1664,7 +1761,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                             onClick={() => { setIsExportModalOpen(true); setRenderProgress(null); }}
                             className="px-4 py-1.5 bg-white hover:bg-gray-200 text-black text-xs font-semibold rounded-md transition-colors flex items-center gap-2"
                         >
-                            <Clapperboard className="w-4 h-4" /> Export
+                            <Clapperboard className="w-4 h-4" /> Export {renderQueue.length > 0 ? `(${renderQueue.length})` : ''}
                         </button>
                     </div>
                 </nav>
@@ -2139,6 +2236,13 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                     title="Shuffle variants"
                                                 >
                                                     <Shuffle className="w-4 h-4" />
+                                                </button>
+                                                <button
+                                                    onClick={() => { queueCurrentVariant(); }}
+                                                    className="p-2 rounded-lg bg-white/5 hover:bg-white/10 text-gray-400 hover:text-white transition-colors"
+                                                    title="Queue Variant"
+                                                >
+                                                    <ListPlus className="w-4 h-4" />
                                                 </button>
                                             </div>
                                         </div>
@@ -3002,6 +3106,48 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                         </div>
                                     )}
 
+                                    {/* Media Trim Config */}
+                                    {(selectedElement.collectionType === 'video' || selectedElement.collectionType === 'audio') && selectedVariantMode !== 'all' && (
+                                        <div className="space-y-3 pt-4 border-t border-white/5">
+                                            <h4 className="text-[9px] font-bold uppercase tracking-widest text-gray-500 font-mono">Media Trim</h4>
+                                            <div className="grid grid-cols-2 gap-2">
+                                                <div className="flex items-center bg-[#111] rounded-md border border-white/10 px-2.5 py-2 focus-within:border-blue-500/50 transition-colors">
+                                                    <span className="text-[10px] text-gray-500 font-mono mr-2">Start</span>
+                                                    <input
+                                                        type="number"
+                                                        step="0.1"
+                                                        min="0"
+                                                        value={Math.round(((effectiveElement || selectedElement).mediaOffset || 0) * 10) / 10}
+                                                        onChange={e => {
+                                                            const newStart = Math.max(0, Number(e.target.value));
+                                                            updateSelected({ mediaOffset: newStart });
+                                                        }}
+                                                        className="bg-transparent text-white text-[11px] w-full focus:outline-none font-mono"
+                                                    />
+                                                </div>
+                                                <div className="flex items-center bg-[#111] rounded-md border border-white/10 px-2.5 py-2 focus-within:border-blue-500/50 transition-colors">
+                                                    <span className="text-[10px] text-gray-500 font-mono mr-2">End</span>
+                                                    <input
+                                                        type="number"
+                                                        step="0.1"
+                                                        min="0.1"
+                                                        value={Math.round((((effectiveElement || selectedElement).mediaOffset || 0) + (effectiveElement || selectedElement).duration) * 10) / 10}
+                                                        onChange={e => {
+                                                            const newEnd = Math.max(0.1, Number(e.target.value));
+                                                            const currentStart = (effectiveElement || selectedElement).mediaOffset || 0;
+                                                            if (newEnd > currentStart) {
+                                                                updateSelected({ duration: newEnd - currentStart });
+                                                            }
+                                                        }}
+                                                        className="bg-transparent text-white text-[11px] w-full focus:outline-none font-mono"
+                                                    />
+                                                </div>
+                                            </div>
+                                            <p className="text-[8px] font-mono text-gray-600">Trims source media. To move on timeline, drag element horizontally.</p>
+                                        </div>
+                                    )}
+
+
 
                                     {/* Animations */}
                                     <div className="space-y-3 pt-4 border-t border-white/5">
@@ -3304,6 +3450,19 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                             Export renders frame-by-frame in your browser. Keep the tab active. Large compositions may take a few minutes.
                                         </p>
                                     </div>
+
+                                    {renderQueue.length > 0 && (
+                                        <div className="flex items-center justify-between bg-blue-500/10 border border-blue-500/20 rounded-lg px-3 py-2.5 mt-2">
+                                            <div className="flex items-center gap-2">
+                                                <ListPlus className="w-4 h-4 text-blue-400" />
+                                                <span className="text-[10px] text-blue-300 font-mono">Render Queue Active</span>
+                                            </div>
+                                            <div className="flex items-center gap-3 text-[10px] font-mono text-gray-400">
+                                                <span>{renderQueue.length} variant(s) queued</span>
+                                                <button onClick={() => setRenderQueue([])} className="text-red-400 hover:text-red-300">Clear</button>
+                                            </div>
+                                        </div>
+                                    )}
 
                                     {/* Estimates */}
                                     <div className="flex justify-between text-[10px] font-mono text-gray-600">

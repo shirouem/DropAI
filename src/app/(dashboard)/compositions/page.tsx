@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { Layers, Plus, Search, Trash2, Edit2, Clock } from "lucide-react";
+import { Layers, Plus, Search, Trash2, Edit2, Clock, Copy } from "lucide-react";
 import { motion } from "framer-motion";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -61,6 +61,33 @@ export default function CompositionsPage() {
         }
     };
 
+    const handleDuplicate = async (comp: any, e: React.MouseEvent) => {
+        e.preventDefault();
+        e.stopPropagation();
+
+        try {
+            const elements = typeof comp.elements === 'string' ? JSON.parse(comp.elements || '[]') : comp.elements;
+            const tracks = typeof comp.tracks === 'string' ? JSON.parse(comp.tracks || '[]') : comp.tracks;
+            const collections = typeof comp.collections === 'string' ? JSON.parse(comp.collections || '[]') : comp.collections;
+
+            await fetch("/api/compositions", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    title: `${comp.title} (Copy)`,
+                    duration: comp.duration,
+                    angle: comp.angle,
+                    elements,
+                    tracks,
+                    collections
+                })
+            });
+            fetchCompositions();
+        } catch (error) {
+            console.error("Failed to duplicate composition", error);
+        }
+    };
+
     return (
         <div className="flex-1 overflow-y-auto relative h-full">
             <header className="h-16 flex items-center justify-between px-8 border-b border-white/5 bg-[#050505]/50 backdrop-blur-sm sticky top-0 z-30">
@@ -115,10 +142,13 @@ export default function CompositionsPage() {
                                             <Layers className="w-5 h-5 text-gray-300" />
                                         </div>
                                         <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                                            <button className="p-2 bg-white/5 hover:bg-white/10 rounded text-gray-400 hover:text-white transition-colors">
+                                            <button onClick={(e) => handleDuplicate(comp, e)} className="p-2 bg-white/5 hover:bg-white/10 rounded text-gray-400 hover:text-white transition-colors" title="Duplicate">
+                                                <Copy className="w-4 h-4" />
+                                            </button>
+                                            <button className="p-2 bg-white/5 hover:bg-white/10 rounded text-gray-400 hover:text-white transition-colors" title="Edit">
                                                 <Edit2 className="w-4 h-4" />
                                             </button>
-                                            <button onClick={(e) => handleDelete(comp.id, e)} className="p-2 bg-red-500/10 hover:bg-red-500/20 rounded text-red-500 hover:text-red-400 transition-colors">
+                                            <button onClick={(e) => handleDelete(comp.id, e)} className="p-2 bg-red-500/10 hover:bg-red-500/20 rounded text-red-500 hover:text-red-400 transition-colors" title="Delete">
                                                 <Trash2 className="w-4 h-4" />
                                             </button>
                                         </div>
