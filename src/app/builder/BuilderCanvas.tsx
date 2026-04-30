@@ -6,7 +6,7 @@ import {
     Play, Pause, Plus, Image as ImageIcon, Music, Download, Upload,
     Layers, X, Type, MonitorPlay, SlidersHorizontal, GripVertical, Shuffle, SkipBack, Video, Trash2, Sparkles, ChevronDown, Eye, EyeOff,
     Bold, Italic, Underline, AlignLeft, AlignCenter, AlignRight, Scissors, MousePointer2, Settings, Lock, Unlock, ArrowUp, ArrowDown,
-    Film, Loader2, CheckCircle2, AlertCircle, Clapperboard
+    Film, Loader2, CheckCircle2, AlertCircle, Clapperboard, ListPlus, Link2, Ban
 } from "lucide-react";
 import Link from "next/link";
 import { renderComposition, type RenderProgress, type RenderElement, type RenderFormat } from "./renderer";
@@ -34,6 +34,8 @@ interface CollectionVariant {
     label: string;
     value: string; // text content, URL, etc.
     duration?: number; // Intrinsic media duration in seconds
+    linkedVariantIds?: string[];
+    excluded?: boolean; // When true, this variant is skipped during shuffle/generation
 }
 
 interface CollectionItem {
@@ -114,13 +116,21 @@ export interface CanvasElement {
     letterSpacing?: number;
     lineHeight?: number;
     textAlign?: 'left' | 'center' | 'right';
+    textStrokeColor?: string; // CSS color for text outline
+    textStrokeWidth?: number; // Stroke width in px (at PREVIEW_W scale)
     selectedVariantId?: string;
     animations: ElementAnimation[];
     variantOverrides?: Record<string, Partial<CanvasElement>>;
     sourceElementId?: string;
     volume?: number; // Volume from 0 to 1
+    speed?: number; // Playback rate (0.25 – 4). 1 = normal
+    audioFadeIn?: number; // Fade-in duration in seconds
+    audioFadeOut?: number; // Fade-out duration in seconds
+    randomizeWindow?: boolean; // When true, picks a random same-duration window from across the full media length
     mediaOffset?: number; // Offset into source media file (seconds), used after splitting
     syncWith?: { targetId: string; targetEdge: 'start' | 'end'; myEdge: 'start' | 'end'; edge?: 'start' | 'end' } | null;
+    matchDurationWithId?: string;
+    matchDurationWithIds?: string[];
 }
 
 // --- Collection Type Styling ---
@@ -137,6 +147,43 @@ const COLLECTION_ICONS: Record<CollectionType, React.ReactNode> = {
     video: <MonitorPlay className="w-3.5 h-3.5" />,
     audio: <Music className="w-3.5 h-3.5" />,
 };
+
+function ScrubInput({ value, onChange, min, max, step, className }: { value: number; onChange: (v: number) => void; min?: number; max?: number; step?: string | number; className?: string }) {
+    const [local, setLocal] = useState(value?.toString() || "0");
+    const [focused, setFocused] = useState(false);
+
+    useEffect(() => {
+        if (!focused) {
+            setLocal(value?.toString() || "0");
+        }
+    }, [value, focused]);
+
+    return (
+        <input
+            type="number"
+            value={focused ? local : (value?.toString() || "0")}
+            min={min} max={max} step={step}
+            className={className}
+            onFocus={() => setFocused(true)}
+            onBlur={() => {
+                setFocused(false);
+                let parsed = parseFloat(local);
+                if (isNaN(parsed)) parsed = value || 0;
+                if (min !== undefined && parsed < min) parsed = min;
+                if (max !== undefined && parsed > max) parsed = max;
+                setLocal(parsed.toString());
+                onChange(parsed);
+            }}
+            onChange={e => {
+                setLocal(e.target.value);
+                const parsed = parseFloat(e.target.value);
+                if (!isNaN(parsed)) {
+                    onChange(parsed);
+                }
+            }}
+        />
+    );
+}
 
 // --- Seed Collections ---
 const SEED_COLLECTIONS: CollectionItem[] = [
@@ -166,11 +213,12 @@ const SEED_COLLECTIONS: CollectionItem[] = [
 
 
 // --- Draggable Collection Card ---
-function CollectionCard({ collection, onAddItem, onDeleteItem, onUpdateItem, onDeleteCollection }: {
+function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, onUpdateItem, onDeleteCollection }: {
     collection: CollectionItem;
+    allCollections: CollectionItem[];
     onAddItem: (collectionId: string, label: string, value: string, duration?: number) => void;
     onDeleteItem: (collectionId: string, variantId: string) => void;
-    onUpdateItem: (collectionId: string, variantId: string, newValue: string, duration?: number) => void;
+    onUpdateItem: (collectionId: string, variantId: string, updates: Partial<CollectionVariant>) => void;
     onDeleteCollection: (collectionId: string) => void;
 }) {
     const [isOpen, setIsOpen] = useState(false);
@@ -180,6 +228,7 @@ function CollectionCard({ collection, onAddItem, onDeleteItem, onUpdateItem, onD
     const fileInputRef = useRef<HTMLInputElement>(null);
     const updateFileRef = useRef<HTMLInputElement>(null);
     const [updatingItemId, setUpdatingItemId] = useState<string | null>(null);
+    const [linkingVariantId, setLinkingVariantId] = useState<string | null>(null);
 
     const isMedia = collection.type !== "text";
     const acceptMap: Record<CollectionType, string> = {
@@ -247,7 +296,7 @@ function CollectionCard({ collection, onAddItem, onDeleteItem, onUpdateItem, onD
                 const res = await fetch('/api/upload', { method: 'POST', body: formData });
                 if (!res.ok) throw new Error("Upload failed");
                 const data = await res.json();
-                onUpdateItem(collection.id, itemId, data.url, duration);
+                onUpdateItem(collection.id, itemId, { value: data.url, duration });
             } catch (e) {
                 console.error("Upload failed", e);
                 alert("Update failed.");
@@ -325,41 +374,118 @@ function CollectionCard({ collection, onAddItem, onDeleteItem, onUpdateItem, onD
                     >
                         <div className="px-3 pb-3 space-y-1.5 border-t border-white/5 pt-2">
                             {collection.items.map((item) => (
-                                <div key={item.id} className="flex items-center gap-2 group">
-                                    {/* Thumbnail preview for media items */}
-                                    {isMedia && item.value && (
-                                        <div className="w-8 h-8 rounded overflow-hidden border border-white/10 shrink-0 bg-black/40">
-                                            {collection.type === "image" ? (
-                                                <img src={item.value} className="w-full h-full object-cover" alt={item.label} />
-                                            ) : collection.type === "video" ? (
-                                                <video src={item.value} className="w-full h-full object-cover" muted />
-                                            ) : (
-                                                <div className="w-full h-full flex items-center justify-center"><Music className="w-3 h-3 text-gray-500" /></div>
+                                    <div key={item.id} className={cn("flex items-center gap-2 group", item.excluded && "opacity-40")}>
+                                        {/* Thumbnail preview for media items */}
+                                        {isMedia && item.value && (
+                                            <div className="w-8 h-8 rounded overflow-hidden border border-white/10 shrink-0 bg-black/40">
+                                                {collection.type === "image" ? (
+                                                    <img src={item.value} className="w-full h-full object-cover" alt={item.label} />
+                                                ) : collection.type === "video" ? (
+                                                    <video src={item.value} className="w-full h-full object-cover" muted />
+                                                ) : (
+                                                    <div className="w-full h-full flex items-center justify-center"><Music className="w-3 h-3 text-gray-500" /></div>
+                                                )}
+                                            </div>
+                                        )}
+                                        <div className={cn("flex-1 text-[10px] font-mono text-gray-400 bg-black/30 rounded px-2 py-1.5 truncate min-w-0 relative", item.excluded && "line-through text-gray-600")}>
+                                            <span className="text-gray-500 mr-1.5">{item.label}</span>
+                                            {!isMedia && <span className="text-gray-300">: {item.value}</span>}
+                                            {item.excluded && <span className="ml-1.5 text-[8px] text-orange-500/70 font-bold uppercase tracking-wider">excl.</span>}
+                                        </div>
+                                        {/* Exclude toggle */}
+                                        <button
+                                            onClick={() => onUpdateItem(collection.id, item.id, { excluded: !item.excluded })}
+                                            className={cn(
+                                                "opacity-0 group-hover:opacity-100 transition-all",
+                                                item.excluded ? "text-orange-400 opacity-100" : "text-gray-600 hover:text-orange-400"
+                                            )}
+                                            title={item.excluded ? "Include in generation" : "Exclude from generation"}
+                                        >
+                                            <Ban className="w-3 h-3" />
+                                        </button>
+                                        {/* Link variants button */}
+                                        <button
+                                            onClick={() => setLinkingVariantId(item.id)}
+                                            className="opacity-0 group-hover:opacity-100 text-gray-600 hover:text-green-400 transition-all"
+                                            title="Link variants"
+                                        >
+                                            <Link2 className="w-3 h-3" />
+                                        </button>
+                                        {/* Replace asset button for media */}
+                                        {isMedia && (
+                                            <button
+                                                onClick={() => { setUpdatingItemId(item.id); updateFileRef.current?.click(); }}
+                                                className="opacity-0 group-hover:opacity-100 text-gray-600 hover:text-blue-400 transition-all"
+                                                title="Replace asset"
+                                            >
+                                                <Upload className="w-3 h-3" />
+                                            </button>
+                                        )}
+                                        <button
+                                            onClick={() => onDeleteItem(collection.id, item.id)}
+                                            className="opacity-0 group-hover:opacity-100 text-gray-600 hover:text-red-400 transition-all"
+                                        >
+                                            <X className="w-3 h-3" />
+                                        </button>
+                                    </div>
+                            ))}
+
+                            {/* Link Modal Overlay */}
+                            {linkingVariantId && (
+                                <div className="fixed inset-0 z-[200] bg-black/60 flex items-center justify-center p-4 backdrop-blur-sm" onClick={() => setLinkingVariantId(null)}>
+                                    <div className="bg-[#1a1a1a] border border-white/10 rounded-xl w-full max-w-lg p-5 flex flex-col gap-4 shadow-2xl" onClick={e => e.stopPropagation()}>
+                                        <h3 className="text-sm font-mono text-white flex items-center gap-2">
+                                            <Link2 className="w-4 h-4 text-blue-400" />
+                                            Link Variants
+                                        </h3>
+                                        <p className="text-xs text-gray-400 font-mono">
+                                            Select variants from other collections that should be enforced when this variant is selected.
+                                        </p>
+                                        <div className="flex-1 overflow-y-auto max-h-[60vh] space-y-4 custom-scrollbar pr-2">
+                                            {allCollections.filter(c => c.id !== collection.id).map(c => (
+                                                <div key={c.id} className="space-y-2">
+                                                    <h4 className="text-[10px] uppercase font-mono text-gray-500 tracking-wider">{c.title}</h4>
+                                                    <div className="grid grid-cols-2 gap-2">
+                                                        {c.items.map(v => {
+                                                            const currentItem = collection.items.find(i => i.id === linkingVariantId);
+                                                            const isLinked = currentItem?.linkedVariantIds?.includes(v.id) ?? false;
+                                                            return (
+                                                                <div 
+                                                                    key={v.id} 
+                                                                    onClick={() => {
+                                                                        const links = currentItem?.linkedVariantIds || [];
+                                                                        const newLinks = isLinked ? links.filter(l => l !== v.id) : [...links, v.id];
+                                                                        onUpdateItem(collection.id, linkingVariantId, { linkedVariantIds: newLinks });
+                                                                    }}
+                                                                    className={cn(
+                                                                        "p-2 rounded cursor-pointer border text-[10px] font-mono transition-all flex items-center gap-2",
+                                                                        isLinked ? "border-blue-500 bg-blue-500/10 text-blue-300" : "border-white/5 bg-white/5 text-gray-400 hover:bg-white/10"
+                                                                    )}
+                                                                >
+                                                                    <div className={cn("w-3 h-3 rounded-full border flex items-center justify-center shrink-0", isLinked ? "border-blue-500 bg-blue-500" : "border-gray-600")}>
+                                                                        {isLinked && <CheckCircle2 className="w-2 h-2 text-white" />}
+                                                                    </div>
+                                                                    <span className="truncate">{v.label}</span>
+                                                                </div>
+                                                            );
+                                                        })}
+                                                    </div>
+                                                </div>
+                                            ))}
+                                            {allCollections.length <= 1 && (
+                                                <div className="text-xs text-gray-500 font-mono text-center py-4 border border-dashed border-white/10 rounded">
+                                                    Create more collections to link variants.
+                                                </div>
                                             )}
                                         </div>
-                                    )}
-                                    <div className="flex-1 text-[10px] font-mono text-gray-400 bg-black/30 rounded px-2 py-1.5 truncate min-w-0">
-                                        <span className="text-gray-500 mr-1.5">{item.label}</span>
-                                        {!isMedia && <span className="text-gray-300">: {item.value}</span>}
+                                        <div className="flex justify-end pt-2 border-t border-white/10">
+                                            <button onClick={() => setLinkingVariantId(null)} className="px-4 py-1.5 bg-white/10 hover:bg-white/20 text-white text-xs font-mono rounded transition-colors">
+                                                Done
+                                            </button>
+                                        </div>
                                     </div>
-                                    {/* Replace asset button for media */}
-                                    {isMedia && (
-                                        <button
-                                            onClick={() => { setUpdatingItemId(item.id); updateFileRef.current?.click(); }}
-                                            className="opacity-0 group-hover:opacity-100 text-gray-600 hover:text-blue-400 transition-all"
-                                            title="Replace asset"
-                                        >
-                                            <Upload className="w-3 h-3" />
-                                        </button>
-                                    )}
-                                    <button
-                                        onClick={() => onDeleteItem(collection.id, item.id)}
-                                        className="opacity-0 group-hover:opacity-100 text-gray-600 hover:text-red-400 transition-all"
-                                    >
-                                        <X className="w-3 h-3" />
-                                    </button>
                                 </div>
-                            ))}
+                            )}
 
                             {/* Hidden file input for updating existing items */}
                             <input
@@ -526,7 +652,7 @@ function CanvasLayer({ el, isSelected, collections, currentTime, onClick, onActi
                 const col = collections.find(c => c.id === el.collectionId);
                 const sv = el.selectedVariantId ? col?.items.find(v => v.id === el.selectedVariantId) : null;
                 if (sv) {
-                    return <span className="text-white text-base drop-shadow-[0_2px_4px_rgba(0,0,0,0.8)] px-2 pointer-events-none w-full" style={{ fontSize: el.fontSize ? `${el.fontSize}px` : undefined, fontWeight: el.fontWeight || 'bold', fontStyle: el.fontStyle || 'normal', textDecoration: el.textDecoration || 'none', letterSpacing: el.letterSpacing ? `${el.letterSpacing}px` : undefined, lineHeight: el.lineHeight ? el.lineHeight : undefined, textAlign: el.textAlign || 'center', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>{sv.value}</span>;
+                    return <span className="text-white text-base px-2 pointer-events-none w-full" style={{ fontSize: el.fontSize ? `${el.fontSize}px` : undefined, fontWeight: el.fontWeight || 'bold', fontStyle: el.fontStyle || 'normal', textDecoration: el.textDecoration || 'none', letterSpacing: el.letterSpacing ? `${el.letterSpacing}px` : undefined, lineHeight: el.lineHeight ? el.lineHeight : undefined, textAlign: el.textAlign || 'center', whiteSpace: 'pre-wrap', wordBreak: 'break-word', WebkitTextStroke: el.textStrokeWidth ? `${el.textStrokeWidth}px ${el.textStrokeColor || '#000000'}` : undefined, paintOrder: el.textStrokeWidth ? 'stroke fill' : undefined }}>{sv.value}</span>;
                 }
                 return (
                     <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
@@ -722,7 +848,8 @@ export function resolveElementTimings(
         return { el, startTime: baseTime, duration: baseDur };
     });
 
-    // Group elements by track
+    // 2. Establish Track Order Sequences
+    // For each track, sort elements by intrinsic startTime.
     const tracksMap = new Map<string, typeof initialTimings>();
     for (const item of initialTimings) {
         const tid = item.el.trackId || 'track-0';
@@ -730,30 +857,93 @@ export function resolveElementTimings(
         tracksMap.get(tid)!.push(item);
     }
 
-    // Process per track
+    // Map of elementId -> previous elementId in the same track
+    const prevInTrack = new Map<string, string>();
     for (const [tid, items] of tracksMap.entries()) {
-        const trackConfig = tracks.find(t => t.id === tid);
+        items.sort((a, b) => a.startTime - b.startTime);
+        for (let i = 1; i < items.length; i++) {
+            prevInTrack.set(items[i].el.elementId, items[i - 1].el.elementId);
+        }
+    }
+
+    // 3. Topological Resolution
+    const initialMap = new Map(initialTimings.map(it => [it.el.elementId, it]));
+    const resolving = new Set<string>();
+
+    function resolveNode(id: string): { startTime: number, duration: number } {
+        if (timings.has(id)) return timings.get(id)!;
         
-        if (trackConfig?.magnet) {
-            // MAGNET ON: Sort by intrinsic startTime, then stack left-to-right
-            items.sort((a, b) => a.startTime - b.startTime);
-            const anchor = items.length > 0 ? items[0].startTime : 0;
-            let cursor = anchor;
-            
-            for (const item of items) {
-                timings.set(item.el.elementId, { startTime: Math.round(cursor * 100) / 100, duration: item.duration });
-                cursor += item.duration;
+        const item = initialMap.get(id);
+        if (!item) return { startTime: 0, duration: 1 };
+
+        if (resolving.has(id)) {
+            // Circular dependency! Break cycle by using intrinsic
+            return { startTime: item.startTime, duration: item.duration };
+        }
+        
+        resolving.add(id);
+        let resolvedStart = item.startTime;
+        let resolvedDur = item.duration;
+
+        if (item.el.matchDurationWithIds && item.el.matchDurationWithIds.length > 0) {
+            resolvedDur = 0;
+            for (const matchId of item.el.matchDurationWithIds) {
+                const matchTarget = resolveNode(matchId);
+                if (matchTarget) {
+                    resolvedDur += matchTarget.duration;
+                }
             }
-        } else {
-            // MAGNET OFF: Elements stay at their intrinsic times, but push each other if they would overlap
-            items.sort((a, b) => a.startTime - b.startTime);
-            let cursor = 0;
-            for (const item of items) {
-                const effectiveStart = Math.max(item.startTime, cursor);
-                timings.set(item.el.elementId, { startTime: Math.round(effectiveStart * 100) / 100, duration: item.duration });
-                cursor = effectiveStart + item.duration;
+        } else if (item.el.matchDurationWithId) {
+            const matchTarget = resolveNode(item.el.matchDurationWithId);
+            if (matchTarget) {
+                resolvedDur = matchTarget.duration;
             }
         }
+
+        if (item.el.syncWith && item.el.syncWith.targetId) {
+            // ANCHORED: depends on syncWith target
+            const targetTiming = resolveNode(item.el.syncWith.targetId);
+            if (targetTiming) {
+                const targetPoint = item.el.syncWith.targetEdge === 'end' 
+                    ? targetTiming.startTime + targetTiming.duration 
+                    : targetTiming.startTime;
+                
+                if (item.el.syncWith.myEdge === 'end') {
+                    resolvedStart = targetPoint - resolvedDur;
+                } else {
+                    resolvedStart = targetPoint;
+                }
+            }
+        } else {
+            // NORMAL: depends on previous element in track
+            const prevId = prevInTrack.get(id);
+            if (prevId) {
+                const prevTiming = resolveNode(prevId);
+                const trackConfig = tracks.find(t => t.id === (item.el.trackId || 'track-0'));
+                
+                const pushStart = prevTiming.startTime + prevTiming.duration;
+                
+                if (trackConfig?.magnet) {
+                    resolvedStart = pushStart;
+                } else {
+                    resolvedStart = Math.max(item.startTime, pushStart);
+                }
+            } else {
+                // First element in track, uses intrinsic
+                resolvedStart = item.startTime;
+            }
+        }
+
+        resolvedStart = Math.max(0, resolvedStart); // Prevent negative start times
+        const res = { startTime: Math.round(resolvedStart * 100) / 100, duration: resolvedDur };
+        timings.set(id, res);
+        resolving.delete(id);
+        return res;
+    }
+
+    // Resolve all
+    for (const item of initialTimings) {
+        resolveNode(item.el.elementId);
     }
 
     return timings;
@@ -783,6 +973,9 @@ function getMediaDurationLimit(el: CanvasElement, variantMode: string, collectio
 
 // --- Main Builder (inner, only rendered on client) ---
 function BuilderInner({ compositionId }: { compositionId?: string }) {
+    const [title, setTitle] = useState("Composition Builder");
+    const [isRenaming, setIsRenaming] = useState(false);
+    const [editTitle, setEditTitle] = useState("");
     const [elements, setElements] = useState<CanvasElement[]>([]);
     const [tracks, setTracks] = useState<TrackConfig[]>([{ id: 'track-0', magnet: false }]);
     const [collections, setCollections] = useState<CollectionItem[]>(SEED_COLLECTIONS);
@@ -803,6 +996,9 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     const [isExportModalOpen, setIsExportModalOpen] = useState(false);
     const [renderProgress, setRenderProgress] = useState<RenderProgress | null>(null);
     const renderAbortRef = useRef<AbortController | null>(null);
+    const [renderQueue, setRenderQueue] = useState<{ id: string; name: string; job: RenderJob; usedVariantIds: string[] }[]>([]);
+    const renderQueueRef = useRef(renderQueue);
+    renderQueueRef.current = renderQueue;
     const [exportSettings, setExportSettings] = useState({
         resolution: '1080x1920' as '1080x1920' | '720x1280' | '540x960',
         fps: 30 as 24 | 30 | 60,
@@ -857,6 +1053,9 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                     if (data.duration) {
                         setTOTAL_DURATION(data.duration);
                     }
+                    if (data.title) {
+                        setTitle(data.title);
+                    }
                 })
                 .catch(err => console.error("Failed to fetch composition", err))
                 .finally(() => setFetching(false));
@@ -907,23 +1106,174 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         return Math.abs(hash);
     };
 
+    function mulberry32(a: number) {
+        return function() {
+            var t = a += 0x6D2B79F5;
+            t = Math.imul(t ^ (t >>> 15), t | 1);
+            t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+            return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        }
+    }
+
+    const [variantUsage, setVariantUsage] = useState<Record<string, number>>(() => {
+        if (typeof window !== 'undefined') {
+            try { return JSON.parse(localStorage.getItem('dropai_variant_usage') || '{}'); } catch(e) {}
+        }
+        return {};
+    });
+
+    const recordVariantUsage = useCallback((usedVariantIds: string[]) => {
+        setVariantUsage(prev => {
+            const next = { ...prev };
+            for (const id of usedVariantIds) {
+                next[id] = (next[id] || 0) + 1;
+            }
+            if (typeof window !== 'undefined') {
+                localStorage.setItem('dropai_variant_usage', JSON.stringify(next));
+            }
+            return next;
+        });
+    }, []);
+
     const previewVariants = useMemo(() => {
         const variants: Record<string, CollectionVariant | null> = {};
-        elements.forEach(el => {
+        
+        // Calculate usage from currently queued items to apply bias even before rendering starts
+        const queueUsages = renderQueueRef.current.reduce((acc, curr) => {
+            if (curr.usedVariantIds) {
+                curr.usedVariantIds.forEach(id => {
+                    acc[id] = (acc[id] || 0) + 1;
+                });
+            }
+            return acc;
+        }, {} as Record<string, number>);
+
+        // Sort elements so link-source collections are always evaluated first.
+        // A "link source" collection is one where at least one variant defines outgoing links.
+        // This ensures that when we evaluate the hook/dependent collection, the linked variant
+        // from the source collection is already in pickedVariantIds — regardless of startTime order.
+        const isLinkSourceCollection = (colId: string) => {
+            const c = collections.find(c => c.id === colId);
+            return c ? c.items.some(v => v.linkedVariantIds && v.linkedVariantIds.length > 0) : false;
+        };
+
+        const sortedElements = [...elements].sort((a, b) => {
+            const aIsSource = isLinkSourceCollection(a.collectionId) ? 0 : 1;
+            const bIsSource = isLinkSourceCollection(b.collectionId) ? 0 : 1;
+            if (aIsSource !== bIsSource) return aIsSource - bIsSource; // sources first
+            return a.startTime - b.startTime; // then by timeline position
+        });
+        const pickedVariantIds = new Set<string>();
+
+        sortedElements.forEach(el => {
             const col = collections.find(c => c.id === el.collectionId);
             if (col && col.items.length > 0) {
-                // Combine global seed with element-specific ID so each element gets a stable but unique pseudorandom index
-                // We use sourceElementId to keep variant persistent across splits
                 const srcId = el.sourceElementId || el.elementId;
-                const seededHash = hashString(`${variantSeed}-${srcId}`);
-                const index = seededHash % col.items.length;
-                variants[el.elementId] = col.items[index];
+                const userMode = col.items.length === 1 ? col.items[0].id : (inspectorVariantModes[srcId] || 'all');
+                
+                let pickedVariant: CollectionVariant | null = null;
+                
+                if (userMode !== 'all') {
+                    pickedVariant = col.items.find(v => v.id === userMode) || null;
+                }
+
+                if (!pickedVariant) {
+                    const seededHash = hashString(`${variantSeed}-${srcId}`);
+                    const random = mulberry32(seededHash);
+                    
+                    // Linked variant resolution
+                    const allowedByLinks = new Set<string>();
+                    let hasLinksToThisCollection = false;
+
+                    for (const prevId of pickedVariantIds) {
+                        for (const c of collections) {
+                            const prevVariant = c.items.find(i => i.id === prevId);
+                            if (prevVariant && prevVariant.linkedVariantIds && prevVariant.linkedVariantIds.length > 0) {
+                                const linksInThisCollection = prevVariant.linkedVariantIds.filter(lid => col.items.some(i => i.id === lid));
+                                if (linksInThisCollection.length > 0) {
+                                    hasLinksToThisCollection = true;
+                                    linksInThisCollection.forEach(lid => allowedByLinks.add(lid));
+                                }
+                            }
+                        }
+                    }
+
+                    // Get list of collections that have already been evaluated (have at least one picked variant)
+                    const evaluatedColIds = new Set<string>();
+                    for (const pid of pickedVariantIds) {
+                        const pCol = collections.find(c => c.items.some(i => i.id === pid));
+                        if (pCol) evaluatedColIds.add(pCol.id);
+                    }
+
+                    const candidates = col.items.filter(v => {
+                        // 1. Forward check (from previously picked to candidate)
+                        if (hasLinksToThisCollection && !allowedByLinks.has(v.id)) {
+                            return false;
+                        }
+
+                        // 2. Backward check (from candidate to previously picked)
+                        // If 'v' has explicit links to another collection, and that collection has been evaluated,
+                        // then at least one picked variant from that collection MUST be in 'v's linkedVariantIds.
+                        if (v.linkedVariantIds && v.linkedVariantIds.length > 0) {
+                            for (const evalColId of evaluatedColIds) {
+                                if (evalColId === col.id) continue;
+                                const evalCol = collections.find(c => c.id === evalColId);
+                                if (!evalCol) continue;
+
+                                const vLinksToEvalCol = v.linkedVariantIds.filter(lid => evalCol.items.some(i => i.id === lid));
+                                
+                                if (vLinksToEvalCol.length > 0) {
+                                    // 'v' requires specific variants from 'evalCol'.
+                                    // Let's see which variants were ACTUALLY picked from 'evalCol'.
+                                    const pickedInEvalCol = evalCol.items.filter(i => pickedVariantIds.has(i.id));
+                                    
+                                    // If none of the picked variants are in 'v's required list, 'v' is invalid.
+                                    const isValid = pickedInEvalCol.some(picked => vLinksToEvalCol.includes(picked.id));
+                                    if (!isValid) return false;
+                                }
+                            }
+                        }
+
+                        return true;
+                    });
+
+                    // Excluded variants are always removed from the pool
+                    const eligibleCandidates = candidates.filter(v => !v.excluded);
+                    // If link filtering wiped all candidates, fall back to all non-excluded items
+                    const nonExcluded = col.items.filter(v => !v.excluded);
+                    const finalCandidates = eligibleCandidates.length > 0 ? eligibleCandidates
+                        : nonExcluded.length > 0 ? nonExcluded
+                        : col.items; // last resort: all items (shouldn't happen)
+
+                    // Calculate weights
+                    const weights = finalCandidates.map(v => {
+                        const usage = (variantUsage[v.id] || 0) + (queueUsages[v.id] || 0);
+                        return 100 / Math.pow(10, usage);
+                    });
+                    
+                    const totalWeight = weights.reduce((a, b) => a + b, 0);
+                    let rand = random() * totalWeight;
+                    let index = 0;
+                    for (let i = 0; i < weights.length; i++) {
+                        rand -= weights[i];
+                        if (rand <= 0) {
+                            index = i;
+                            break;
+                        }
+                    }
+                    pickedVariant = finalCandidates[index];
+                }
+                
+                variants[el.elementId] = pickedVariant;
+                if (pickedVariant) {
+                    pickedVariantIds.add(pickedVariant.id);
+                }
             } else {
                 variants[el.elementId] = null;
             }
         });
         return variants;
-    }, [elements, collections, variantSeed]);
+    }, [elements, collections, variantSeed, variantUsage, inspectorVariantModes]);
 
     const activeVariantModes = useMemo(() => {
         const modes: Record<string, string> = {};
@@ -939,6 +1289,21 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     const elementTimings = useMemo(() => {
         return resolveElementTimings(elements, tracks, collections, elId => activeVariantModes[elId] || 'all');
     }, [elements, tracks, collections, activeVariantModes]);
+
+    // Auto-expand playback duration when elements extend beyond the current timeline length
+    useEffect(() => {
+        if (elementTimings.size === 0) return;
+        let maxEnd = 0;
+        for (const timing of elementTimings.values()) {
+            const end = timing.startTime + timing.duration;
+            if (end > maxEnd) maxEnd = end;
+        }
+        if (maxEnd > 0) {
+            // Add 1s breathing room; never shrink below current user-set value
+            const required = Math.ceil(maxEnd) + 1;
+            setTOTAL_DURATION(prev => Math.max(prev, required));
+        }
+    }, [elementTimings]);
 
     const randomizeVariants = useCallback(() => {
         setVariantSeed(s => s + 1);
@@ -1081,19 +1446,39 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                     if ((overrides as any).mediaOffset !== undefined) (timingOnly as any).mediaOffset = (overrides as any).mediaOffset;
                     if (Object.keys(timingOnly).length > 0) preservedOverrides[vid] = timingOnly;
                 }
+                // Apply updates to base element; base-level props like randomizeWindow are
+                // always stored on the root element, not in variantOverrides.
                 const newEl = { ...el, ...updates, variantOverrides: preservedOverrides };
                 return newEl;
             }
             const newEl = { ...el, ...updates, variantOverrides: {} };
             return newEl;
         } else if (isMedia) {
-            // For media elements with a specific variant, store timing in overrides
+            // Base-level properties that must always live on the root element, never in variantOverrides.
+            // This prevents them from being lost when variant mode switches back to 'all'.
+            const BASE_PROPS = new Set(['randomizeWindow', 'volume', 'speed', 'audioFadeIn', 'audioFadeOut',
+                'x', 'y', 'width', 'height', 'rotation', 'opacity', 'zIndex', 'visible',
+                'aspectRatioLocked', 'animations', 'syncWith', 'matchDurationWithIds',
+                'textStrokeColor', 'textStrokeWidth', 'fontSize', 'fontWeight', 'fontStyle',
+                'textDecoration', 'letterSpacing', 'lineHeight', 'textAlign']);
+
+            const baseUpdates: Partial<CanvasElement> = {};
+            const variantUpdates: Partial<CanvasElement> = {};
+            for (const [k, v] of Object.entries(updates as Record<string, unknown>)) {
+                if (BASE_PROPS.has(k)) {
+                    (baseUpdates as Record<string, unknown>)[k] = v;
+                } else {
+                    (variantUpdates as Record<string, unknown>)[k] = v;
+                }
+            }
+
             const existing = el.variantOverrides?.[variantMode] || {};
             return {
                 ...el,
+                ...baseUpdates,  // base props directly on the element
                 variantOverrides: {
                     ...el.variantOverrides,
-                    [variantMode]: { ...existing, ...updates },
+                    [variantMode]: { ...existing, ...variantUpdates },
                 },
             };
         } else {
@@ -1475,7 +1860,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         if (selectedVariantMode === 'all' && selectedElement) {
             const isMedia = selectedElement.collectionType === 'video' || selectedElement.collectionType === 'audio';
             if (isMedia) {
-                const { startTime, duration, ...rest } = finalUpdates as any;
+                const { startTime, duration, mediaOffset, ...rest } = finalUpdates as any;
                 finalUpdates = rest;
                 if (Object.keys(finalUpdates).length === 0) return;
             }
@@ -1493,7 +1878,13 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     const buildRenderJob = useCallback(() => {
         const [rw, rh] = exportSettings.resolution.split('x').map(Number);
 
-        const renderEls: RenderElement[] = elements.map(el => {
+        const renderEls: RenderElement[] = elements
+            .filter(el => {
+                const chosenVariant = previewVariants[el.elementId];
+                const effectiveEl = getEffectiveElement(el, chosenVariant?.id || 'all');
+                return effectiveEl.visible !== false;
+            })
+            .map(el => {
             const timingEntry = elementTimings.get(el.elementId) ?? { startTime: el.startTime, duration: el.duration };
             const col = collections.find(c => c.id === el.collectionId);
             const chosenVariant = previewVariants[el.elementId];
@@ -1519,7 +1910,17 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
 
             const startTime = timingEntry.startTime;
             const duration = variantOverride?.duration ?? timingEntry.duration;
-            const mediaOffset = (variantOverride as any)?.mediaOffset ?? el.mediaOffset ?? 0;
+
+            // Randomize window: bake a seeded-random offset into the export, same as preview
+            const isMedia = el.collectionType === 'video' || el.collectionType === 'audio';
+            const rawMediaOffset = (variantOverride as Partial<CanvasElement>)?.mediaOffset ?? el.mediaOffset ?? 0;
+            let mediaOffset = rawMediaOffset;
+            if (isMedia && el.randomizeWindow) {
+                const fullMediaDur = chosenVariant?.duration ?? col?.items[0]?.duration;
+                if (fullMediaDur && fullMediaDur > duration) {
+                    mediaOffset = mulberry32(hashString(`${variantSeed}-${el.elementId}-window`))() * (fullMediaDur - duration);
+                }
+            }
 
             return {
                 elementId: el.elementId,
@@ -1536,6 +1937,9 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 mediaUrl,
                 mediaOffset,
                 volume: el.volume ?? 1,
+                speed: el.speed,
+                audioFadeIn: el.audioFadeIn,
+                audioFadeOut: el.audioFadeOut,
                 zIndex: el.zIndex,
                 fontSize: el.fontSize,
                 fontWeight: el.fontWeight,
@@ -1544,13 +1948,19 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 letterSpacing: el.letterSpacing,
                 lineHeight: el.lineHeight,
                 textAlign: el.textAlign,
+                textStrokeColor: el.textStrokeColor,
+                textStrokeWidth: el.textStrokeWidth,
                 animations: el.animations ?? [],
             } satisfies RenderElement;
         });
 
+        // Render only until the last element ends — no empty tail frames
+        const maxEndTime = renderEls.reduce((max, el) => Math.max(max, el.startTime + el.duration), 0);
+        const effectiveDuration = maxEndTime > 0 ? maxEndTime : TOTAL_DURATION;
+
         return {
             elements: renderEls,
-            totalDuration: TOTAL_DURATION,
+            totalDuration: effectiveDuration,
             width: rw,
             height: rh,
             fps: exportSettings.fps,
@@ -1559,17 +1969,53 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         };
     }, [elements, collections, previewVariants, elementTimings, exportSettings, TOTAL_DURATION]);
 
-    const startRender = useCallback(async () => {
+    const queueCurrentVariant = useCallback(() => {
         const job = buildRenderJob();
+        const currentUsedVariantIds = elements.map(el => activeVariantModes[el.elementId]).filter(id => id !== 'all') as string[];
+        setRenderQueue(prev => [...prev, { id: `job-${Date.now()}`, name: `Variant ${prev.length + 1} (Seed ${variantSeed})`, job, usedVariantIds: currentUsedVariantIds }]);
+        showToast("Variant added to render queue", "success");
+    }, [buildRenderJob, variantSeed, elements, activeVariantModes]);
+
+    const startRender = useCallback(async () => {
+        const currentUsedVariantIds = elements.map(el => activeVariantModes[el.elementId]).filter(id => id !== 'all') as string[];
+        const jobsToRender = renderQueue.length > 0 ? renderQueue : [{ id: 'current', name: 'Current View', job: buildRenderJob(), usedVariantIds: currentUsedVariantIds }];
+        
         const abortCtrl = new AbortController();
         renderAbortRef.current = abortCtrl;
-        setRenderProgress({ phase: 'preparing', progress: 0, message: 'Starting…' });
+        
         try {
-            await renderComposition(job, setRenderProgress, abortCtrl.signal);
-        } catch (e: any) {
-            setRenderProgress({ phase: 'error', progress: 0, message: 'Render failed', error: e?.message ?? String(e) });
+            for (let i = 0; i < jobsToRender.length; i++) {
+                const item = jobsToRender[i];
+                if (abortCtrl.signal.aborted) break;
+                
+                setRenderProgress({ phase: 'preparing', progress: 0, message: jobsToRender.length > 1 ? `[${i + 1}/${jobsToRender.length}] Starting…` : 'Starting…' });
+
+                const progressWrapper = (p: RenderProgress) => {
+                    setRenderProgress({ 
+                        ...p, 
+                        message: jobsToRender.length > 1 
+                            ? `[${i + 1}/${jobsToRender.length}] ${p.message}` 
+                            : p.message 
+                    });
+                };
+                
+                await renderComposition(item.job, progressWrapper, abortCtrl.signal);
+                
+                // Record usage for negative bias in future randomizations
+                recordVariantUsage(item.usedVariantIds);
+
+                // Remove from queue if successful
+                if (jobsToRender.length > 1) {
+                    setRenderQueue(prev => prev.filter(q => q.id !== item.id));
+                }
+            }
+            if (!abortCtrl.signal.aborted) {
+                setRenderProgress({ phase: 'done', progress: 1, message: jobsToRender.length > 1 ? 'All exports complete!' : 'Export complete!' });
+            }
+        } catch (e: unknown) {
+            setRenderProgress({ phase: 'error', progress: 0, message: 'Render failed', error: e instanceof Error ? e.message : String(e) });
         }
-    }, [buildRenderJob]);
+    }, [buildRenderJob, renderQueue]);
 
     const cancelRender = useCallback(() => {
         renderAbortRef.current?.abort();
@@ -1579,6 +2025,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         setSaving(true);
         try {
             const payload = {
+                title: title,
                 duration: TOTAL_DURATION,
                 elements: elements,
                 tracks: overrides?.tracks || tracks,
@@ -1608,7 +2055,39 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                         <Link href="/">
                             <div className="w-8 h-8 bg-white text-black rounded-md flex items-center justify-center font-bold font-mono text-lg border border-gray-400 hover:scale-105 transition-transform">D</div>
                         </Link>
-                        <h1 className="text-sm font-semibold tracking-wide text-white">DropAI <span className="text-gray-600 font-normal mx-2">/</span> Composition Builder</h1>
+                        <div className="flex items-center text-sm font-semibold tracking-wide">
+                            <span className="text-white">DropAI</span>
+                            <span className="text-gray-600 font-normal mx-2">/</span>
+                            {isRenaming ? (
+                                <input
+                                    autoFocus
+                                    type="text"
+                                    value={editTitle}
+                                    onChange={(e) => setEditTitle(e.target.value)}
+                                    onBlur={() => {
+                                        if (editTitle.trim()) setTitle(editTitle.trim());
+                                        setIsRenaming(false);
+                                    }}
+                                    onKeyDown={(e) => {
+                                        if (e.key === 'Enter') {
+                                            if (editTitle.trim()) setTitle(editTitle.trim());
+                                            setIsRenaming(false);
+                                        }
+                                    }}
+                                    className="bg-white/10 border-none outline-none text-white px-1 rounded"
+                                />
+                            ) : (
+                                <span
+                                    onClick={() => {
+                                        setEditTitle(title);
+                                        setIsRenaming(true);
+                                    }}
+                                    className="text-white cursor-pointer hover:text-blue-400 transition-colors"
+                                >
+                                    {title}
+                                </span>
+                            )}
+                        </div>
                     </div>
                     <div className="flex items-center gap-3">
                         <div className="relative">
@@ -1638,12 +2117,11 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                         onChange={(e) => setTOTAL_DURATION(Number(e.target.value))}
                                                         className="w-full h-1.5 bg-white/10 rounded-full appearance-none cursor-pointer accent-blue-500"
                                                     />
-                                                    <input
-                                                        type="number"
+                                                    <ScrubInput
                                                         min={10}
                                                         max={600}
                                                         value={TOTAL_DURATION}
-                                                        onChange={(e) => setTOTAL_DURATION(Number(e.target.value) || 10)}
+                                                        onChange={(v) => setTOTAL_DURATION(v)}
                                                         className="w-14 text-xs font-mono bg-black/40 border border-white/10 rounded px-1.5 py-1 text-gray-300 outline-none focus:border-white/20 text-center"
                                                     />
                                                 </div>
@@ -1664,7 +2142,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                             onClick={() => { setIsExportModalOpen(true); setRenderProgress(null); }}
                             className="px-4 py-1.5 bg-white hover:bg-gray-200 text-black text-xs font-semibold rounded-md transition-colors flex items-center gap-2"
                         >
-                            <Clapperboard className="w-4 h-4" /> Export
+                            <Clapperboard className="w-4 h-4" /> Export {renderQueue.length > 0 ? `(${renderQueue.length})` : ''}
                         </button>
                     </div>
                 </nav>
@@ -1752,6 +2230,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                 <CollectionCard
                                     key={col.id}
                                     collection={col}
+                                    allCollections={collections}
                                     onAddItem={(colId, label, value, duration) => {
                                         setCollections(prev => prev.map(c =>
                                             c.id === colId ? { ...c, items: [...c.items, { id: `v-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, label, value, duration }] } : c
@@ -1762,9 +2241,9 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                             c.id === colId ? { ...c, items: c.items.filter(v => v.id !== variantId) } : c
                                         ));
                                     }}
-                                    onUpdateItem={(colId, variantId, newValue, duration) => {
+                                    onUpdateItem={(colId, variantId, updates) => {
                                         setCollections(prev => prev.map(c =>
-                                            c.id === colId ? { ...c, items: c.items.map(v => v.id === variantId ? { ...v, value: newValue, duration: duration !== undefined ? duration : v.duration } : v) } : c
+                                            c.id === colId ? { ...c, items: c.items.map(v => v.id === variantId ? { ...v, ...updates } : v) } : c
                                         ));
                                     }}
                                     onDeleteCollection={(colId) => {
@@ -1830,6 +2309,11 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                 </AnimatePresence>
                                                 <div className="absolute inset-0 opacity-[0.06] pointer-events-none" style={{ backgroundImage: 'linear-gradient(rgba(255,255,255,0.3) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.3) 1px, transparent 1px)', backgroundSize: '10% 10%' }} />
                                                 {elements.filter(el => el.elementId !== selectedElementId)
+                                                    .filter(baseEl => {
+                                                        const elMode = getVariantMode(baseEl.elementId);
+                                                        const rawEl = elMode !== 'all' ? getEffectiveElement(baseEl, elMode) : baseEl;
+                                                        return rawEl.visible !== false;
+                                                    })
                                                     .sort((a, b) => {
                                                         const ta = tracks.findIndex(t => t.id === (a.trackId || 'track-0'));
                                                         const tb = tracks.findIndex(t => t.id === (b.trackId || 'track-0'));
@@ -1839,10 +2323,11 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                     .map(baseEl => {
                                                         const elMode = getVariantMode(baseEl.elementId);
                                                         const rawEl = elMode !== 'all' ? getEffectiveElement(baseEl, elMode) : baseEl;
+                                                        const timing = elementTimings.get(baseEl.elementId);
                                                         
                                                         const trackIndex = tracks.findIndex(t => t.id === (baseEl.trackId || 'track-0'));
                                                         const baseZ = 1000 - (Math.max(0, trackIndex) * 10);
-                                                        const el = { ...rawEl, zIndex: baseZ + (rawEl.zIndex || 0) };
+                                                        const el = { ...rawEl, ...(timing || {}), zIndex: baseZ + (rawEl.zIndex || 0) };
 
                                                         return (
                                                             <CanvasLayer
@@ -1859,6 +2344,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                             </div>
                                             {selectedElement && (() => {
                                                 const rawEl = effectiveElement || selectedElement;
+                                                if (rawEl.visible === false) return null;
                                                 const trackIndex = tracks.findIndex(t => t.id === (rawEl.trackId || 'track-0'));
                                                 const baseZ = 1000 - (Math.max(0, trackIndex) * 10);
                                                 const el = { ...rawEl, zIndex: baseZ + (rawEl.zIndex || 0) + 100 }; // Boost selected on top of its track
@@ -1881,9 +2367,9 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                 </div>
                                             )}
                                             <AnimatePresence>
-                                                {selectedElement && (
+                                                {selectedElement && effectiveElement && effectiveElement.visible !== false && (
                                                     // Only show rotation handles if the element is active in the current timeline position
-                                                    (currentTime >= selectedElement.startTime && currentTime < selectedElement.startTime + selectedElement.duration) && (
+                                                    (currentTime >= effectiveElement.startTime && currentTime < effectiveElement.startTime + effectiveElement.duration) && (
                                                         <motion.div
                                                             initial={{ opacity: 0, scale: 0.8 }}
                                                             animate={{ opacity: 1, scale: 1 }}
@@ -1969,7 +2455,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                         >
                                                             {el.collectionType === 'text' ? (
                                                                 <div className="w-full h-full flex items-center justify-center px-2">
-                                                                    <span className="text-white text-sm drop-shadow-[0_2px_6px_rgba(0,0,0,0.9)] w-full" style={{ fontSize: el.fontSize ? `${el.fontSize}px` : undefined, fontWeight: el.fontWeight || 'bold', fontStyle: el.fontStyle || 'normal', textDecoration: el.textDecoration || 'none', letterSpacing: el.letterSpacing ? `${el.letterSpacing}px` : undefined, lineHeight: el.lineHeight ? el.lineHeight : undefined, textAlign: el.textAlign || 'center', whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+                                                                    <span className="text-white text-sm w-full" style={{ fontSize: el.fontSize ? `${el.fontSize}px` : undefined, fontWeight: el.fontWeight || 'bold', fontStyle: el.fontStyle || 'normal', textDecoration: el.textDecoration || 'none', letterSpacing: el.letterSpacing ? `${el.letterSpacing}px` : undefined, lineHeight: el.lineHeight ? el.lineHeight : undefined, textAlign: el.textAlign || 'center', whiteSpace: 'pre-wrap', wordBreak: 'break-word', WebkitTextStroke: el.textStrokeWidth ? `${el.textStrokeWidth}px ${el.textStrokeColor || '#000000'}` : undefined, paintOrder: el.textStrokeWidth ? 'stroke fill' : undefined }}>
                                                                         {variant?.value || el.content || "TEXT"}
                                                                     </span>
                                                                 </div>
@@ -1993,15 +2479,35 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                         ref={(videoEl) => {
                                                                             if (!videoEl) return;
                                                                             const rawDur = (videoEl.duration && !isNaN(videoEl.duration)) ? videoEl.duration : Infinity;
-                                                                            const localTime = Math.max(0, currentTime - el.startTime) + (el.mediaOffset ?? 0);
-                                                                            const safeLocalTime = rawDur !== Infinity ? (localTime % rawDur) : localTime;
+                                                                            // Randomize window: pick a seeded-random start within the full media, preserving clip duration
+                                                                            const baseOffset = el.randomizeWindow && rawDur !== Infinity
+                                                                                ? mulberry32(hashString(`${variantSeed}-${el.elementId}-window`))() * Math.max(0, rawDur - el.duration)
+                                                                                : (el.mediaOffset ?? 0);
+                                                                            const localTime = Math.max(0, currentTime - el.startTime) + baseOffset;
+                                                                            let safeLocalTime = rawDur !== Infinity ? (localTime % rawDur) : localTime;
+                                                                            
+                                                                            // Prevent flash of first frame at the very end of the element's duration
+                                                                            const isAtElementEnd = (currentTime >= el.startTime + el.duration - 0.1);
+                                                                            if (isAtElementEnd && rawDur !== Infinity && safeLocalTime < 0.2) {
+                                                                                safeLocalTime = Math.max(0, rawDur - 0.05);
+                                                                            }
+
                                                                             // Sync time if scrubbing or drifting out of sync
                                                                             if (Math.abs(videoEl.currentTime - safeLocalTime) > 0.2) {
                                                                                 videoEl.currentTime = safeLocalTime;
                                                                             }
-                                                                            if (videoEl.volume !== (el.volume ?? 1)) {
-                                                                                videoEl.volume = el.volume ?? 1;
-                                                                            }
+                                                                            // Playback speed
+                                                                            const targetRate = el.speed ?? 1;
+                                                                            if (videoEl.playbackRate !== targetRate) videoEl.playbackRate = targetRate;
+                                                                            // Audio fade in/out
+                                                                            const baseVol = el.volume ?? 1;
+                                                                            const elapsed = currentTime - el.startTime;
+                                                                            const remaining = el.startTime + el.duration - currentTime;
+                                                                            let fadeMult = 1;
+                                                                            if (el.audioFadeIn && el.audioFadeIn > 0 && elapsed < el.audioFadeIn) fadeMult = Math.min(1, elapsed / el.audioFadeIn);
+                                                                            else if (el.audioFadeOut && el.audioFadeOut > 0 && remaining < el.audioFadeOut) fadeMult = Math.min(1, remaining / el.audioFadeOut);
+                                                                            const targetVol = Math.max(0, Math.min(1, baseVol * fadeMult));
+                                                                            if (Math.abs(videoEl.volume - targetVol) > 0.01) videoEl.volume = targetVol;
                                                                             if (isPlaying && isActive) {
                                                                                 if (videoEl.paused) videoEl.play().catch(() => { });
                                                                             }
@@ -2022,14 +2528,24 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                     ref={(audioEl) => {
                                                                         if (!audioEl) return;
                                                                         const rawDur = (audioEl.duration && !isNaN(audioEl.duration)) ? audioEl.duration : Infinity;
-                                                                        const localTime = Math.max(0, currentTime - el.startTime);
+                                                                        const baseOffset = el.randomizeWindow && rawDur !== Infinity
+                                                                            ? mulberry32(hashString(`${variantSeed}-${el.elementId}-window`))() * Math.max(0, rawDur - el.duration)
+                                                                            : (el.mediaOffset ?? 0);
+                                                                        const localTime = Math.max(0, currentTime - el.startTime) + baseOffset;
                                                                         const safeLocalTime = rawDur !== Infinity ? (localTime % rawDur) : localTime;
                                                                         if (Math.abs(audioEl.currentTime - safeLocalTime) > 0.2) {
                                                                             audioEl.currentTime = safeLocalTime;
                                                                         }
-                                                                        if (audioEl.volume !== (el.volume ?? 1)) {
-                                                                            audioEl.volume = el.volume ?? 1;
-                                                                        }
+                                                                        const targetRate = el.speed ?? 1;
+                                                                        if (audioEl.playbackRate !== targetRate) audioEl.playbackRate = targetRate;
+                                                                        const baseVol = el.volume ?? 1;
+                                                                        const elapsed = currentTime - el.startTime;
+                                                                        const remaining = el.startTime + el.duration - currentTime;
+                                                                        let fadeMult = 1;
+                                                                        if (el.audioFadeIn && el.audioFadeIn > 0 && elapsed < el.audioFadeIn) fadeMult = Math.min(1, elapsed / el.audioFadeIn);
+                                                                        else if (el.audioFadeOut && el.audioFadeOut > 0 && remaining < el.audioFadeOut) fadeMult = Math.min(1, remaining / el.audioFadeOut);
+                                                                        const targetVol = Math.max(0, Math.min(1, baseVol * fadeMult));
+                                                                        if (Math.abs(audioEl.volume - targetVol) > 0.01) audioEl.volume = targetVol;
                                                                         if (isPlaying && isActive) {
                                                                             if (audioEl.paused) audioEl.play().catch(() => { });
                                                                         } else {
@@ -2066,14 +2582,24 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                             ref={(audioEl) => {
                                                                 if (!audioEl) return;
                                                                 const rawDur = (audioEl.duration && !isNaN(audioEl.duration)) ? audioEl.duration : Infinity;
-                                                                const localTime = Math.max(0, currentTime - el.startTime) + (el.mediaOffset ?? 0);
+                                                                const baseOffset = el.randomizeWindow && rawDur !== Infinity
+                                                                    ? mulberry32(hashString(`${variantSeed}-${el.elementId}-window`))() * Math.max(0, rawDur - el.duration)
+                                                                    : (el.mediaOffset ?? 0);
+                                                                const localTime = Math.max(0, currentTime - el.startTime) + baseOffset;
                                                                 const safeLocalTime = rawDur !== Infinity ? (localTime % rawDur) : localTime;
                                                                 if (Math.abs(audioEl.currentTime - safeLocalTime) > 0.2) {
                                                                     audioEl.currentTime = safeLocalTime;
                                                                 }
-                                                                if (audioEl.volume !== (el.volume ?? 1)) {
-                                                                    audioEl.volume = el.volume ?? 1;
-                                                                }
+                                                                const targetRate = el.speed ?? 1;
+                                                                if (audioEl.playbackRate !== targetRate) audioEl.playbackRate = targetRate;
+                                                                const baseVol = el.volume ?? 1;
+                                                                const elapsed = currentTime - el.startTime;
+                                                                const remaining = el.startTime + el.duration - currentTime;
+                                                                let fadeMult = 1;
+                                                                if (el.audioFadeIn && el.audioFadeIn > 0 && elapsed < el.audioFadeIn) fadeMult = Math.min(1, elapsed / el.audioFadeIn);
+                                                                else if (el.audioFadeOut && el.audioFadeOut > 0 && remaining < el.audioFadeOut) fadeMult = Math.min(1, remaining / el.audioFadeOut);
+                                                                const targetVol = Math.max(0, Math.min(1, baseVol * fadeMult));
+                                                                if (Math.abs(audioEl.volume - targetVol) > 0.01) audioEl.volume = targetVol;
                                                                 if (isPlaying && isActive) {
                                                                     if (audioEl.paused) audioEl.play().catch(() => { });
                                                                 } else {
@@ -2139,6 +2665,13 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                     title="Shuffle variants"
                                                 >
                                                     <Shuffle className="w-4 h-4" />
+                                                </button>
+                                                <button
+                                                    onClick={() => { queueCurrentVariant(); }}
+                                                    className="p-2 rounded-lg bg-white/5 hover:bg-white/10 text-gray-400 hover:text-white transition-colors"
+                                                    title="Queue Variant"
+                                                >
+                                                    <ListPlus className="w-4 h-4" />
                                                 </button>
                                             </div>
                                         </div>
@@ -2247,6 +2780,50 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                             className={cn("px-1.5 py-0.5 rounded transition-colors text-[9px]", track.magnet ? "bg-pink-500/20 text-pink-400 font-bold border border-pink-500/50" : "hover:bg-white/10")}
                                                                         >
                                                                             🧲 {track.magnet ? 'ON' : 'OFF'}
+                                                                        </button>
+                                                                        {/* Track Shuffle — only available when magnet is ON */}
+                                                                        <button
+                                                                            onClick={(e) => {
+                                                                                e.stopPropagation();
+                                                                                if (!track.magnet) return;
+                                                                                // Collect track elements sorted by current resolved startTime
+                                                                                const trackEls = (prevElements: CanvasElement[]) => {
+                                                                                    const inTrack = prevElements
+                                                                                        .filter((el: CanvasElement) => (el.trackId || 'track-0') === track.id)
+                                                                                        // Exclude syncWith-anchored elements — they follow their target automatically
+                                                                                        .filter((el: CanvasElement) => !el.syncWith?.targetId);
+                                                                                    // Get their current resolved start times (the "slots")
+                                                                                    const slots = inTrack
+                                                                                        .map((el: CanvasElement) => elementTimings.get(el.elementId)?.startTime ?? el.startTime)
+                                                                                        .sort((a: number, b: number) => a - b);
+                                                                                    // Fisher-Yates shuffle of the element list
+                                                                                    const shuffled = [...inTrack];
+                                                                                    for (let i = shuffled.length - 1; i > 0; i--) {
+                                                                                        const j = Math.floor(Math.random() * (i + 1));
+                                                                                        [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+                                                                                    }
+                                                                                    // Assign sorted slots to shuffled elements
+                                                                                    const idToNewStart = new Map(shuffled.map((el: CanvasElement, idx: number) => [el.elementId, slots[idx]]));
+                                                                                    return prevElements.map((el: CanvasElement) => {
+                                                                                        if (idToNewStart.has(el.elementId)) {
+                                                                                            const mode = getVariantModeRef.current(el.elementId);
+                                                                                            return applyToElement(el, { startTime: idToNewStart.get(el.elementId)! }, mode);
+                                                                                        }
+                                                                                        return el;
+                                                                                    });
+                                                                                };
+                                                                                setElements(trackEls);
+                                                                            }}
+                                                                            onPointerDown={(e) => e.stopPropagation()}
+                                                                            title={track.magnet ? "Shuffle element order in this track" : "Enable magnet to shuffle"}
+                                                                            className={cn(
+                                                                                "px-1.5 py-0.5 rounded transition-colors text-[9px] flex items-center gap-1",
+                                                                                track.magnet
+                                                                                    ? "bg-violet-500/20 text-violet-300 border border-violet-500/40 hover:bg-violet-500/30 cursor-pointer"
+                                                                                    : "text-gray-700 cursor-not-allowed opacity-40"
+                                                                            )}
+                                                                        >
+                                                                            <Shuffle className="w-2.5 h-2.5" />
                                                                         </button>
                                                                     </div>
                                                                 ))}
@@ -2837,10 +3414,9 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                             ].map(({ label, key }) => (
                                                 <div key={key} className="flex items-center bg-[#111] rounded-md border border-white/10 px-2.5 py-2 focus-within:border-blue-500/50 transition-colors">
                                                     <span className="text-gray-500 text-[10px] font-mono mr-2 w-3">{label}</span>
-                                                    <input
-                                                        type="number"
+                                                    <ScrubInput
                                                         value={Math.round((effectiveElement || selectedElement)[key])}
-                                                        onChange={e => updateSelected({ [key]: Number(e.target.value) })}
+                                                        onChange={v => updateSelected({ [key]: v })}
                                                         className="bg-transparent text-white text-xs w-full focus:outline-none font-mono"
                                                     />
                                                 </div>
@@ -2849,12 +3425,11 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                         <div className="flex items-center gap-2">
                                             <div className="flex-1 flex items-center bg-[#111] rounded-md border border-white/10 px-2.5 py-2 focus-within:border-blue-500/50 transition-colors">
                                                 <span className="text-gray-500 text-[10px] font-mono mr-2 w-3">W</span>
-                                                <input
-                                                    type="number"
+                                                <ScrubInput
                                                     value={Math.round((effectiveElement || selectedElement).width)}
-                                                    onChange={e => {
+                                                    onChange={v => {
                                                         const el = effectiveElement || selectedElement;
-                                                        const w = Number(e.target.value);
+                                                        const w = v;
                                                         const updates: Partial<CanvasElement> = { width: w };
                                                         if (el.aspectRatioLocked && el.width && el.height) {
                                                             updates.height = w / (el.width / el.height);
@@ -2876,12 +3451,11 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                             </button>
                                             <div className="flex-1 flex items-center bg-[#111] rounded-md border border-white/10 px-2.5 py-2 focus-within:border-blue-500/50 transition-colors">
                                                 <span className="text-gray-500 text-[10px] font-mono mr-2 w-3">H</span>
-                                                <input
-                                                    type="number"
+                                                <ScrubInput
                                                     value={Math.round((effectiveElement || selectedElement).height)}
-                                                    onChange={e => {
+                                                    onChange={v => {
                                                         const el = effectiveElement || selectedElement;
-                                                        const h = Number(e.target.value);
+                                                        const h = v;
                                                         const updates: Partial<CanvasElement> = { height: h };
                                                         if (el.aspectRatioLocked && el.width && el.height) {
                                                             updates.width = h * (el.width / el.height);
@@ -2895,15 +3469,110 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                         <div className="grid grid-cols-2 gap-2">
                                             <div className="flex items-center bg-[#111] rounded-md border border-white/10 px-2.5 py-2 focus-within:border-blue-500/50 transition-colors">
                                                 <span className="text-[10px] text-gray-500 font-mono mr-2 w-4">R°</span>
-                                                <input type="number" value={(effectiveElement || selectedElement).rotation || 0} onChange={e => updateSelected({ rotation: Number(e.target.value) })} className="bg-transparent text-white text-[11px] w-full focus:outline-none font-mono" />
+                                                <ScrubInput value={(effectiveElement || selectedElement).rotation || 0} onChange={v => updateSelected({ rotation: v })} className="bg-transparent text-white text-[11px] w-full focus:outline-none font-mono" />
                                             </div>
                                             <div className="flex items-center bg-[#111] rounded-md border border-white/10 px-2.5 py-2 focus-within:border-blue-500/50 transition-colors">
                                                 <Layers className="text-gray-500 w-3 h-3 mr-2" />
                                                 <span className="text-[10px] text-gray-500 font-mono mr-2">Z</span>
-                                                <input type="number" value={(effectiveElement || selectedElement).zIndex} onChange={e => updateSelected({ zIndex: Number(e.target.value) })} className="bg-transparent text-white text-[11px] w-full focus:outline-none font-mono" />
+                                                <ScrubInput value={(effectiveElement || selectedElement).zIndex} onChange={v => updateSelected({ zIndex: v })} className="bg-transparent text-white text-[11px] w-full focus:outline-none font-mono" />
                                             </div>
                                         </div>
                                     </div>
+
+                                    {/* Duration Linking */}
+                                    {(selectedElement.collectionType === 'text' || selectedElement.collectionType === 'image') && (
+                                        <div className="space-y-3 pt-4 border-t border-white/5">
+                                            <div className="flex items-center justify-between">
+                                                <h4 className="text-[9px] font-bold uppercase tracking-widest text-gray-500 font-mono">Match Duration</h4>
+                                                <div className="text-[8px] text-gray-600 font-mono">Cumulative Sum</div>
+                                            </div>
+                                            <div className="flex flex-col gap-2">
+                                                {/* Current linked items */}
+                                                {((effectiveElement || selectedElement).matchDurationWithIds || []).map(linkedId => {
+                                                    const linkedEl = elements.find(e => e.elementId === linkedId);
+                                                    if (!linkedEl) return null;
+                                                    return (
+                                                        <div key={linkedId} className="flex items-center justify-between bg-[#1a1a1a] rounded-md border border-white/10 px-2 py-1.5">
+                                                            <div className="flex items-center gap-1.5 overflow-hidden">
+                                                                <Link2 className="w-3 h-3 text-cyan-500 shrink-0" />
+                                                                <span className="text-[10px] text-gray-300 font-mono truncate">{linkedEl.title}</span>
+                                                            </div>
+                                                            <button 
+                                                                onClick={() => {
+                                                                    const el = effectiveElement || selectedElement;
+                                                                    const currentIds = el.matchDurationWithIds || [];
+                                                                    updateSelected({ matchDurationWithIds: currentIds.filter(id => id !== linkedId) });
+                                                                }}
+                                                                className="p-1 hover:bg-white/10 rounded-md text-gray-500 hover:text-red-400 transition-colors shrink-0"
+                                                            >
+                                                                <X className="w-3 h-3" />
+                                                            </button>
+                                                        </div>
+                                                    );
+                                                })}
+                                                
+                                                {/* Legacy single link fallback rendering */}
+                                                {(effectiveElement || selectedElement).matchDurationWithId && !((effectiveElement || selectedElement).matchDurationWithIds?.length) && (() => {
+                                                    const linkedId = (effectiveElement || selectedElement).matchDurationWithId!;
+                                                    const linkedEl = elements.find(e => e.elementId === linkedId);
+                                                    if (!linkedEl) return null;
+                                                    return (
+                                                        <div key={linkedId} className="flex items-center justify-between bg-[#1a1a1a] rounded-md border border-white/10 px-2 py-1.5">
+                                                            <div className="flex items-center gap-1.5 overflow-hidden">
+                                                                <Link2 className="w-3 h-3 text-cyan-500 shrink-0" />
+                                                                <span className="text-[10px] text-gray-300 font-mono truncate">{linkedEl.title}</span>
+                                                            </div>
+                                                            <button 
+                                                                onClick={() => updateSelected({ matchDurationWithId: undefined })}
+                                                                className="p-1 hover:bg-white/10 rounded-md text-gray-500 hover:text-red-400 transition-colors shrink-0"
+                                                            >
+                                                                <X className="w-3 h-3" />
+                                                            </button>
+                                                        </div>
+                                                    );
+                                                })()}
+
+                                                {/* Add new link */}
+                                                <div className="flex items-center bg-[#111] rounded-md border border-white/10 px-2.5 py-1.5 focus-within:border-blue-500/50 transition-colors">
+                                                    <Plus className="text-gray-500 w-3 h-3 mr-2 shrink-0" />
+                                                    <select
+                                                        value=""
+                                                        onChange={e => {
+                                                            if (!e.target.value) return;
+                                                            const el = effectiveElement || selectedElement;
+                                                            
+                                                            // Migrate legacy single ID if it exists
+                                                            let currentIds = el.matchDurationWithIds || [];
+                                                            if (el.matchDurationWithId && !currentIds.length) {
+                                                                currentIds = [el.matchDurationWithId];
+                                                                updateSelected({ matchDurationWithId: undefined }); // Clear legacy
+                                                            }
+                                                            
+                                                            if (!currentIds.includes(e.target.value)) {
+                                                                updateSelected({ matchDurationWithIds: [...currentIds, e.target.value] });
+                                                            }
+                                                        }}
+                                                        className="bg-transparent text-gray-400 text-[10px] w-full focus:outline-none font-mono"
+                                                    >
+                                                        <option value="" className="bg-[#111]">Add element to match...</option>
+                                                        {elements
+                                                            .filter(el => {
+                                                                if (el.elementId === selectedElement.elementId) return false;
+                                                                const isLegacyLinked = (effectiveElement || selectedElement).matchDurationWithId === el.elementId;
+                                                                const isLinked = (effectiveElement || selectedElement).matchDurationWithIds?.includes(el.elementId);
+                                                                return !isLegacyLinked && !isLinked;
+                                                            })
+                                                            .map(el => (
+                                                                <option key={el.elementId} value={el.elementId} className="bg-[#111]">
+                                                                    {el.title}
+                                                                </option>
+                                                            ))
+                                                        }
+                                                    </select>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    )}
 
                                     {/* Text Content — only for text elements when a specific variant is selected */}
                                     {selectedElement.collectionType === 'text' && selectedVariantMode !== 'all' && (() => {
@@ -2935,17 +3604,17 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                             <div className="grid grid-cols-2 gap-2">
                                                 <div className="flex items-center bg-[#111] rounded-md border border-white/10 px-2.5 py-2 focus-within:border-blue-500/50 transition-colors">
                                                     <span className="text-[10px] text-gray-500 font-mono mr-2">Sz</span>
-                                                    <input type="number" value={(effectiveElement || selectedElement).fontSize || 16} min={8} max={200} onChange={e => updateSelected({ fontSize: Number(e.target.value) })} className="bg-transparent text-white text-[11px] w-full focus:outline-none font-mono" />
+                                                    <ScrubInput value={(effectiveElement || selectedElement).fontSize || 16} min={8} max={200} onChange={v => updateSelected({ fontSize: v })} className="bg-transparent text-white text-[11px] w-full focus:outline-none font-mono" />
                                                 </div>
                                                 <div className="flex items-center bg-[#111] rounded-md border border-white/10 px-2.5 py-2 focus-within:border-blue-500/50 transition-colors">
                                                     <span className="text-[10px] text-gray-500 font-mono mr-2">Lh</span>
-                                                    <input type="number" step={0.1} value={(effectiveElement || selectedElement).lineHeight || 1.4} min={0.5} max={5} onChange={e => updateSelected({ lineHeight: Number(e.target.value) })} className="bg-transparent text-white text-[11px] w-full focus:outline-none font-mono" />
+                                                    <ScrubInput step={0.1} value={(effectiveElement || selectedElement).lineHeight || 1.4} min={0.5} max={5} onChange={v => updateSelected({ lineHeight: v })} className="bg-transparent text-white text-[11px] w-full focus:outline-none font-mono" />
                                                 </div>
                                             </div>
                                             {/* Letter Spacing */}
                                             <div className="flex items-center bg-[#111] rounded-md border border-white/10 px-2.5 py-2 focus-within:border-blue-500/50 transition-colors">
                                                 <span className="text-[10px] text-gray-500 font-mono mr-2 whitespace-nowrap">Tracking</span>
-                                                <input type="number" step={0.5} value={(effectiveElement || selectedElement).letterSpacing || 0} min={-5} max={20} onChange={e => updateSelected({ letterSpacing: Number(e.target.value) })} className="bg-transparent text-white text-[11px] w-full focus:outline-none font-mono" />
+                                                <ScrubInput step={0.5} value={(effectiveElement || selectedElement).letterSpacing || 0} min={-5} max={20} onChange={v => updateSelected({ letterSpacing: v })} className="bg-transparent text-white text-[11px] w-full focus:outline-none font-mono" />
                                                 <span className="text-[9px] text-gray-600 font-mono ml-1">px</span>
                                             </div>
                                             {/* Bold / Italic / Underline toggles */}
@@ -2981,26 +3650,224 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                     </button>
                                                 ))}
                                             </div>
-                                        </div>
-                                    )}
 
-                                    {/* Volume Config */}
-                                    {(selectedElement.collectionType === 'video' || selectedElement.collectionType === 'audio') && (
-                                        <div className="space-y-3 pt-4 border-t border-white/5">
-                                            <h4 className="text-[9px] font-bold uppercase tracking-widest text-gray-500 font-mono">Volume & Speed</h4>
-
-                                            <div className="flex justify-between text-xs text-gray-400 mt-2">
-                                                <span>Volume</span>
-                                                <span className="text-white font-mono font-medium">{Math.round(((effectiveElement || selectedElement).volume ?? 1) * 100)}%</span>
+                                            {/* Text Stroke */}
+                                            <div className="space-y-2">
+                                                <div className="flex items-center justify-between">
+                                                    <span className="text-[10px] text-gray-400 font-mono">Stroke</span>
+                                                    <div className="flex items-center gap-2">
+                                                        <span className="text-[9px] text-gray-500 font-mono">{(effectiveElement || selectedElement).textStrokeWidth ?? 0}px</span>
+                                                        {/* Color swatch */}
+                                                        <label className="relative w-5 h-5 rounded cursor-pointer border border-white/20 overflow-hidden" title="Stroke color">
+                                                            <span className="absolute inset-0" style={{ background: (effectiveElement || selectedElement).textStrokeColor || '#000000' }} />
+                                                            <input
+                                                                type="color"
+                                                                value={(effectiveElement || selectedElement).textStrokeColor || '#000000'}
+                                                                onChange={e => updateSelected({ textStrokeColor: e.target.value })}
+                                                                className="absolute inset-0 opacity-0 w-full h-full cursor-pointer"
+                                                            />
+                                                        </label>
+                                                    </div>
+                                                </div>
+                                                <input
+                                                    type="range" min="0" max="20" step="0.5"
+                                                    value={(effectiveElement || selectedElement).textStrokeWidth ?? 0}
+                                                    onChange={e => updateSelected({ textStrokeWidth: Number(e.target.value) })}
+                                                    className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-orange-400"
+                                                />
                                             </div>
-                                            <input
-                                                type="range" min="0" max="1" step="0.05"
-                                                value={(effectiveElement || selectedElement).volume ?? 1}
-                                                onChange={e => updateSelected({ volume: Number(e.target.value) })}
-                                                className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-blue-500"
-                                            />
                                         </div>
                                     )}
+
+                                    {/* AUDIO Config */}
+                                    {(selectedElement.collectionType === 'video' || selectedElement.collectionType === 'audio') && (() => {
+                                        const el = effectiveElement || selectedElement;
+                                        const vol = el.volume ?? 1;
+                                        const spd = el.speed ?? 1;
+                                        const fadeIn = el.audioFadeIn ?? 0;
+                                        const fadeOut = el.audioFadeOut ?? 0;
+                                        return (
+                                            <div className="space-y-4 pt-4 border-t border-white/5">
+                                                <h4 className="text-[9px] font-bold uppercase tracking-widest text-gray-500 font-mono">Audio</h4>
+
+                                                {/* Volume */}
+                                                <div className="space-y-1.5">
+                                                    <div className="flex justify-between text-xs text-gray-400">
+                                                        <span>Volume</span>
+                                                        <span className="text-white font-mono font-medium">{Math.round(vol * 100)}%</span>
+                                                    </div>
+                                                    <input
+                                                        type="range" min="0" max="1" step="0.05"
+                                                        value={vol}
+                                                        onChange={e => updateSelected({ volume: Number(e.target.value) })}
+                                                        className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-emerald-500"
+                                                    />
+                                                </div>
+
+                                                {/* Speed */}
+                                                <div className="space-y-1.5">
+                                                    <div className="flex justify-between text-xs text-gray-400">
+                                                        <span>Speed</span>
+                                                        <span className="text-white font-mono font-medium">{spd.toFixed(2)}×</span>
+                                                    </div>
+                                                    <input
+                                                        type="range" min="0.25" max="4" step="0.05"
+                                                        value={spd}
+                                                        onChange={e => updateSelected({ speed: Number(e.target.value) })}
+                                                        className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                                                    />
+                                                    <div className="flex justify-between text-[9px] text-gray-600 font-mono">
+                                                        <span>0.25×</span><span>1×</span><span>2×</span><span>4×</span>
+                                                    </div>
+                                                </div>
+
+                                                {/* Fade In / Fade Out */}
+                                                <div className="grid grid-cols-2 gap-2">
+                                                    <div className="space-y-1">
+                                                        <div className="flex justify-between text-[10px] text-gray-400">
+                                                            <span>Fade In</span>
+                                                            <span className="text-white font-mono">{fadeIn.toFixed(1)}s</span>
+                                                        </div>
+                                                        <input
+                                                            type="range" min="0" max={Math.max(0.1, (el.duration ?? 5) / 2)} step="0.1"
+                                                            value={fadeIn}
+                                                            onChange={e => updateSelected({ audioFadeIn: Number(e.target.value) })}
+                                                            className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-violet-500"
+                                                        />
+                                                    </div>
+                                                    <div className="space-y-1">
+                                                        <div className="flex justify-between text-[10px] text-gray-400">
+                                                            <span>Fade Out</span>
+                                                            <span className="text-white font-mono">{fadeOut.toFixed(1)}s</span>
+                                                        </div>
+                                                        <input
+                                                            type="range" min="0" max={Math.max(0.1, (el.duration ?? 5) / 2)} step="0.1"
+                                                            value={fadeOut}
+                                                            onChange={e => updateSelected({ audioFadeOut: Number(e.target.value) })}
+                                                            className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-violet-500"
+                                                        />
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        );
+                                    })()}
+
+                                    {/* Media Trim Config */}
+                                    {(selectedElement.collectionType === 'video' || selectedElement.collectionType === 'audio') && selectedVariantMode !== 'all' && (
+                                        <div className="space-y-3 pt-4 border-t border-white/5">
+                                            <h4 className="text-[9px] font-bold uppercase tracking-widest text-gray-500 font-mono">Media Trim</h4>
+
+                                            {/* Start / End inputs — only meaningful in per-variant mode */}
+                                            {selectedVariantMode !== 'all' && (
+                                                <div className="grid grid-cols-2 gap-2">
+                                                    <div className="flex items-center bg-[#111] rounded-md border border-white/10 px-2.5 py-2 focus-within:border-blue-500/50 transition-colors">
+                                                        <span className="text-[10px] text-gray-500 font-mono mr-2">Start</span>
+                                                        <input
+                                                            type="number"
+                                                            step="0.1"
+                                                            min="0"
+                                                            value={Math.round(((effectiveElement || selectedElement).mediaOffset || 0) * 10) / 10}
+                                                            onChange={e => {
+                                                                const newStart = Math.max(0, Number(e.target.value));
+                                                                updateSelected({ mediaOffset: newStart });
+                                                            }}
+                                                            className="bg-transparent text-white text-[11px] w-full focus:outline-none font-mono"
+                                                        />
+                                                    </div>
+                                                    <div className="flex items-center bg-[#111] rounded-md border border-white/10 px-2.5 py-2 focus-within:border-blue-500/50 transition-colors">
+                                                        <span className="text-[10px] text-gray-500 font-mono mr-2">End</span>
+                                                        <input
+                                                            type="number"
+                                                            step="0.1"
+                                                            min="0.1"
+                                                            value={Math.round((((effectiveElement || selectedElement).mediaOffset || 0) + (effectiveElement || selectedElement).duration) * 10) / 10}
+                                                            onChange={e => {
+                                                                const newEnd = Math.max(0.1, Number(e.target.value));
+                                                                const currentStart = (effectiveElement || selectedElement).mediaOffset || 0;
+                                                                if (newEnd > currentStart) {
+                                                                    updateSelected({ duration: newEnd - currentStart });
+                                                                }
+                                                            }}
+                                                            className="bg-transparent text-white text-[11px] w-full focus:outline-none font-mono"
+                                                        />
+                                                    </div>
+                                                </div>
+                                            )}
+
+                                            {/* Randomize Window toggle — always on base element, not per-variant */}
+                                            <button
+                                                onClick={() => updateSelected({ randomizeWindow: !((selectedElement).randomizeWindow ?? false) })}
+                                                className={cn(
+                                                    "w-full flex items-center justify-between px-3 py-2 rounded-md border text-[10px] font-mono transition-all",
+                                                    (selectedElement).randomizeWindow
+                                                        ? "border-violet-500/50 bg-violet-500/10 text-violet-300"
+                                                        : "border-white/10 bg-white/5 text-gray-400 hover:bg-white/10 hover:text-gray-300"
+                                                )}
+                                            >
+                                                <span className="flex items-center gap-2">
+                                                    <Shuffle className="w-3 h-3" />
+                                                    Randomize Window
+                                                </span>
+                                                <span className={cn(
+                                                    "text-[9px] px-1.5 py-0.5 rounded font-bold tracking-wide",
+                                                    (selectedElement).randomizeWindow
+                                                        ? "bg-violet-500/30 text-violet-300"
+                                                        : "bg-white/10 text-gray-500"
+                                                )}>
+                                                    {(selectedElement).randomizeWindow ? 'ON' : 'OFF'}
+                                                </span>
+                                            </button>
+                                            {(selectedElement).randomizeWindow && (
+                                                <p className="text-[8px] font-mono text-violet-400/70 leading-relaxed">
+                                                    Picks a random {((effectiveElement || selectedElement).duration ?? 5).toFixed(1)}s window from the full media on each shuffle. Start/End trim is ignored.
+                                                </p>
+                                            )}
+                                            {!(selectedElement).randomizeWindow && selectedVariantMode !== 'all' && (
+                                                <p className="text-[8px] font-mono text-gray-600">Trims source media. To move on timeline, drag element horizontally.</p>
+                                            )}
+                                        </div>
+                                    )}
+
+                                    {/* Position Anchor / Link */}
+                                    <div className="space-y-3 pt-4 border-t border-white/5">
+                                        <h4 className="text-[9px] font-bold uppercase tracking-widest text-gray-500 font-mono">Position Link</h4>
+                                        <div className="flex flex-col gap-2">
+                                            <div className="flex items-center bg-[#111] rounded-md border border-white/10 px-2.5 py-2 focus-within:border-blue-500/50 transition-colors">
+                                                <Link2 className="text-gray-500 w-3 h-3 mr-2 shrink-0" />
+                                                <select
+                                                    value={(effectiveElement || selectedElement).syncWith?.targetId || ""}
+                                                    onChange={e => {
+                                                        const targetId = e.target.value;
+                                                        if (!targetId) {
+                                                            updateSelected({ syncWith: null });
+                                                        } else {
+                                                            updateSelected({ syncWith: { targetId, targetEdge: 'start', myEdge: 'start' } });
+                                                        }
+                                                    }}
+                                                    className="bg-transparent text-white text-[11px] w-full focus:outline-none font-mono appearance-none"
+                                                >
+                                                    <option value="" className="bg-[#111] text-gray-500">None (Free Position)</option>
+                                                    {elements
+                                                        .filter(el => el.elementId !== selectedElement.elementId && el.trackId !== selectedElement.trackId)
+                                                        .map(el => {
+                                                            const col = collections.find(c => c.id === el.collectionId);
+                                                            const label = col?.title || "Element";
+                                                            return (
+                                                                <option key={el.elementId} value={el.elementId} className="bg-[#111]">
+                                                                    Anchor to: {label} (Trk {tracks.findIndex(t => t.id === el.trackId) + 1})
+                                                                </option>
+                                                            );
+                                                        })}
+                                                </select>
+                                            </div>
+                                            {(effectiveElement || selectedElement).syncWith?.targetId && (
+                                                <p className="text-[8px] font-mono text-cyan-500/70">
+                                                    Start position is locked to the selected element.
+                                                </p>
+                                            )}
+                                        </div>
+                                    </div>
+
 
 
                                     {/* Animations */}
@@ -3076,12 +3943,12 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                 {/* Start delay */}
                                                                 <div className="space-y-0.5">
                                                                     <span className="text-[7px] font-mono text-gray-600 uppercase">Start</span>
-                                                                    <input
-                                                                        type="number" step="0.1" min="0" max={(effectiveElement || selectedElement).duration}
+                                                                    <ScrubInput
+                                                                        step="0.1" min={0} max={(effectiveElement || selectedElement).duration}
                                                                         value={anim.start}
-                                                                        onChange={e => {
+                                                                        onChange={v => {
                                                                             const updated = ((effectiveElement || selectedElement).animations || []).map(a =>
-                                                                                a.id === anim.id ? { ...a, start: Math.max(0, Number(e.target.value)) } : a
+                                                                                a.id === anim.id ? { ...a, start: Math.max(0, v) } : a
                                                                             );
                                                                             updateSelected({ animations: updated });
                                                                         }}
@@ -3091,12 +3958,12 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                 {/* Duration */}
                                                                 <div className="space-y-0.5">
                                                                     <span className="text-[7px] font-mono text-gray-600 uppercase">Duration</span>
-                                                                    <input
-                                                                        type="number" step="0.1" min="0.1" max={(effectiveElement || selectedElement).duration}
+                                                                    <ScrubInput
+                                                                        step="0.1" min={0.1} max={(effectiveElement || selectedElement).duration}
                                                                         value={anim.duration}
-                                                                        onChange={e => {
+                                                                        onChange={v => {
                                                                             const updated = ((effectiveElement || selectedElement).animations || []).map(a =>
-                                                                                a.id === anim.id ? { ...a, duration: Math.max(0.1, Number(e.target.value)) } : a
+                                                                                a.id === anim.id ? { ...a, duration: Math.max(0.1, v) } : a
                                                                             );
                                                                             updateSelected({ animations: updated });
                                                                         }}
@@ -3129,12 +3996,12 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                 <div className="grid grid-cols-2 gap-1.5 mt-1.5">
                                                                     <div className="space-y-0.5">
                                                                         <span className="text-[7px] font-mono text-gray-600 uppercase">From</span>
-                                                                        <input
-                                                                            type="number" step="0.1"
+                                                                        <ScrubInput
+                                                                            step="0.1"
                                                                             value={anim.from ?? (anim.type === 'scaleOut' ? 1 : 0)}
-                                                                            onChange={e => {
+                                                                            onChange={v => {
                                                                                 const updated = ((effectiveElement || selectedElement).animations || []).map(a =>
-                                                                                    a.id === anim.id ? { ...a, from: Number(e.target.value) } : a
+                                                                                    a.id === anim.id ? { ...a, from: v } : a
                                                                                 );
                                                                                 updateSelected({ animations: updated });
                                                                             }}
@@ -3143,12 +4010,12 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                     </div>
                                                                     <div className="space-y-0.5">
                                                                         <span className="text-[7px] font-mono text-gray-600 uppercase">To</span>
-                                                                        <input
-                                                                            type="number" step="0.1"
+                                                                        <ScrubInput
+                                                                            step="0.1"
                                                                             value={anim.to ?? (anim.type === 'scaleOut' ? 0 : 1)}
-                                                                            onChange={e => {
+                                                                            onChange={v => {
                                                                                 const updated = ((effectiveElement || selectedElement).animations || []).map(a =>
-                                                                                    a.id === anim.id ? { ...a, to: Number(e.target.value) } : a
+                                                                                    a.id === anim.id ? { ...a, to: v } : a
                                                                                 );
                                                                                 updateSelected({ animations: updated });
                                                                             }}
@@ -3173,7 +4040,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             <DragOverlay dropAnimation={null}>
                 {activeCollection ? (
                     <div className="opacity-80 scale-105 pointer-events-none origin-top-left w-[220px]">
-                        <CollectionCard collection={activeCollection} onAddItem={() => { }} onDeleteItem={() => { }} onUpdateItem={() => { }} onDeleteCollection={() => { }} />
+                        <CollectionCard collection={activeCollection} allCollections={collections} onAddItem={() => { }} onDeleteItem={() => { }} onUpdateItem={() => { }} onDeleteCollection={() => { }} />
                     </div>
                 ) : null}
             </DragOverlay>
@@ -3304,6 +4171,19 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                             Export renders frame-by-frame in your browser. Keep the tab active. Large compositions may take a few minutes.
                                         </p>
                                     </div>
+
+                                    {renderQueue.length > 0 && (
+                                        <div className="flex items-center justify-between bg-blue-500/10 border border-blue-500/20 rounded-lg px-3 py-2.5 mt-2">
+                                            <div className="flex items-center gap-2">
+                                                <ListPlus className="w-4 h-4 text-blue-400" />
+                                                <span className="text-[10px] text-blue-300 font-mono">Render Queue Active</span>
+                                            </div>
+                                            <div className="flex items-center gap-3 text-[10px] font-mono text-gray-400">
+                                                <span>{renderQueue.length} variant(s) queued</span>
+                                                <button onClick={() => setRenderQueue([])} className="text-red-400 hover:text-red-300">Clear</button>
+                                            </div>
+                                        </div>
+                                    )}
 
                                     {/* Estimates */}
                                     <div className="flex justify-between text-[10px] font-mono text-gray-600">

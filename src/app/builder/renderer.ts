@@ -23,6 +23,9 @@ export type RenderElement = {
     mediaUrl?: string;
     mediaOffset?: number;
     volume?: number;
+    speed?: number;        // Playback rate (for future resampling; stored for completeness)
+    audioFadeIn?: number;  // Fade-in duration in seconds
+    audioFadeOut?: number; // Fade-out duration in seconds
     zIndex: number;
     fontSize?: number;
     fontWeight?: string;
@@ -31,6 +34,8 @@ export type RenderElement = {
     letterSpacing?: number;
     lineHeight?: number;
     textAlign?: 'left' | 'center' | 'right';
+    textStrokeColor?: string;
+    textStrokeWidth?: number;
     animations: Array<{
         id: string;
         type: string;
@@ -325,6 +330,17 @@ function drawFrame(
             const lh = fs * (el.lineHeight ?? 1.2);
             const totalH = lines.length * lh;
             const startY = ph / 2 - totalH / 2 + lh / 2;
+            // Draw stroke first so fill renders on top
+            if (el.textStrokeWidth && el.textStrokeWidth > 0) {
+                const strokeW = (el.textStrokeWidth / PREVIEW_W) * W;
+                ctx.strokeStyle = el.textStrokeColor || '#000000';
+                ctx.lineWidth = strokeW * 2; // *2 because lineWidth is centered on the path
+                ctx.lineJoin = 'round';
+                for (let i = 0; i < lines.length; i++) {
+                    const tx = el.textAlign === 'left' ? 0 : el.textAlign === 'right' ? pw : pw / 2;
+                    ctx.strokeText(lines[i], tx, startY + i * lh);
+                }
+            }
             for (let i = 0; i < lines.length; i++) {
                 const tx = el.textAlign === 'left' ? 0 : el.textAlign === 'right' ? pw : pw / 2;
                 ctx.fillText(lines[i], tx, startY + i * lh);
@@ -348,15 +364,24 @@ function mixAudio(
         if (!el.mediaUrl || (el.collectionType !== 'audio' && el.collectionType !== 'video')) continue;
         const buf = buffers.get(el.elementId);
         if (!buf) continue;
-        const vol = el.volume ?? 1;
-        const off = Math.floor((el.mediaOffset ?? 0) * sr);
+        const baseVol = el.volume ?? 1;
+        const fadeIn  = el.audioFadeIn  ?? 0;
+        const fadeOut = el.audioFadeOut ?? 0;
+        const off   = Math.floor((el.mediaOffset ?? 0) * sr);
         const start = Math.floor(el.startTime * sr);
         const count = Math.min(Math.floor(el.duration * sr), buf.length - off, n - start);
         const sL = buf.getChannelData(0);
         const sR = buf.numberOfChannels > 1 ? buf.getChannelData(1) : sL;
         for (let i = 0; i < count; i++) {
-            L[start + i] += (sL[off + i] ?? 0) * vol;
-            R[start + i] += (sR[off + i] ?? 0) * vol;
+            // Compute fade multiplier matching the preview ref callback logic
+            const elapsed   = i / sr;                    // seconds since element start
+            const remaining = el.duration - elapsed;     // seconds until element end
+            let fadeMult = 1;
+            if (fadeIn  > 0 && elapsed   < fadeIn)  fadeMult = Math.min(1, elapsed   / fadeIn);
+            else if (fadeOut > 0 && remaining < fadeOut) fadeMult = Math.min(1, remaining / fadeOut);
+            const v = baseVol * fadeMult;
+            L[start + i] += (sL[off + i] ?? 0) * v;
+            R[start + i] += (sR[off + i] ?? 0) * v;
         }
     }
     return [L, R];
@@ -383,14 +408,20 @@ async function encodeComposition(
     const [mL, mR] = mixAudio(sorted, audioBufs, job.totalDuration, SR);
     const aEnc = new AudioEncoder({ output: onAudioChunk, error: e => console.error(e) });
     aEnc.configure({ codec: audioCodec, sampleRate: SR, numberOfChannels: 2, bitrate: 128_000 });
-    const CHUNK = 1024;
+    const CHUNK = 4096;
     for (let p = 0; p < mL.length; p += CHUNK) {
+        if (signal?.aborted) { aEnc.close(); throw new DOMException('Cancelled', 'AbortError'); }
         const cnt = Math.min(CHUNK, mL.length - p);
         const data = new Float32Array(cnt * 2);
         for (let i = 0; i < cnt; i++) { data[i] = mL[p + i]; data[cnt + i] = mR[p + i]; }
         const ad = new AudioData({ format: 'f32-planar', sampleRate: SR, numberOfFrames: cnt, numberOfChannels: 2, timestamp: Math.floor((p / SR) * US), data });
         aEnc.encode(ad);
         ad.close();
+        
+        // Prevent audio encoder from hoarding RAM
+        while (aEnc.encodeQueueSize > 50) {
+            await new Promise(r => setTimeout(r, 2));
+        }
     }
 
     // Video
@@ -406,7 +437,7 @@ async function encodeComposition(
     for (let frame = 0; frame < totalFrames; frame++) {
         if (signal?.aborted) { vEnc.close(); aEnc.close(); throw new DOMException('Cancelled', 'AbortError'); }
 
-        const t = frame / FPS; // Use stable division for time
+        const t = frame / FPS;
 
         for (const el of sorted) {
             if (el.collectionType !== 'video' || !el.mediaUrl) continue;
@@ -429,7 +460,7 @@ async function encodeComposition(
         vEnc.encode(vf, { keyFrame: frame % FPS === 0 });
         vf.close();
 
-        // Throttle UI updates to roughly 10fps to avoid React choking the main thread
+        // Throttle UI updates
         if (Date.now() - lastProgressTime > 100) {
             onProgress({ phase: 'rendering', progress: frame / totalFrames, message: `Rendering Frame ${frame + 1} / ${totalFrames}` });
             lastProgressTime = Date.now();
@@ -437,7 +468,7 @@ async function encodeComposition(
     }
 
     // Drain remaining frames
-    while (vEnc.encodeQueueSize > 0) {
+    while (vEnc.encodeQueueSize > 0 || aEnc.encodeQueueSize > 0) {
         await new Promise(r => setTimeout(r, 10));
     }
 
@@ -453,35 +484,37 @@ export async function renderComposition(job: RenderJob, onProgress: ProgressCb, 
     const totalFrames = Math.ceil(job.totalDuration * FPS);
     const format = job.format || 'mp4';
 
-    onProgress({ phase: 'preparing', progress: 0.1, message: 'Loading assets…' });
     const images = new Map<string, HTMLImageElement>();
     const videos = new Map<string, HTMLVideoElement>();
     const audioBufs = new Map<string, AudioBuffer>();
+    const objectUrls: string[] = [];
     const actx = new AudioContext({ sampleRate: 44100 });
 
-    for (const el of job.elements) {
-        if (!el.mediaUrl) continue;
-        try {
-            if (el.collectionType === 'image') {
-                images.set(el.elementId, await loadImage(el.mediaUrl));
-            } else if (el.collectionType === 'video') {
-                // Fetch fully into a blob to prevent network stalls during frame-by-frame seeking
-                const res = await fetch(el.mediaUrl);
-                const blob = await res.blob();
-                videos.set(el.elementId, await loadVideo(URL.createObjectURL(blob)));
-                audioBufs.set(el.elementId, await actx.decodeAudioData(await blob.arrayBuffer()));
-            } else if (el.collectionType === 'audio') {
-                const res = await fetch(el.mediaUrl);
-                const blob = await res.blob();
-                audioBufs.set(el.elementId, await actx.decodeAudioData(await blob.arrayBuffer()));
-            }
-        } catch (e) { console.warn(e); }
-    }
-    await actx.close();
-
-    const sorted = [...job.elements].sort((a, b) => a.zIndex - b.zIndex);
-
     try {
+        onProgress({ phase: 'preparing', progress: 0.1, message: 'Loading assets…' });
+
+        for (const el of job.elements) {
+            if (!el.mediaUrl) continue;
+            try {
+                if (el.collectionType === 'image') {
+                    images.set(el.elementId, await loadImage(el.mediaUrl));
+                } else if (el.collectionType === 'video') {
+                    const res = await fetch(el.mediaUrl);
+                    const blob = await res.blob();
+                    const blobUrl = URL.createObjectURL(blob);
+                    objectUrls.push(blobUrl);
+                    videos.set(el.elementId, await loadVideo(blobUrl));
+                    audioBufs.set(el.elementId, await actx.decodeAudioData(await blob.arrayBuffer()));
+                } else if (el.collectionType === 'audio') {
+                    const res = await fetch(el.mediaUrl);
+                    const blob = await res.blob();
+                    audioBufs.set(el.elementId, await actx.decodeAudioData(await blob.arrayBuffer()));
+                }
+            } catch (e) { console.warn(e); }
+        }
+
+        const sorted = [...job.elements].sort((a, b) => a.zIndex - b.zIndex);
+
         let blob: Blob;
         if (format === 'mp4') {
             const { Muxer, ArrayBufferTarget } = await import('mp4-muxer');
@@ -505,8 +538,21 @@ export async function renderComposition(job: RenderJob, onProgress: ProgressCb, 
 
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a'); a.href = url; a.download = `export-${Date.now()}.${format}`; a.click();
+        
+        // Clean up the final export URL after download
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+        
         onProgress({ phase: 'done', progress: 1, message: 'Export complete' });
-    } catch (e: any) {
-        onProgress({ phase: 'error', progress: 0, message: 'Export failed', error: e.message });
+    } catch (e: unknown) {
+        onProgress({ phase: 'error', progress: 0, message: 'Export failed', error: e instanceof Error ? e.message : String(e) });
+    } finally {
+        await actx.close().catch(() => {});
+        for (const url of objectUrls) {
+            URL.revokeObjectURL(url);
+        }
+        for (const vid of videos.values()) {
+            vid.removeAttribute('src');
+            vid.load();
+        }
     }
 }

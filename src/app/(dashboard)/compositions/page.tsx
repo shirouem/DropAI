@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { Layers, Plus, Search, Trash2, Edit2, Clock } from "lucide-react";
+import { Layers, Plus, Search, Trash2, Edit2, Clock, Copy } from "lucide-react";
 import { motion } from "framer-motion";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -10,10 +10,45 @@ export default function CompositionsPage() {
     const [compositions, setCompositions] = useState<any[]>([]);
     const [loading, setLoading] = useState(true);
     const router = useRouter();
+    const [renamingId, setRenamingId] = useState<string | null>(null);
+    const [editName, setEditName] = useState("");
 
     useEffect(() => {
         fetchCompositions();
     }, []);
+
+    const handleRename = async (id: string, e: React.MouseEvent | React.KeyboardEvent) => {
+        e.preventDefault();
+        e.stopPropagation();
+
+        if (!editName.trim()) {
+            setRenamingId(null);
+            return;
+        }
+
+        try {
+            const res = await fetch(`/api/compositions/${id}`, {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ title: editName.trim() }),
+            });
+
+            if (res.ok) {
+                setCompositions(compositions.map(c => c.id === id ? { ...c, title: editName.trim() } : c));
+            }
+        } catch (error) {
+            console.error("Failed to rename:", error);
+        } finally {
+            setRenamingId(null);
+        }
+    };
+
+    const startRenaming = (comp: any, e: React.MouseEvent) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setRenamingId(comp.id);
+        setEditName(comp.title);
+    };
 
     const fetchCompositions = async () => {
         try {
@@ -58,6 +93,33 @@ export default function CompositionsPage() {
             fetchCompositions();
         } catch (error) {
             console.error("Failed to delete", error);
+        }
+    };
+
+    const handleDuplicate = async (comp: any, e: React.MouseEvent) => {
+        e.preventDefault();
+        e.stopPropagation();
+
+        try {
+            const elements = typeof comp.elements === 'string' ? JSON.parse(comp.elements || '[]') : comp.elements;
+            const tracks = typeof comp.tracks === 'string' ? JSON.parse(comp.tracks || '[]') : comp.tracks;
+            const collections = typeof comp.collections === 'string' ? JSON.parse(comp.collections || '[]') : comp.collections;
+
+            await fetch("/api/compositions", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    title: `${comp.title} (Copy)`,
+                    duration: comp.duration,
+                    angle: comp.angle,
+                    elements,
+                    tracks,
+                    collections
+                })
+            });
+            fetchCompositions();
+        } catch (error) {
+            console.error("Failed to duplicate composition", error);
         }
     };
 
@@ -115,17 +177,33 @@ export default function CompositionsPage() {
                                             <Layers className="w-5 h-5 text-gray-300" />
                                         </div>
                                         <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
-                                            <button className="p-2 bg-white/5 hover:bg-white/10 rounded text-gray-400 hover:text-white transition-colors">
+                                            <button onClick={(e) => handleDuplicate(comp, e)} className="p-2 bg-white/5 hover:bg-white/10 rounded text-gray-400 hover:text-white transition-colors" title="Duplicate">
+                                                <Copy className="w-4 h-4" />
+                                            </button>
+                                            <button onClick={(e) => startRenaming(comp, e)} className="p-2 bg-white/5 hover:bg-white/10 rounded text-gray-400 hover:text-white transition-colors" title="Rename">
                                                 <Edit2 className="w-4 h-4" />
                                             </button>
-                                            <button onClick={(e) => handleDelete(comp.id, e)} className="p-2 bg-red-500/10 hover:bg-red-500/20 rounded text-red-500 hover:text-red-400 transition-colors">
+                                            <button onClick={(e) => handleDelete(comp.id, e)} className="p-2 bg-red-500/10 hover:bg-red-500/20 rounded text-red-500 hover:text-red-400 transition-colors" title="Delete">
                                                 <Trash2 className="w-4 h-4" />
                                             </button>
                                         </div>
                                     </div>
 
                                     <div>
-                                        <h3 className="text-lg font-medium text-white mb-1 group-hover:text-blue-400 transition-colors">{comp.title}</h3>
+                                        {renamingId === comp.id ? (
+                                            <input
+                                                autoFocus
+                                                type="text"
+                                                value={editName}
+                                                onChange={(e) => setEditName(e.target.value)}
+                                                onBlur={(e) => handleRename(comp.id, e as any)}
+                                                onKeyDown={(e) => e.key === "Enter" && handleRename(comp.id, e)}
+                                                onClick={(e) => e.stopPropagation()}
+                                                className="w-full bg-white/10 border border-white/20 rounded px-2 py-1 text-white text-lg font-medium outline-none focus:border-blue-500 mb-1"
+                                            />
+                                        ) : (
+                                            <h3 className="text-lg font-medium text-white mb-1 group-hover:text-blue-400 transition-colors">{comp.title}</h3>
+                                        )}
                                         <div className="flex items-center gap-4 text-xs font-mono text-gray-500">
                                             <span className="flex items-center gap-1.5"><Clock className="w-3.5 h-3.5" /> {comp.duration}s</span>
                                             <span>{new Date(comp.updatedAt).toLocaleDateString()}</span>
