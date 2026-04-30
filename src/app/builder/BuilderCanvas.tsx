@@ -1008,10 +1008,14 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
 
     // Helper: get the variant mode for an element, auto-selecting single variants
     const getVariantMode = useCallback((elementId: string): string => {
-        const mode = inspectorVariantModes[elementId] || 'all';
+        const el = elements.find(e => e.elementId === elementId);
+        let mode = inspectorVariantModes[elementId];
+        if (!mode && el?.sourceElementId) {
+            mode = inspectorVariantModes[el.sourceElementId];
+        }
+        mode = mode || 'all';
+
         if (mode === 'all') {
-            // For single-variant collections, auto-select the only variant
-            const el = elements.find(e => e.elementId === elementId);
             if (el) {
                 const col = collections.find(c => c.id === el.collectionId);
                 if (col?.items.length === 1) return col.items[0].id;
@@ -1095,7 +1099,6 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     const lastFrameRef = useRef<number>(0);
     const playbackRafRef = useRef<number | null>(null);
 
-    // Simple deterministic hash function for strings
     const hashString = (str: string) => {
         let hash = 0;
         for (let i = 0; i < str.length; i++) {
@@ -1103,6 +1106,13 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             hash = ((hash << 5) - hash) + char;
             hash = hash & hash; // Convert to 32bit integer
         }
+        // MurmurHash3 avalanche to ensure sequential inputs produce highly uncorrelated seeds
+        hash ^= hash >>> 16;
+        hash = Math.imul(hash, 0x85ebca6b);
+        hash ^= hash >>> 13;
+        hash = Math.imul(hash, 0xc2b2ae35);
+        hash ^= hash >>> 16;
+        
         return Math.abs(hash);
     };
 
@@ -1169,7 +1179,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             const col = collections.find(c => c.id === el.collectionId);
             if (col && col.items.length > 0) {
                 const srcId = el.sourceElementId || el.elementId;
-                const userMode = col.items.length === 1 ? col.items[0].id : (inspectorVariantModes[srcId] || 'all');
+                const userMode = getVariantModeRef.current(el.elementId);
                 
                 let pickedVariant: CollectionVariant | null = null;
                 
@@ -1246,13 +1256,18 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                         : col.items; // last resort: all items (shouldn't happen)
 
                     // Calculate weights
-                    const weights = finalCandidates.map(v => {
-                        const usage = (variantUsage[v.id] || 0) + (queueUsages[v.id] || 0);
-                        return 100 / Math.pow(10, usage);
+                    const usages = finalCandidates.map(v => (variantUsage[v.id] || 0) + (queueUsages[v.id] || 0));
+                    const minUsage = Math.min(...usages);
+                    
+                    const weights = finalCandidates.map((v, i) => {
+                        const relativeUsage = usages[i] - minUsage;
+                        // Use a softer linear penalty so items don't get completely locked out during preview
+                        return 100 / (1 + relativeUsage * 2);
                     });
                     
                     const totalWeight = weights.reduce((a, b) => a + b, 0);
-                    let rand = random() * totalWeight;
+                    const randomVal = random();
+                    let rand = randomVal * totalWeight;
                     let index = 0;
                     for (let i = 0; i < weights.length; i++) {
                         rand -= weights[i];
@@ -1262,6 +1277,8 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                         }
                     }
                     pickedVariant = finalCandidates[index];
+                    
+                    console.log(`[Shuffle Debug] Element: ${el.elementId} (src: ${srcId}), Seed: ${variantSeed}, Hash: ${seededHash}, Rand: ${randomVal}, Candidates: ${finalCandidates.map(c=>c.id).join(',')}, Weights: ${weights.join(',')}, Picked: ${pickedVariant?.id}`);
                 }
                 
                 variants[el.elementId] = pickedVariant;
