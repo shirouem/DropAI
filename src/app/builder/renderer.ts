@@ -23,6 +23,9 @@ export type RenderElement = {
     mediaUrl?: string;
     mediaOffset?: number;
     volume?: number;
+    speed?: number;        // Playback rate (for future resampling; stored for completeness)
+    audioFadeIn?: number;  // Fade-in duration in seconds
+    audioFadeOut?: number; // Fade-out duration in seconds
     zIndex: number;
     fontSize?: number;
     fontWeight?: string;
@@ -31,6 +34,8 @@ export type RenderElement = {
     letterSpacing?: number;
     lineHeight?: number;
     textAlign?: 'left' | 'center' | 'right';
+    textStrokeColor?: string;
+    textStrokeWidth?: number;
     animations: Array<{
         id: string;
         type: string;
@@ -325,6 +330,17 @@ function drawFrame(
             const lh = fs * (el.lineHeight ?? 1.2);
             const totalH = lines.length * lh;
             const startY = ph / 2 - totalH / 2 + lh / 2;
+            // Draw stroke first so fill renders on top
+            if (el.textStrokeWidth && el.textStrokeWidth > 0) {
+                const strokeW = (el.textStrokeWidth / PREVIEW_W) * W;
+                ctx.strokeStyle = el.textStrokeColor || '#000000';
+                ctx.lineWidth = strokeW * 2; // *2 because lineWidth is centered on the path
+                ctx.lineJoin = 'round';
+                for (let i = 0; i < lines.length; i++) {
+                    const tx = el.textAlign === 'left' ? 0 : el.textAlign === 'right' ? pw : pw / 2;
+                    ctx.strokeText(lines[i], tx, startY + i * lh);
+                }
+            }
             for (let i = 0; i < lines.length; i++) {
                 const tx = el.textAlign === 'left' ? 0 : el.textAlign === 'right' ? pw : pw / 2;
                 ctx.fillText(lines[i], tx, startY + i * lh);
@@ -348,15 +364,24 @@ function mixAudio(
         if (!el.mediaUrl || (el.collectionType !== 'audio' && el.collectionType !== 'video')) continue;
         const buf = buffers.get(el.elementId);
         if (!buf) continue;
-        const vol = el.volume ?? 1;
-        const off = Math.floor((el.mediaOffset ?? 0) * sr);
+        const baseVol = el.volume ?? 1;
+        const fadeIn  = el.audioFadeIn  ?? 0;
+        const fadeOut = el.audioFadeOut ?? 0;
+        const off   = Math.floor((el.mediaOffset ?? 0) * sr);
         const start = Math.floor(el.startTime * sr);
         const count = Math.min(Math.floor(el.duration * sr), buf.length - off, n - start);
         const sL = buf.getChannelData(0);
         const sR = buf.numberOfChannels > 1 ? buf.getChannelData(1) : sL;
         for (let i = 0; i < count; i++) {
-            L[start + i] += (sL[off + i] ?? 0) * vol;
-            R[start + i] += (sR[off + i] ?? 0) * vol;
+            // Compute fade multiplier matching the preview ref callback logic
+            const elapsed   = i / sr;                    // seconds since element start
+            const remaining = el.duration - elapsed;     // seconds until element end
+            let fadeMult = 1;
+            if (fadeIn  > 0 && elapsed   < fadeIn)  fadeMult = Math.min(1, elapsed   / fadeIn);
+            else if (fadeOut > 0 && remaining < fadeOut) fadeMult = Math.min(1, remaining / fadeOut);
+            const v = baseVol * fadeMult;
+            L[start + i] += (sL[off + i] ?? 0) * v;
+            R[start + i] += (sR[off + i] ?? 0) * v;
         }
     }
     return [L, R];
