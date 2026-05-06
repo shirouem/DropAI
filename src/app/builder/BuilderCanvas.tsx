@@ -131,6 +131,7 @@ export interface CanvasElement {
     syncWith?: { targetId: string; targetEdge: 'start' | 'end'; myEdge: 'start' | 'end'; edge?: 'start' | 'end' } | null;
     matchDurationWithId?: string;
     matchDurationWithIds?: string[];
+    matchDurationOffsets?: Record<string, number>;
 }
 
 // --- Collection Type Styling ---
@@ -890,13 +891,27 @@ export function resolveElementTimings(
             for (const matchId of item.el.matchDurationWithIds) {
                 const matchTarget = resolveNode(matchId);
                 if (matchTarget) {
-                    resolvedDur += matchTarget.duration;
+                    const offset = item.el.matchDurationOffsets?.[matchId] || 0;
+                    resolvedDur += Math.max(0, matchTarget.duration + offset);
                 }
             }
         } else if (item.el.matchDurationWithId) {
             const matchTarget = resolveNode(item.el.matchDurationWithId);
             if (matchTarget) {
-                resolvedDur = matchTarget.duration;
+                const offset = item.el.matchDurationOffsets?.[item.el.matchDurationWithId] || 0;
+                resolvedDur = Math.max(0, matchTarget.duration + offset);
+            }
+        }
+
+        // Cap duration for media
+        if (item.el.collectionType === 'video' || item.el.collectionType === 'audio') {
+            const varMode = getVariantMode(item.el.elementId);
+            const maxAvailableDuration = getMediaDurationLimit(item.el, varMode, collections, 9999);
+            const mediaStart = item.el.mediaOffset || 0;
+            const remainingDuration = maxAvailableDuration - mediaStart;
+            
+            if (resolvedDur > remainingDuration) {
+                resolvedDur = Math.max(0.1, remainingDuration);
             }
         }
 
@@ -1971,9 +1986,21 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             } satisfies RenderElement;
         });
 
-        // Render only until the last element ends — no empty tail frames
-        const maxEndTime = renderEls.reduce((max, el) => Math.max(max, el.startTime + el.duration), 0);
-        const effectiveDuration = maxEndTime > 0 ? maxEndTime : TOTAL_DURATION;
+        // Render only until the last VISUAL element ends — audio should not extend the composition
+        const visualMaxEnd = renderEls
+            .filter(el => el.collectionType !== 'audio')
+            .reduce((max, el) => Math.max(max, el.startTime + el.duration), 0);
+        const effectiveDuration = visualMaxEnd > 0 ? visualMaxEnd : TOTAL_DURATION;
+
+        // Clamp audio durations so they never exceed the composition length
+        for (const el of renderEls) {
+            if (el.collectionType === 'audio' || el.collectionType === 'video') {
+                const endTime = el.startTime + el.duration;
+                if (endTime > effectiveDuration) {
+                    el.duration = Math.max(0, effectiveDuration - el.startTime);
+                }
+            }
+        }
 
         return {
             elements: renderEls,
@@ -3497,7 +3524,6 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                     </div>
 
                                     {/* Duration Linking */}
-                                    {(selectedElement.collectionType === 'text' || selectedElement.collectionType === 'image') && (
                                         <div className="space-y-3 pt-4 border-t border-white/5">
                                             <div className="flex items-center justify-between">
                                                 <h4 className="text-[9px] font-bold uppercase tracking-widest text-gray-500 font-mono">Match Duration</h4>
@@ -3508,17 +3534,38 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                 {((effectiveElement || selectedElement).matchDurationWithIds || []).map(linkedId => {
                                                     const linkedEl = elements.find(e => e.elementId === linkedId);
                                                     if (!linkedEl) return null;
+                                                    const offset = (effectiveElement || selectedElement).matchDurationOffsets?.[linkedId] || 0;
                                                     return (
-                                                        <div key={linkedId} className="flex items-center justify-between bg-[#1a1a1a] rounded-md border border-white/10 px-2 py-1.5">
-                                                            <div className="flex items-center gap-1.5 overflow-hidden">
+                                                        <div key={linkedId} className="flex items-center justify-between bg-[#1a1a1a] rounded-md border border-white/10 px-2 py-1.5 gap-2">
+                                                            <div className="flex items-center gap-1.5 overflow-hidden flex-1">
                                                                 <Link2 className="w-3 h-3 text-cyan-500 shrink-0" />
                                                                 <span className="text-[10px] text-gray-300 font-mono truncate">{linkedEl.title}</span>
+                                                            </div>
+                                                            <div className="flex items-center gap-1 shrink-0">
+                                                                <span className="text-[9px] text-gray-500 font-mono">offset</span>
+                                                                <input
+                                                                    type="number"
+                                                                    step="0.1"
+                                                                    className="w-12 bg-[#111] text-[10px] font-mono text-gray-300 px-1 py-0.5 rounded border border-white/10 focus:outline-none focus:border-blue-500 text-center"
+                                                                    value={offset}
+                                                                    onChange={e => {
+                                                                        const el = effectiveElement || selectedElement;
+                                                                        const currentOffsets = el.matchDurationOffsets || {};
+                                                                        updateSelected({ matchDurationOffsets: { ...currentOffsets, [linkedId]: parseFloat(e.target.value) || 0 } });
+                                                                    }}
+                                                                />
+                                                                <span className="text-[9px] text-gray-500 font-mono">s</span>
                                                             </div>
                                                             <button 
                                                                 onClick={() => {
                                                                     const el = effectiveElement || selectedElement;
                                                                     const currentIds = el.matchDurationWithIds || [];
-                                                                    updateSelected({ matchDurationWithIds: currentIds.filter(id => id !== linkedId) });
+                                                                    const currentOffsets = { ...(el.matchDurationOffsets || {}) };
+                                                                    delete currentOffsets[linkedId];
+                                                                    updateSelected({ 
+                                                                        matchDurationWithIds: currentIds.filter(id => id !== linkedId),
+                                                                        matchDurationOffsets: currentOffsets
+                                                                    });
                                                                 }}
                                                                 className="p-1 hover:bg-white/10 rounded-md text-gray-500 hover:text-red-400 transition-colors shrink-0"
                                                             >
@@ -3533,14 +3580,35 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                     const linkedId = (effectiveElement || selectedElement).matchDurationWithId!;
                                                     const linkedEl = elements.find(e => e.elementId === linkedId);
                                                     if (!linkedEl) return null;
+                                                    const offset = (effectiveElement || selectedElement).matchDurationOffsets?.[linkedId] || 0;
                                                     return (
-                                                        <div key={linkedId} className="flex items-center justify-between bg-[#1a1a1a] rounded-md border border-white/10 px-2 py-1.5">
-                                                            <div className="flex items-center gap-1.5 overflow-hidden">
+                                                        <div key={linkedId} className="flex items-center justify-between bg-[#1a1a1a] rounded-md border border-white/10 px-2 py-1.5 gap-2">
+                                                            <div className="flex items-center gap-1.5 overflow-hidden flex-1">
                                                                 <Link2 className="w-3 h-3 text-cyan-500 shrink-0" />
                                                                 <span className="text-[10px] text-gray-300 font-mono truncate">{linkedEl.title}</span>
                                                             </div>
+                                                            <div className="flex items-center gap-1 shrink-0">
+                                                                <span className="text-[9px] text-gray-500 font-mono">offset</span>
+                                                                <input
+                                                                    type="number"
+                                                                    step="0.1"
+                                                                    className="w-12 bg-[#111] text-[10px] font-mono text-gray-300 px-1 py-0.5 rounded border border-white/10 focus:outline-none focus:border-blue-500 text-center"
+                                                                    value={offset}
+                                                                    onChange={e => {
+                                                                        const el = effectiveElement || selectedElement;
+                                                                        const currentOffsets = el.matchDurationOffsets || {};
+                                                                        updateSelected({ matchDurationOffsets: { ...currentOffsets, [linkedId]: parseFloat(e.target.value) || 0 } });
+                                                                    }}
+                                                                />
+                                                                <span className="text-[9px] text-gray-500 font-mono">s</span>
+                                                            </div>
                                                             <button 
-                                                                onClick={() => updateSelected({ matchDurationWithId: undefined })}
+                                                                onClick={() => {
+                                                                    const el = effectiveElement || selectedElement;
+                                                                    const currentOffsets = { ...(el.matchDurationOffsets || {}) };
+                                                                    delete currentOffsets[linkedId];
+                                                                    updateSelected({ matchDurationWithId: undefined, matchDurationOffsets: currentOffsets });
+                                                                }}
                                                                 className="p-1 hover:bg-white/10 rounded-md text-gray-500 hover:text-red-400 transition-colors shrink-0"
                                                             >
                                                                 <X className="w-3 h-3" />
@@ -3589,7 +3657,6 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                 </div>
                                             </div>
                                         </div>
-                                    )}
 
                                     {/* Text Content — only for text elements when a specific variant is selected */}
                                     {selectedElement.collectionType === 'text' && selectedVariantMode !== 'all' && (() => {

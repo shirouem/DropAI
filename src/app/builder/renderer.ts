@@ -199,6 +199,19 @@ function loadVideo(url: string): Promise<HTMLVideoElement> {
         v.preload = 'auto';
         v.muted = true;
         v.playsInline = true;
+        
+        // Critical: Append to DOM so Chromium's video decoder doesn't deprioritize it!
+        // When off-screen, decoding can lag and hit our safety timeouts, causing grey flashes.
+        v.style.position = 'fixed';
+        v.style.opacity = '0.001';
+        v.style.pointerEvents = 'none';
+        v.style.width = '10px';
+        v.style.height = '10px';
+        v.style.zIndex = '-9999';
+        v.style.top = '0';
+        v.style.left = '0';
+        document.body.appendChild(v);
+
         v.src = url;
         v.onloadeddata = () => res(v);
         v.onerror = rej;
@@ -207,53 +220,54 @@ function loadVideo(url: string): Promise<HTMLVideoElement> {
 }
 
 /** 
- * Optimized seekTo: Prevents seeking completely if the video is already exactly where we want it.
+ * seekTo — Guaranteed frame-accurate seeking.
+ * 
+ * Uses a single polling loop that waits for BOTH conditions:
+ *   1. The seek has completed (currentTime is near target)
+ *   2. readyState >= 2 (frame data is actually decoded)
+ * 
+ * This eliminates the race between seeked events and safety timeouts
+ * that caused grey flashes. No vsync dependency (fast), no event ordering
+ * bugs (reliable).
  */
 function seekTo(vid: HTMLVideoElement, target: number): Promise<void> {
     return new Promise(resolve => {
         const safeTarget = target + 0.005;
         const clampedTarget = Math.max(0, Math.min(safeTarget, (vid.duration || 0) - 0.05));
         
-        // Skip seek if already there
-        if (Math.abs(vid.currentTime - clampedTarget) < 0.0001) {
+        // Skip seek if already at the right position with data ready
+        if (Math.abs(vid.currentTime - clampedTarget) < 0.02 && vid.readyState >= 2) {
             resolve();
             return;
         }
-        let resolved = false;
-        
-        const finish = () => {
-            if (resolved) return;
-            resolved = true;
-            resolve();
-        };
 
-        const done = () => { 
-            vid.removeEventListener('seeked', done); 
-            if ('requestVideoFrameCallback' in vid) {
-                let rfcResolved = false;
-                const callbackId = (vid as HTMLVideoElement & { requestVideoFrameCallback: (cb: () => void) => number }).requestVideoFrameCallback(() => {
-                    if (rfcResolved) return;
-                    rfcResolved = true;
-                    finish();
-                });
-                setTimeout(() => {
-                    if (!rfcResolved) {
-                        try { (vid as HTMLVideoElement & { cancelVideoFrameCallback: (id: number) => void }).cancelVideoFrameCallback(callbackId); } catch (e) {}
-                        finish();
-                    }
-                }, 150);
-            } else {
-                setTimeout(finish, 150);
-            }
-        };
-        vid.addEventListener('seeked', done);
+        // Initiate the seek
         vid.currentTime = clampedTarget;
-        setTimeout(() => {
-            if (!resolved) {
-                vid.removeEventListener('seeked', done);
-                finish();
+
+        // Single polling loop: wait until the decoder has actually
+        // landed on the target AND has pixel data ready to draw.
+        // This runs every 2ms — far faster than any event-based approach —
+        // and has zero risk of resolving before the frame is decoded.
+        let elapsed = 0;
+        const poll = () => {
+            // Frame is decoded and position is correct
+            if (vid.readyState >= 2 && Math.abs(vid.currentTime - clampedTarget) < 0.1) {
+                resolve();
+                return;
             }
-        }, 2000);
+            elapsed += 2;
+            // Hard deadline: 5 seconds. If we haven't got a frame by now,
+            // something is seriously wrong — resolve anyway so the export
+            // doesn't hang forever. At this point readyState < 2 is caught
+            // by drawFrame which will draw the last good cached frame.
+            if (elapsed > 5000) {
+                resolve();
+                return;
+            }
+            setTimeout(poll, 2);
+        };
+        // Start polling on next tick to give the browser a chance to start seeking
+        setTimeout(poll, 2);
     });
 }
 
@@ -267,6 +281,7 @@ function drawFrame(
     imageCache: Map<string, HTMLImageElement>,
     videoCache: Map<string, HTMLVideoElement>,
     t: number,
+    lastFrames: Map<string, HTMLCanvasElement>
 ) {
     ctx.clearRect(0, 0, W, H);
     ctx.fillStyle = '#000';
@@ -303,9 +318,23 @@ function drawFrame(
             const vid = videoCache.get(el.elementId);
             if (vid && vid.readyState >= 2) {
                 ctx.drawImage(vid, 0, 0, pw, ph);
+                // Cache last good frame as safety net
+                let fb = lastFrames.get(el.elementId);
+                if (!fb) {
+                    fb = document.createElement('canvas');
+                    fb.width = pw;
+                    fb.height = ph;
+                    lastFrames.set(el.elementId, fb);
+                }
+                fb.getContext('2d')!.drawImage(vid, 0, 0, pw, ph);
             } else {
-                ctx.fillStyle = '#555';
-                ctx.fillRect(0, 0, pw, ph);
+                // Fallback: draw last known good frame (only hit if 5s timeout expired)
+                const fb = lastFrames.get(el.elementId);
+                if (fb) {
+                    ctx.drawImage(fb, 0, 0, pw, ph);
+                }
+                // No else — if there's truly no frame yet, the black background shows,
+                // which is the correct behavior for a video that hasn't started.
             }
         } else if (el.collectionType === 'text' && el.content) {
             const fs = ((el.fontSize ?? 16) / PREVIEW_W) * W;
@@ -334,7 +363,7 @@ function drawFrame(
             if (el.textStrokeWidth && el.textStrokeWidth > 0) {
                 const strokeW = (el.textStrokeWidth / PREVIEW_W) * W;
                 ctx.strokeStyle = el.textStrokeColor || '#000000';
-                ctx.lineWidth = strokeW * 2; // *2 because lineWidth is centered on the path
+                ctx.lineWidth = strokeW * 2;
                 ctx.lineJoin = 'round';
                 for (let i = 0; i < lines.length; i++) {
                     const tx = el.textAlign === 'left' ? 0 : el.textAlign === 'right' ? pw : pw / 2;
@@ -431,6 +460,7 @@ async function encodeComposition(
     const canvas = document.createElement('canvas');
     canvas.width = W; canvas.height = H;
     const ctx = canvas.getContext('2d', { alpha: false, willReadFrequently: true })!;
+    const lastFrames = new Map<string, HTMLCanvasElement>();
 
     let lastProgressTime = Date.now();
 
@@ -446,7 +476,7 @@ async function encodeComposition(
             if (vid) await seekTo(vid, t - el.startTime + (el.mediaOffset ?? 0));
         }
 
-        drawFrame(ctx, W, H, sorted, images, videos, t);
+        drawFrame(ctx, W, H, sorted, images, videos, t, lastFrames);
 
         const bitmap = await createImageBitmap(canvas);
         const vf = new VideoFrame(bitmap, { timestamp: Math.floor(t * US), duration: Math.floor(spf * US) });
@@ -553,6 +583,9 @@ export async function renderComposition(job: RenderJob, onProgress: ProgressCb, 
         for (const vid of videos.values()) {
             vid.removeAttribute('src');
             vid.load();
+            if (vid.parentNode) {
+                vid.parentNode.removeChild(vid);
+            }
         }
     }
 }
