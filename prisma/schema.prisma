@@ -26,6 +26,7 @@ model Composition {
   elements    String   // Store array of elements as JSON string
   tracks      String   @default("[]") // Store array of tracks as JSON string
   collections String   // Store array of collections to preserve uploaded assets
+  structuralGroups String @default("[]") // Store structural groups
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 }

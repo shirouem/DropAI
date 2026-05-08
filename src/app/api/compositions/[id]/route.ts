@@ -30,6 +30,7 @@ export async function PUT(request: Request, context: { params: Promise<{ id: str
         if (body.elements !== undefined) updateData.elements = JSON.stringify(body.elements);
         if (body.tracks !== undefined) updateData.tracks = JSON.stringify(body.tracks);
         if (body.collections !== undefined) updateData.collections = JSON.stringify(body.collections);
+        if (body.structuralGroups !== undefined) updateData.structuralGroups = JSON.stringify(body.structuralGroups);
 
         const composition = await prisma.composition.update({
             where: { id: id },

@@ -6,10 +6,10 @@ import {
     Play, Pause, Plus, Image as ImageIcon, Music, Download, Upload,
     Layers, X, Type, MonitorPlay, SlidersHorizontal, GripVertical, Shuffle, SkipBack, Video, Trash2, Sparkles, ChevronDown, Eye, EyeOff,
     Bold, Italic, Underline, AlignLeft, AlignCenter, AlignRight, Scissors, MousePointer2, Settings, Lock, Unlock, ArrowUp, ArrowDown,
-    Film, Loader2, CheckCircle2, AlertCircle, Clapperboard, ListPlus, Link2, Ban
+    Film, Loader2, CheckCircle2, AlertCircle, Clapperboard, ListPlus, Link2, Ban, Boxes, FolderOpen, ChevronRight
 } from "lucide-react";
 import Link from "next/link";
-import { renderComposition, type RenderProgress, type RenderElement, type RenderFormat } from "./renderer";
+import { renderComposition, type RenderProgress, type RenderElement, type RenderFormat, type RenderJob } from "./renderer";
 import {
     DndContext,
     useSensor,
@@ -27,7 +27,7 @@ import { CSS } from "@dnd-kit/utilities";
 import { cn } from "@/lib/utils";
 
 // --- Types ---
-type CollectionType = "text" | "image" | "video" | "audio";
+type CollectionType = "text" | "image" | "video" | "audio" | "structure";
 
 interface CollectionVariant {
     id: string;
@@ -43,6 +43,32 @@ interface CollectionItem {
     title: string;
     type: CollectionType;
     items: CollectionVariant[];
+}
+
+// --- Structures ---
+// A blueprint element inside a structure (relative timings)
+interface StructureElement {
+    id: string;
+    collectionId: string;
+    trackOffset: number;       // 0-based track index within structure
+    relativeStart: number;     // seconds from structure start
+    duration: number;          // seconds
+    x: number; y: number; width: number; height: number;
+    localExcludedVariantIds?: string[];
+}
+
+// A named sequence of structure elements (a reusable mini-timeline)
+interface Structure {
+    id: string;
+    name: string;
+    elements: StructureElement[];
+}
+
+// A group of structure variants — importing picks one randomly
+interface StructuralGroup {
+    id: string;
+    name: string;
+    structures: Structure[];
 }
 
 // --- Animation Presets ---
@@ -118,6 +144,7 @@ export interface CanvasElement {
     textAlign?: 'left' | 'center' | 'right';
     textStrokeColor?: string; // CSS color for text outline
     textStrokeWidth?: number; // Stroke width in px (at PREVIEW_W scale)
+    seedOffset?: number; // Local seed offset to allow targeted re-randomization
     selectedVariantId?: string;
     animations: ElementAnimation[];
     variantOverrides?: Record<string, Partial<CanvasElement>>;
@@ -132,6 +159,10 @@ export interface CanvasElement {
     matchDurationWithId?: string;
     matchDurationWithIds?: string[];
     matchDurationOffsets?: Record<string, number>;
+    localExcludedVariantIds?: string[]; // Variant IDs excluded only for this instance (not global)
+    parentStructureId?: string; // ID of the structure parent this element belongs to
+    isStructureExpanded?: boolean; // Whether the structure block is expanded in timeline
+    trackOffset?: number;
 }
 
 // --- Collection Type Styling ---
@@ -140,6 +171,7 @@ const COLLECTION_COLORS: Record<CollectionType, { bg: string; border: string; te
     image: { bg: "bg-blue-500/15", border: "border-blue-500/40", text: "text-blue-400", icon: "text-blue-500" },
     video: { bg: "bg-purple-500/15", border: "border-purple-500/40", text: "text-purple-400", icon: "text-purple-500" },
     audio: { bg: "bg-emerald-500/15", border: "border-emerald-500/40", text: "text-emerald-400", icon: "text-emerald-500" },
+    structure: { bg: "bg-pink-500/15", border: "border-pink-500/40", text: "text-pink-400", icon: "text-pink-500" },
 };
 
 const COLLECTION_ICONS: Record<CollectionType, React.ReactNode> = {
@@ -147,6 +179,7 @@ const COLLECTION_ICONS: Record<CollectionType, React.ReactNode> = {
     image: <ImageIcon className="w-3.5 h-3.5" />,
     video: <MonitorPlay className="w-3.5 h-3.5" />,
     audio: <Music className="w-3.5 h-3.5" />,
+    structure: <Layers className="w-3.5 h-3.5" />,
 };
 
 function ScrubInput({ value, onChange, min, max, step, className }: { value: number; onChange: (v: number) => void; min?: number; max?: number; step?: string | number; className?: string }) {
@@ -237,6 +270,7 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
         image: "image/*",
         video: "video/*",
         audio: "audio/*",
+        structure: ""
     };
 
     const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
@@ -597,6 +631,30 @@ const TimelineWaveform = React.memo(function TimelineWaveform({ elementId, colle
     );
 });
 
+// --- Draggable Structural Group Card ---
+function DraggableStructGroupCard({ group, onDelete, onAddStructure }: { group: StructuralGroup; onDelete: () => void; onAddStructure: () => void }) {
+    const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
+        id: `structgroup-${group.id}`,
+        data: { group },
+    });
+    return (
+        <div ref={setNodeRef} className={cn("flex items-center justify-between px-3 py-2", isDragging && "opacity-50")}>
+            <div {...listeners} {...attributes} className="flex items-center gap-2 cursor-grab active:cursor-grabbing flex-1 min-w-0">
+                <GripVertical className="w-3 h-3 text-gray-600 shrink-0" />
+                <Boxes className="w-3.5 h-3.5 text-purple-400 shrink-0" />
+                <div className="min-w-0">
+                    <p className="text-[10px] font-mono text-gray-300 truncate">{group.name}</p>
+                    <p className="text-[7px] font-mono text-gray-600">{group.structures.length} variant{group.structures.length !== 1 ? 's' : ''}</p>
+                </div>
+            </div>
+            <div className="flex items-center gap-1 shrink-0">
+                <button onClick={(e) => { e.stopPropagation(); onAddStructure(); }} className="text-gray-600 hover:text-green-400 transition-colors p-0.5" title="Add structure variant"><Plus className="w-3 h-3" /></button>
+                <button onClick={(e) => { e.stopPropagation(); onDelete(); }} className="text-gray-600 hover:text-red-400 transition-colors p-0.5" title="Delete group"><Trash2 className="w-3 h-3" /></button>
+            </div>
+        </div>
+    );
+}
+
 // --- Canvas Layer ---
 function CanvasLayer({ el, isSelected, collections, currentTime, onClick, onActionStart }: { el: CanvasElement; isSelected: boolean; collections: CollectionItem[]; currentTime: number; onClick: () => void; onActionStart: (action: string, e: React.PointerEvent) => void }) {
     const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
@@ -853,6 +911,7 @@ export function resolveElementTimings(
     // For each track, sort elements by intrinsic startTime.
     const tracksMap = new Map<string, typeof initialTimings>();
     for (const item of initialTimings) {
+        if (item.el.parentStructureId) continue; // Structure children don't participate in main track sequencing
         const tid = item.el.trackId || 'track-0';
         if (!tracksMap.has(tid)) tracksMap.set(tid, []);
         tracksMap.get(tid)!.push(item);
@@ -886,21 +945,49 @@ export function resolveElementTimings(
         let resolvedStart = item.startTime;
         let resolvedDur = item.duration;
 
-        if (item.el.matchDurationWithIds && item.el.matchDurationWithIds.length > 0) {
+        if (item.el.collectionType === 'structure') {
+            let maxChildEnd = 0;
+            for (const [childId, childItem] of initialMap.entries()) {
+                if (childItem.el.parentStructureId === id) {
+                    const relativeStart = childItem.startTime - item.startTime;
+                    const childTiming = resolveNode(childId);
+                    const childEnd = relativeStart + childTiming.duration;
+                    if (childEnd > maxChildEnd) maxChildEnd = childEnd;
+                }
+            }
+            resolvedDur = Math.max(0.1, maxChildEnd);
+        }
+
+        if (item.el.parentStructureId) {
+            const parentTiming = resolveNode(item.el.parentStructureId);
+            const parentInitial = initialMap.get(item.el.parentStructureId);
+            const relativeStart = item.startTime - (parentInitial ? parentInitial.startTime : 0);
+            resolvedStart = parentTiming.startTime + relativeStart;
+        } else if (item.el.matchDurationWithIds && item.el.matchDurationWithIds.length > 0) {
             resolvedDur = 0;
+            let anyValid = false;
             for (const matchId of item.el.matchDurationWithIds) {
+                // Only resolve if the target element actually exists in this composition
+                if (!initialMap.has(matchId)) continue;
                 const matchTarget = resolveNode(matchId);
                 if (matchTarget) {
                     const offset = item.el.matchDurationOffsets?.[matchId] || 0;
                     resolvedDur += Math.max(0, matchTarget.duration + offset);
+                    anyValid = true;
                 }
             }
+            // If no valid targets remain, fall back to intrinsic duration
+            if (!anyValid) resolvedDur = item.duration;
         } else if (item.el.matchDurationWithId) {
-            const matchTarget = resolveNode(item.el.matchDurationWithId);
-            if (matchTarget) {
-                const offset = item.el.matchDurationOffsets?.[item.el.matchDurationWithId] || 0;
-                resolvedDur = Math.max(0, matchTarget.duration + offset);
+            // Only resolve if the target element actually exists
+            if (initialMap.has(item.el.matchDurationWithId)) {
+                const matchTarget = resolveNode(item.el.matchDurationWithId);
+                if (matchTarget) {
+                    const offset = item.el.matchDurationOffsets?.[item.el.matchDurationWithId] || 0;
+                    resolvedDur = Math.max(0, matchTarget.duration + offset);
+                }
             }
+            // If target doesn't exist, keep intrinsic duration (resolvedDur unchanged)
         }
 
         // Cap duration for media
@@ -915,41 +1002,75 @@ export function resolveElementTimings(
             }
         }
 
-        if (item.el.syncWith && item.el.syncWith.targetId) {
-            // ANCHORED: depends on syncWith target
-            const targetTiming = resolveNode(item.el.syncWith.targetId);
-            if (targetTiming) {
-                const targetPoint = item.el.syncWith.targetEdge === 'end' 
-                    ? targetTiming.startTime + targetTiming.duration 
-                    : targetTiming.startTime;
-                
-                if (item.el.syncWith.myEdge === 'end') {
-                    resolvedStart = targetPoint - resolvedDur;
-                } else {
-                    resolvedStart = targetPoint;
+        if (!item.el.parentStructureId) {
+            if (item.el.syncWith && item.el.syncWith.targetId) {
+                // ANCHORED: depends on syncWith target — but only if it still exists
+                if (initialMap.has(item.el.syncWith.targetId)) {
+                    const targetTiming = resolveNode(item.el.syncWith.targetId);
+                    if (targetTiming) {
+                        const targetPoint = item.el.syncWith.targetEdge === 'end' 
+                            ? targetTiming.startTime + targetTiming.duration 
+                            : targetTiming.startTime;
+                        
+                        if (item.el.syncWith.myEdge === 'end') {
+                            resolvedStart = targetPoint - resolvedDur;
+                        } else {
+                            resolvedStart = targetPoint;
+                        }
+                    }
                 }
-            }
-        } else {
-            // NORMAL: depends on previous element in track
-            const prevId = prevInTrack.get(id);
-            if (prevId) {
-                const prevTiming = resolveNode(prevId);
-                const trackConfig = tracks.find(t => t.id === (item.el.trackId || 'track-0'));
-                
-                const pushStart = prevTiming.startTime + prevTiming.duration;
-                
-                if (trackConfig?.magnet) {
-                    resolvedStart = pushStart;
-                } else {
-                    resolvedStart = Math.max(item.startTime, pushStart);
+                // If target doesn't exist, fall through to normal positioning below
+                // (but only if we didn't anchor — we need the else to fire)
+                if (!initialMap.has(item.el.syncWith.targetId)) {
+                    // Treat as normal (non-anchored) element
+                    const prevId = prevInTrack.get(id);
+                    if (prevId) {
+                        const prevTiming = resolveNode(prevId);
+                        const trackConfig = tracks.find(t => t.id === (item.el.trackId || 'track-0'));
+                        const pushStart = prevTiming.startTime + prevTiming.duration;
+                        if (trackConfig?.magnet) {
+                            resolvedStart = pushStart;
+                        } else {
+                            resolvedStart = Math.max(item.startTime, pushStart);
+                        }
+                    } else {
+                        resolvedStart = item.startTime;
+                    }
                 }
             } else {
-                // First element in track, uses intrinsic
-                resolvedStart = item.startTime;
+                // NORMAL: depends on previous element in track
+                const prevId = prevInTrack.get(id);
+                if (prevId) {
+                    const prevTiming = resolveNode(prevId);
+                    const trackConfig = tracks.find(t => t.id === (item.el.trackId || 'track-0'));
+                    
+                    const pushStart = prevTiming.startTime + prevTiming.duration;
+                    
+                    if (trackConfig?.magnet) {
+                        resolvedStart = pushStart;
+                    } else {
+                        resolvedStart = Math.max(item.startTime, pushStart);
+                    }
+                } else {
+                    // First element in track, uses intrinsic
+                    resolvedStart = item.startTime;
+                }
             }
         }
 
         resolvedStart = Math.max(0, resolvedStart); // Prevent negative start times
+
+        if (item.el.collectionType === 'structure') {
+            let maxChildEnd = resolvedStart + 0.1; // Default min duration
+            for (const childItem of initialTimings) {
+                if (childItem.el.parentStructureId === item.el.elementId) {
+                    const childTiming = resolveNode(childItem.el.elementId);
+                    maxChildEnd = Math.max(maxChildEnd, childTiming.startTime + childTiming.duration);
+                }
+            }
+            resolvedDur = maxChildEnd - resolvedStart;
+        }
+
         const res = { startTime: Math.round(resolvedStart * 100) / 100, duration: resolvedDur };
         timings.set(id, res);
         resolving.delete(id);
@@ -1075,6 +1196,12 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                     if (data.title) {
                         setTitle(data.title);
                     }
+                    if (data.structuralGroups) {
+                        try {
+                            const parsed = typeof data.structuralGroups === 'string' ? JSON.parse(data.structuralGroups) : data.structuralGroups;
+                            if (Array.isArray(parsed)) setStructuralGroups(parsed);
+                        } catch (e) { }
+                    }
                 })
                 .catch(err => console.error("Failed to fetch composition", err))
                 .finally(() => setFetching(false));
@@ -1086,10 +1213,19 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     const [newCollectionTitle, setNewCollectionTitle] = useState("");
     const [newCollectionType, setNewCollectionType] = useState<CollectionType>("text");
 
+    // --- Structures ---
+    const [structuralGroups, setStructuralGroups] = useState<StructuralGroup[]>([]);
+    const [sidebarTab, setSidebarTab] = useState<'collections' | 'structures'>('collections');
+    const [isCreatingGroup, setIsCreatingGroup] = useState(false);
+    const [newGroupName, setNewGroupName] = useState("");
+    const [editingStructureId, setEditingStructureId] = useState<string | null>(null); // currently expanded structure for editing
+    const [activeStructGroup, setActiveStructGroup] = useState<StructuralGroup | null>(null); // drag overlay for struct groups
+
     // Drag state for overlay
     const [activeCollection, setActiveCollection] = useState<CollectionItem | null>(null);
     const [activeDragElement, setActiveDragElement] = useState<CanvasElement | null>(null);
     const [activeDragDelta, setActiveDragDelta] = useState<{ x: number, y: number } | null>(null);
+
 
     // Timeline state
     const [isTimelineOpen, setIsTimelineOpen] = useState(true);
@@ -1160,6 +1296,42 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         });
     }, []);
 
+    const flattenedElements = useMemo(() => {
+        const result: CanvasElement[] = [];
+        for (const el of elements) {
+            result.push(el);
+            if (el.collectionType === 'structure') {
+                const structGroup = structuralGroups.find(g => g.id === el.collectionId);
+                const structure = structGroup?.structures[0];
+                if (structure) {
+                    for (const child of structure.elements) {
+                        const col = collections.find(c => c.id === child.collectionId);
+                        result.push({
+                            elementId: `${el.elementId}_${child.id}`,
+                            sourceElementId: el.sourceElementId || el.elementId,
+                            collectionId: child.collectionId,
+                            collectionType: col?.type || 'video',
+                            trackId: el.trackId || 'track-0',
+                            trackOffset: child.trackOffset,
+                            startTime: el.startTime + child.relativeStart,
+                            duration: child.duration,
+                            x: child.x,
+                            y: child.y,
+                            width: child.width,
+                            height: child.height,
+                            zIndex: el.zIndex,
+                            localExcludedVariantIds: child.localExcludedVariantIds,
+                            parentStructureId: el.elementId,
+                            visible: el.visible,
+                            seedOffset: (el.seedOffset || 0) + (child.relativeStart * 100),
+                        } as CanvasElement);
+                    }
+                }
+            }
+        }
+        return result;
+    }, [elements, structuralGroups, tracks, collections]);
+
     const previewVariants = useMemo(() => {
         const variants: Record<string, CollectionVariant | null> = {};
         
@@ -1182,13 +1354,16 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             return c ? c.items.some(v => v.linkedVariantIds && v.linkedVariantIds.length > 0) : false;
         };
 
-        const sortedElements = [...elements].sort((a, b) => {
+        const sortedElements = [...flattenedElements].sort((a, b) => {
             const aIsSource = isLinkSourceCollection(a.collectionId) ? 0 : 1;
             const bIsSource = isLinkSourceCollection(b.collectionId) ? 0 : 1;
             if (aIsSource !== bIsSource) return aIsSource - bIsSource; // sources first
             return a.startTime - b.startTime; // then by timeline position
         });
         const pickedVariantIds = new Set<string>();
+        // Track which variant IDs have been picked per collection, so elements
+        // sharing the same collection are forced to pick different variants.
+        const pickedByCollection: Record<string, Set<string>> = {};
 
         sortedElements.forEach(el => {
             const col = collections.find(c => c.id === el.collectionId);
@@ -1203,7 +1378,8 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 }
 
                 if (!pickedVariant) {
-                    const seededHash = hashString(`${variantSeed}-${srcId}`);
+                    const localSeed = variantSeed + (el.seedOffset || 0);
+                    const seededHash = hashString(`${localSeed}-${srcId}`);
                     const random = mulberry32(seededHash);
                     
                     // Linked variant resolution
@@ -1263,12 +1439,27 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                     });
 
                     // Excluded variants are always removed from the pool
-                    const eligibleCandidates = candidates.filter(v => !v.excluded);
+                    // Apply both global exclusions (variant.excluded) AND local per-instance exclusions
+                    const localExcluded = new Set(el.localExcludedVariantIds || []);
+                    const eligibleCandidates = candidates.filter(v => !v.excluded && !localExcluded.has(v.id));
                     // If link filtering wiped all candidates, fall back to all non-excluded items
-                    const nonExcluded = col.items.filter(v => !v.excluded);
-                    const finalCandidates = eligibleCandidates.length > 0 ? eligibleCandidates
+                    const nonExcluded = col.items.filter(v => !v.excluded && !localExcluded.has(v.id));
+                    let finalCandidates = eligibleCandidates.length > 0 ? eligibleCandidates
                         : nonExcluded.length > 0 ? nonExcluded
-                        : col.items; // last resort: all items (shouldn't happen)
+                        : col.items.filter(v => !v.excluded); // fall back to globally-non-excluded only
+
+                    // --- Same-collection deduplication ---
+                    // If another element from this collection already picked a variant,
+                    // forcibly exclude those variants so every element gets a unique one.
+                    const alreadyPickedInCol = pickedByCollection[col.id];
+                    if (alreadyPickedInCol && alreadyPickedInCol.size > 0) {
+                        const deduped = finalCandidates.filter(v => !alreadyPickedInCol.has(v.id));
+                        // Only apply dedup if there are still candidates left;
+                        // if all variants are exhausted (more elements than variants), allow repeats.
+                        if (deduped.length > 0) {
+                            finalCandidates = deduped;
+                        }
+                    }
 
                     // Calculate weights
                     const usages = finalCandidates.map(v => (variantUsage[v.id] || 0) + (queueUsages[v.id] || 0));
@@ -1299,28 +1490,31 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 variants[el.elementId] = pickedVariant;
                 if (pickedVariant) {
                     pickedVariantIds.add(pickedVariant.id);
+                    // Record per-collection pick for deduplication
+                    if (!pickedByCollection[col.id]) pickedByCollection[col.id] = new Set();
+                    pickedByCollection[col.id].add(pickedVariant.id);
                 }
             } else {
                 variants[el.elementId] = null;
             }
         });
         return variants;
-    }, [elements, collections, variantSeed, variantUsage, inspectorVariantModes]);
+    }, [flattenedElements, collections, variantSeed, variantUsage, inspectorVariantModes]);
 
     const activeVariantModes = useMemo(() => {
         const modes: Record<string, string> = {};
-        for (const el of elements) {
+        for (const el of flattenedElements) {
             const userMode = getVariantMode(el.elementId);
             modes[el.elementId] = userMode === 'all'
                 ? (previewVariants[el.elementId]?.id || 'all')
                 : userMode;
         }
         return modes;
-    }, [elements, previewVariants, getVariantMode]);
+    }, [flattenedElements, previewVariants, getVariantMode]);
 
     const elementTimings = useMemo(() => {
-        return resolveElementTimings(elements, tracks, collections, elId => activeVariantModes[elId] || 'all');
-    }, [elements, tracks, collections, activeVariantModes]);
+        return resolveElementTimings(flattenedElements, tracks, collections, elId => activeVariantModes[elId] || 'all');
+    }, [flattenedElements, tracks, collections, activeVariantModes]);
 
     // Auto-expand playback duration when elements extend beyond the current timeline length
     useEffect(() => {
@@ -1721,6 +1915,9 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 setActiveDragElement(data.element);
                 setSelectedElementId(data.element.elementId);
             }
+        } else if (String(event.active.id).startsWith("structgroup-")) {
+            const data = event.active.data.current as { group: StructuralGroup } | undefined;
+            if (data?.group) setActiveStructGroup(data.group);
         }
     };
 
@@ -1761,8 +1958,51 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         setActiveCollection(null);
         setActiveDragElement(null);
         setActiveDragDelta(null);
+        setActiveStructGroup(null);
 
         const { active, over, delta } = event;
+
+        // --- Drop structural group onto timeline ---
+        if (String(active.id).startsWith("structgroup-")) {
+            const data = active.data.current as { group: StructuralGroup } | undefined;
+            const group = data?.group;
+            if (group && group.structures.length > 0) {
+                // Pick a random structure from the group
+                const picked = group.structures[Math.floor(Math.random() * group.structures.length)];
+                if (picked.elements.length === 0) return;
+
+                // Determine drop point on timeline: use end of current content
+                const maxEnd = elements.reduce((max, el) => {
+                    const t = elementTimings.get(el.elementId);
+                    const end = t ? t.startTime + t.duration : el.startTime + el.duration;
+                    return Math.max(max, end);
+                }, 0);
+
+                                // Find the highest track offset in the structure
+                                const maxDuration = picked.elements.reduce((max, el) => Math.max(max, el.relativeStart + el.duration), 0);
+
+                                const structureElement: CanvasElement = {
+                                    elementId: `struct-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                                    collectionId: group.id,
+                                    collectionType: 'structure',
+                                    title: group.name,
+                                    x: 0,
+                                    y: 0,
+                                    width: 100,
+                                    height: 100,
+                                    zIndex: elements.length + 1,
+                                    startTime: maxEnd,
+                                    duration: maxDuration || 5,
+                                    trackId: dropTrackId || 'track-0',
+                                    animations: [],
+                                    isStructureExpanded: false,
+                                };
+
+                                setElements(prev => [...prev, structureElement]);
+                                showToast(`Imported structure "${picked.name}"`, "success");
+                                return;
+            }
+        }
 
         // --- Drop collection onto canvas ---
         if (String(active.id).startsWith("collection-") && isPointerOverCanvas(event)) {
@@ -1867,7 +2107,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         }
     };
 
-    const selectedElement = elements.find(e => e.elementId === selectedElementId);
+    const selectedElement = flattenedElements.find(e => e.elementId === selectedElementId);
 
     // Get the effective element with variant overrides merged in
     const getEffectiveElement = (el: CanvasElement, variantId: string): CanvasElement => {
@@ -1897,12 +2137,118 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 if (Object.keys(finalUpdates).length === 0) return;
             }
         }
-        setElements(prev => prev.map(el => el.elementId === selectedElementId ? applyToElement(el, finalUpdates, selectedVariantMode) : el));
+        
+        if (selectedElement?.parentStructureId) {
+            const [structId, childId] = selectedElementId.split('_');
+            const parentEl = elements.find(e => e.elementId === structId);
+            if (parentEl) {
+                setStructuralGroups(prev => prev.map(group => {
+                    if (group.id === parentEl.collectionId) {
+                        return {
+                            ...group,
+                            structures: group.structures.map(structure => ({
+                                ...structure,
+                                elements: structure.elements.map(child => {
+                                    if (child.id === childId) {
+                                        const childUpdates = { ...finalUpdates } as any;
+                                        if (childUpdates.startTime !== undefined) {
+                                            childUpdates.relativeStart = childUpdates.startTime - parentEl.startTime;
+                                            delete childUpdates.startTime;
+                                        }
+                                        return { ...child, ...childUpdates };
+                                    }
+                                    return child;
+                                })
+                            }))
+                        };
+                    }
+                    return group;
+                }));
+            }
+        } else {
+            setElements(prev => prev.map(el => el.elementId === selectedElementId ? applyToElement(el, finalUpdates, selectedVariantMode) : el));
+        }
     };
 
     const removeSelected = () => {
         if (!selectedElementId) return;
-        setElements(prev => prev.filter(el => el.elementId !== selectedElementId));
+        const removedId = selectedElementId;
+        
+        const idsToRemove = new Set<string>([removedId]);
+        const selectedEl = elements.find(el => el.elementId === removedId);
+        if (selectedEl?.collectionType === 'structure') {
+            elements.filter(el => el.parentStructureId === removedId).forEach(el => idsToRemove.add(el.elementId));
+        }
+
+        setElements(prev => prev
+            .filter(el => !idsToRemove.has(el.elementId))
+            .map(el => {
+                const cleanLinks = <T extends Partial<CanvasElement>>(obj: T): { changed: boolean, cleaned: T } => {
+                    let c = false;
+                    let result = { ...obj };
+                    
+                    if (result.syncWith?.targetId && idsToRemove.has(result.syncWith.targetId)) {
+                        result.syncWith = null;
+                        c = true;
+                    }
+
+                    if (result.matchDurationWithId && idsToRemove.has(result.matchDurationWithId)) {
+                        result.matchDurationWithId = undefined;
+                        c = true;
+                    }
+
+                    if (result.matchDurationWithIds && result.matchDurationWithIds.some(id => idsToRemove.has(id))) {
+                        const newIds = result.matchDurationWithIds.filter(id => !idsToRemove.has(id));
+                        const newOffsets = { ...(result.matchDurationOffsets || {}) };
+                        idsToRemove.forEach(id => delete newOffsets[id]);
+                        result.matchDurationWithIds = newIds;
+                        result.matchDurationOffsets = newOffsets;
+                        c = true;
+                    } else if (result.matchDurationOffsets) {
+                        let hasStale = false;
+                        const newOffsets = { ...result.matchDurationOffsets };
+                        idsToRemove.forEach(id => {
+                            if (newOffsets[id] !== undefined) {
+                                delete newOffsets[id];
+                                hasStale = true;
+                            }
+                        });
+                        if (hasStale) {
+                            result.matchDurationOffsets = newOffsets;
+                            c = true;
+                        }
+                    }
+                    return { changed: c, cleaned: result };
+                };
+
+                let updated = { ...el };
+                let changed = false;
+
+                const baseRes = cleanLinks(el);
+                if (baseRes.changed) {
+                    updated = { ...updated, ...baseRes.cleaned };
+                    changed = true;
+                }
+
+                if (updated.variantOverrides) {
+                    let overridesChanged = false;
+                    const newOverrides = { ...updated.variantOverrides };
+                    for (const mode in newOverrides) {
+                        const modeRes = cleanLinks(newOverrides[mode]);
+                        if (modeRes.changed) {
+                            newOverrides[mode] = modeRes.cleaned;
+                            overridesChanged = true;
+                        }
+                    }
+                    if (overridesChanged) {
+                        updated.variantOverrides = newOverrides;
+                        changed = true;
+                    }
+                }
+
+                return changed ? updated as CanvasElement : el;
+            })
+        );
         setSelectedElementId(null);
     };
 
@@ -1910,8 +2256,9 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     const buildRenderJob = useCallback(() => {
         const [rw, rh] = exportSettings.resolution.split('x').map(Number);
 
-        const renderEls: RenderElement[] = elements
+        const renderEls: RenderElement[] = flattenedElements
             .filter(el => {
+                if (el.collectionType === 'structure') return false;
                 const chosenVariant = previewVariants[el.elementId];
                 const effectiveEl = getEffectiveElement(el, chosenVariant?.id || 'all');
                 return effectiveEl.visible !== false;
@@ -1950,13 +2297,14 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             if (isMedia && el.randomizeWindow) {
                 const fullMediaDur = chosenVariant?.duration ?? col?.items[0]?.duration;
                 if (fullMediaDur && fullMediaDur > duration) {
-                    mediaOffset = mulberry32(hashString(`${variantSeed}-${el.elementId}-window`))() * (fullMediaDur - duration);
+                    const localSeed = variantSeed + (el.seedOffset || 0);
+                    mediaOffset = mulberry32(hashString(`${localSeed}-${el.elementId}-window`))() * (fullMediaDur - duration);
                 }
             }
 
             return {
                 elementId: el.elementId,
-                collectionType: el.collectionType,
+                collectionType: el.collectionType as "text" | "image" | "video" | "audio",
                 startTime,
                 duration,
                 x: el.x,         // already 0–100 percent of canvas
@@ -2011,17 +2359,17 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             videoBitsPerSecond: exportSettings.bitrate * 1_000_000,
             format: exportSettings.format,
         };
-    }, [elements, collections, previewVariants, elementTimings, exportSettings, TOTAL_DURATION]);
+    }, [flattenedElements, collections, previewVariants, elementTimings, exportSettings, TOTAL_DURATION]);
 
     const queueCurrentVariant = useCallback(() => {
         const job = buildRenderJob();
-        const currentUsedVariantIds = elements.map(el => activeVariantModes[el.elementId]).filter(id => id !== 'all') as string[];
+        const currentUsedVariantIds = flattenedElements.map(el => activeVariantModes[el.elementId]).filter(id => id !== 'all') as string[];
         setRenderQueue(prev => [...prev, { id: `job-${Date.now()}`, name: `Variant ${prev.length + 1} (Seed ${variantSeed})`, job, usedVariantIds: currentUsedVariantIds }]);
         showToast("Variant added to render queue", "success");
-    }, [buildRenderJob, variantSeed, elements, activeVariantModes]);
+    }, [buildRenderJob, variantSeed, flattenedElements, activeVariantModes]);
 
     const startRender = useCallback(async () => {
-        const currentUsedVariantIds = elements.map(el => activeVariantModes[el.elementId]).filter(id => id !== 'all') as string[];
+        const currentUsedVariantIds = flattenedElements.map(el => activeVariantModes[el.elementId]).filter(id => id !== 'all') as string[];
         const jobsToRender = renderQueue.length > 0 ? renderQueue : [{ id: 'current', name: 'Current View', job: buildRenderJob(), usedVariantIds: currentUsedVariantIds }];
         
         const abortCtrl = new AbortController();
@@ -2074,6 +2422,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 elements: elements,
                 tracks: overrides?.tracks || tracks,
                 collections: collections,
+                structuralGroups: structuralGroups,
             };
             const endpoint = compositionId ? `/api/compositions/${compositionId}` : '/api/compositions';
             const method = compositionId ? 'PUT' : 'POST';
@@ -2194,81 +2543,38 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 <main className="flex-1 flex overflow-hidden">
 
                     <aside className="w-72 border-r border-white/5 flex flex-col bg-[#0a0a0a] shrink-0">
-                        <div className="px-5 py-4 border-b border-white/5 flex items-center justify-between">
-                            <h2 className="text-[10px] font-bold uppercase tracking-widest text-gray-500 font-mono">Collections</h2>
-                            <button
-                                onClick={() => setIsCreatingCollection(!isCreatingCollection)}
-                                className="text-gray-500 hover:text-gray-300 transition-colors"
-                            >
-                                <Plus className="w-4 h-4" />
+                        {/* Tab Bar */}
+                        <div className="px-3 pt-3 pb-0 border-b border-white/5 flex items-center gap-0">
+                            <button onClick={() => setSidebarTab('collections')} className={cn("flex-1 py-2 text-[9px] font-bold uppercase tracking-widest font-mono transition-all border-b-2", sidebarTab === 'collections' ? "text-white border-white" : "text-gray-600 border-transparent hover:text-gray-400")}>
+                                <Layers className="w-3 h-3 inline mr-1 -mt-0.5" />Collections
+                            </button>
+                            <button onClick={() => setSidebarTab('structures')} className={cn("flex-1 py-2 text-[9px] font-bold uppercase tracking-widest font-mono transition-all border-b-2", sidebarTab === 'structures' ? "text-white border-white" : "text-gray-600 border-transparent hover:text-gray-400")}>
+                                <Boxes className="w-3 h-3 inline mr-1 -mt-0.5" />Structures
                             </button>
                         </div>
 
-                        {/* New Collection Form */}
+                        {/* === Collections Tab === */}
+                        {sidebarTab === 'collections' && (<>
+                        <div className="px-5 py-3 border-b border-white/5 flex items-center justify-between">
+                            <h2 className="text-[10px] font-bold uppercase tracking-widest text-gray-500 font-mono">Collections</h2>
+                            <button onClick={() => setIsCreatingCollection(!isCreatingCollection)} className="text-gray-500 hover:text-gray-300 transition-colors"><Plus className="w-4 h-4" /></button>
+                        </div>
                         <AnimatePresence>
                             {isCreatingCollection && (
-                                <motion.div
-                                    initial={{ height: 0, opacity: 0 }}
-                                    animate={{ height: "auto", opacity: 1 }}
-                                    exit={{ height: 0, opacity: 0 }}
-                                    className="overflow-hidden border-b border-white/5"
-                                >
+                                <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="overflow-hidden border-b border-white/5">
                                     <div className="p-3 space-y-2">
-                                        <input
-                                            value={newCollectionTitle}
-                                            onChange={(e) => setNewCollectionTitle(e.target.value)}
-                                            placeholder="Collection name..."
-                                            className="w-full text-[11px] font-mono bg-black/40 border border-white/10 rounded px-2.5 py-2 text-gray-300 placeholder:text-gray-600 outline-none focus:border-white/20"
-                                        />
+                                        <input value={newCollectionTitle} onChange={(e) => setNewCollectionTitle(e.target.value)} placeholder="Collection name..." className="w-full text-[11px] font-mono bg-black/40 border border-white/10 rounded px-2.5 py-2 text-gray-300 placeholder:text-gray-600 outline-none focus:border-white/20" />
                                         <div className="grid grid-cols-4 gap-1">
-                                            {(["text", "image", "video", "audio"] as CollectionType[]).map(t => {
-                                                const c = COLLECTION_COLORS[t];
-                                                return (
-                                                    <button
-                                                        key={t}
-                                                        onClick={() => setNewCollectionType(t)}
-                                                        className={cn(
-                                                            "text-[9px] font-mono py-1.5 rounded border transition-all capitalize",
-                                                            newCollectionType === t
-                                                                ? `${c.bg} ${c.border} ${c.text}`
-                                                                : "border-white/5 text-gray-500 hover:border-white/10"
-                                                        )}
-                                                    >
-                                                        {t}
-                                                    </button>
-                                                );
-                                            })}
+                                            {(["text", "image", "video", "audio"] as CollectionType[]).map(t => { const c = COLLECTION_COLORS[t]; return (<button key={t} onClick={() => setNewCollectionType(t)} className={cn("text-[9px] font-mono py-1.5 rounded border transition-all capitalize", newCollectionType === t ? `${c.bg} ${c.border} ${c.text}` : "border-white/5 text-gray-500 hover:border-white/10")}>{t}</button>); })}
                                         </div>
                                         <div className="flex gap-1.5">
-                                            <button
-                                                onClick={() => {
-                                                    if (!newCollectionTitle.trim()) return;
-                                                    const newCol: CollectionItem = {
-                                                        id: `col-${Date.now()}`,
-                                                        title: newCollectionTitle.trim(),
-                                                        type: newCollectionType,
-                                                        items: [],
-                                                    };
-                                                    setCollections(prev => [...prev, newCol]);
-                                                    setNewCollectionTitle("");
-                                                    setIsCreatingCollection(false);
-                                                }}
-                                                className="flex-1 text-[10px] font-mono py-1.5 bg-white/10 hover:bg-white/15 text-gray-300 rounded transition-colors"
-                                            >
-                                                Create
-                                            </button>
-                                            <button
-                                                onClick={() => { setIsCreatingCollection(false); setNewCollectionTitle(""); }}
-                                                className="flex-1 text-[10px] font-mono py-1.5 bg-white/5 hover:bg-white/10 text-gray-500 rounded transition-colors"
-                                            >
-                                                Cancel
-                                            </button>
+                                            <button onClick={() => { if (!newCollectionTitle.trim()) return; setCollections(prev => [...prev, { id: `col-${Date.now()}`, title: newCollectionTitle.trim(), type: newCollectionType, items: [] }]); setNewCollectionTitle(""); setIsCreatingCollection(false); }} className="flex-1 text-[10px] font-mono py-1.5 bg-white/10 hover:bg-white/15 text-gray-300 rounded transition-colors">Create</button>
+                                            <button onClick={() => { setIsCreatingCollection(false); setNewCollectionTitle(""); }} className="flex-1 text-[10px] font-mono py-1.5 bg-white/5 hover:bg-white/10 text-gray-500 rounded transition-colors">Cancel</button>
                                         </div>
                                     </div>
                                 </motion.div>
                             )}
                         </AnimatePresence>
-
                         <div className="flex-1 overflow-y-auto p-3 space-y-2 custom-scrollbar">
                             {collections.map(col => (
                                 <CollectionCard
@@ -2300,6 +2606,124 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                 />
                             ))}
                         </div>
+                        </>)}
+
+                        {/* === Structures Tab === */}
+                        {sidebarTab === 'structures' && (<>
+                        <div className="px-5 py-3 border-b border-white/5 flex items-center justify-between">
+                            <h2 className="text-[10px] font-bold uppercase tracking-widest text-gray-500 font-mono">Structural Groups</h2>
+                            <button onClick={() => setIsCreatingGroup(!isCreatingGroup)} className="text-gray-500 hover:text-gray-300 transition-colors"><Plus className="w-4 h-4" /></button>
+                        </div>
+
+                        {/* New Group Form */}
+                        <AnimatePresence>
+                            {isCreatingGroup && (
+                                <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="overflow-hidden border-b border-white/5">
+                                    <div className="p-3 space-y-2">
+                                        <input value={newGroupName} onChange={e => setNewGroupName(e.target.value)} placeholder="Group name..." className="w-full text-[11px] font-mono bg-black/40 border border-white/10 rounded px-2.5 py-2 text-gray-300 placeholder:text-gray-600 outline-none focus:border-white/20" />
+                                        <div className="flex gap-1.5">
+                                            <button onClick={() => { if (!newGroupName.trim()) return; setStructuralGroups(prev => [...prev, { id: `sg-${Date.now()}`, name: newGroupName.trim(), structures: [] }]); setNewGroupName(""); setIsCreatingGroup(false); }} className="flex-1 text-[10px] font-mono py-1.5 bg-white/10 hover:bg-white/15 text-gray-300 rounded transition-colors">Create</button>
+                                            <button onClick={() => { setIsCreatingGroup(false); setNewGroupName(""); }} className="flex-1 text-[10px] font-mono py-1.5 bg-white/5 hover:bg-white/10 text-gray-500 rounded transition-colors">Cancel</button>
+                                        </div>
+                                    </div>
+                                </motion.div>
+                            )}
+                        </AnimatePresence>
+
+                        <div className="flex-1 overflow-y-auto p-3 space-y-3 custom-scrollbar">
+                            {structuralGroups.length === 0 && (
+                                <div className="text-center py-8 text-gray-600">
+                                    <Boxes className="w-8 h-8 mx-auto mb-2 opacity-30" />
+                                    <p className="text-[10px] font-mono">No structural groups yet</p>
+                                    <p className="text-[8px] font-mono text-gray-700 mt-1">Create a group, add structure variants, then drag to timeline</p>
+                                </div>
+                            )}
+
+                            {structuralGroups.map(group => (
+                                <div key={group.id} className="rounded-lg border border-white/5 bg-white/[0.02] overflow-hidden">
+                                    {/* Group Header — draggable */}
+                                    <DraggableStructGroupCard group={group} onDelete={() => setStructuralGroups(prev => prev.filter(g => g.id !== group.id))} onAddStructure={() => {
+                                        const newStruct: Structure = { id: `st-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`, name: `Variant ${group.structures.length + 1}`, elements: [] };
+                                        setStructuralGroups(prev => prev.map(g => g.id === group.id ? { ...g, structures: [...g.structures, newStruct] } : g));
+                                    }} />
+
+                                    {/* Structure Variants */}
+                                    {group.structures.map(struct => (
+                                        <div key={struct.id} className="border-t border-white/5">
+                                            <div className="flex items-center justify-between px-3 py-1.5 bg-white/[0.01]">
+                                                <button onClick={() => setEditingStructureId(editingStructureId === struct.id ? null : struct.id)} className="flex items-center gap-1.5 text-[9px] font-mono text-gray-400 hover:text-white transition-colors">
+                                                    <ChevronDown className={cn("w-3 h-3 transition-transform", editingStructureId === struct.id && "rotate-180")} />
+                                                    {struct.name}
+                                                    <span className="text-gray-600">({struct.elements.length})</span>
+                                                </button>
+                                                <div className="flex items-center gap-1">
+                                                    <button onClick={() => {
+                                                        const newName = prompt("Rename structure:", struct.name);
+                                                        if (newName?.trim()) setStructuralGroups(prev => prev.map(g => g.id === group.id ? { ...g, structures: g.structures.map(s => s.id === struct.id ? { ...s, name: newName.trim() } : s) } : g));
+                                                    }} className="text-gray-600 hover:text-gray-300 transition-colors p-0.5"><Settings className="w-2.5 h-2.5" /></button>
+                                                    <button onClick={() => setStructuralGroups(prev => prev.map(g => g.id === group.id ? { ...g, structures: g.structures.filter(s => s.id !== struct.id) } : g))} className="text-gray-600 hover:text-red-400 transition-colors p-0.5"><Trash2 className="w-2.5 h-2.5" /></button>
+                                                </div>
+                                            </div>
+
+                                            {/* Structure Mini-Timeline Editor */}
+                                            <AnimatePresence>
+                                                {editingStructureId === struct.id && (
+                                                    <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="overflow-hidden">
+                                                        <div className="px-3 py-2 space-y-1.5 bg-black/30">
+                                                            {/* Existing structure elements */}
+                                                            {struct.elements.length === 0 && (
+                                                                <p className="text-[8px] font-mono text-gray-600 text-center py-2">No elements — add from collections below</p>
+                                                            )}
+                                                            {struct.elements.map((se, idx) => {
+                                                                const col = collections.find(c => c.id === se.collectionId);
+                                                                const colors = COLLECTION_COLORS[col?.type || 'text'];
+                                                                return (
+                                                                    <div key={se.id} className={cn("flex items-center gap-2 px-2 py-1.5 rounded border text-[9px] font-mono", colors.border, colors.bg)}>
+                                                                        <span className={cn("truncate flex-1", colors.text)}>{col?.title || '?'}</span>
+                                                                        <span className="text-gray-500">T{se.trackOffset}</span>
+                                                                        <span className="text-gray-500">{se.relativeStart.toFixed(1)}s</span>
+                                                                        <span className="text-gray-500">{se.duration.toFixed(1)}s</span>
+                                                                        <button onClick={() => setStructuralGroups(prev => prev.map(g => g.id === group.id ? { ...g, structures: g.structures.map(s => s.id === struct.id ? { ...s, elements: s.elements.filter(e => e.id !== se.id) } : s) } : g))} className="text-gray-600 hover:text-red-400"><X className="w-2.5 h-2.5" /></button>
+                                                                    </div>
+                                                                );
+                                                            })}
+
+                                                            {/* Add element picker */}
+                                                            <div className="pt-1 border-t border-white/5">
+                                                                <select
+                                                                    defaultValue=""
+                                                                    onChange={e => {
+                                                                        if (!e.target.value) return;
+                                                                        const col = collections.find(c => c.id === e.target.value);
+                                                                        if (!col) return;
+                                                                        const lastEnd = struct.elements.reduce((max, el) => Math.max(max, el.relativeStart + el.duration), 0);
+                                                                        const newSE: StructureElement = {
+                                                                            id: `se-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+                                                                            collectionId: col.id,
+                                                                            trackOffset: 0,
+                                                                            relativeStart: lastEnd,
+                                                                            duration: col.type === 'text' ? 3 : col.type === 'image' ? 4 : 5,
+                                                                            x: 10, y: 10, width: 80, height: 80,
+                                                                        };
+                                                                        setStructuralGroups(prev => prev.map(g => g.id === group.id ? { ...g, structures: g.structures.map(s => s.id === struct.id ? { ...s, elements: [...s.elements, newSE] } : s) } : g));
+                                                                        e.target.value = "";
+                                                                    }}
+                                                                    className="w-full text-[9px] font-mono bg-black/50 border border-white/10 rounded px-2 py-1.5 text-gray-400 outline-none"
+                                                                >
+                                                                    <option value="">+ Add collection...</option>
+                                                                    {collections.map(c => <option key={c.id} value={c.id}>{c.title} ({c.type})</option>)}
+                                                                </select>
+                                                            </div>
+                                                        </div>
+                                                    </motion.div>
+                                                )}
+                                            </AnimatePresence>
+                                        </div>
+                                    ))}
+                                </div>
+                            ))}
+                        </div>
+                        </>)}
                     </aside>
 
                     {/* Center Area */}
@@ -2352,7 +2776,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                     )}
                                                 </AnimatePresence>
                                                 <div className="absolute inset-0 opacity-[0.06] pointer-events-none" style={{ backgroundImage: 'linear-gradient(rgba(255,255,255,0.3) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.3) 1px, transparent 1px)', backgroundSize: '10% 10%' }} />
-                                                {elements.filter(el => el.elementId !== selectedElementId)
+                                                {flattenedElements.filter(el => el.elementId !== selectedElementId && el.collectionType !== 'structure')
                                                     .filter(baseEl => {
                                                         const elMode = getVariantMode(baseEl.elementId);
                                                         const rawEl = elMode !== 'all' ? getEffectiveElement(baseEl, elMode) : baseEl;
@@ -2404,7 +2828,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                     />
                                                 );
                                             })()}
-                                            {elements.length === 0 && (
+                                            {flattenedElements.filter(e => e.collectionType !== 'structure').length === 0 && (
                                                 <div className="absolute inset-0 flex flex-col items-center justify-center text-gray-600 pointer-events-none">
                                                     <Plus className="w-8 h-8 mb-3 opacity-30" />
                                                     <p className="text-xs font-mono tracking-wide">Drag assets here</p>
@@ -2524,8 +2948,9 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                             if (!videoEl) return;
                                                                             const rawDur = (videoEl.duration && !isNaN(videoEl.duration)) ? videoEl.duration : Infinity;
                                                                             // Randomize window: pick a seeded-random start within the full media, preserving clip duration
+                                                                            const localSeed = variantSeed + (el.seedOffset || 0);
                                                                             const baseOffset = el.randomizeWindow && rawDur !== Infinity
-                                                                                ? mulberry32(hashString(`${variantSeed}-${el.elementId}-window`))() * Math.max(0, rawDur - el.duration)
+                                                                                ? mulberry32(hashString(`${localSeed}-${el.elementId}-window`))() * Math.max(0, rawDur - el.duration)
                                                                                 : (el.mediaOffset ?? 0);
                                                                             const localTime = Math.max(0, currentTime - el.startTime) + baseOffset;
                                                                             let safeLocalTime = rawDur !== Infinity ? (localTime % rawDur) : localTime;
@@ -2572,8 +2997,9 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                     ref={(audioEl) => {
                                                                         if (!audioEl) return;
                                                                         const rawDur = (audioEl.duration && !isNaN(audioEl.duration)) ? audioEl.duration : Infinity;
+                                                                        const localSeed = variantSeed + (el.seedOffset || 0);
                                                                         const baseOffset = el.randomizeWindow && rawDur !== Infinity
-                                                                            ? mulberry32(hashString(`${variantSeed}-${el.elementId}-window`))() * Math.max(0, rawDur - el.duration)
+                                                                            ? mulberry32(hashString(`${localSeed}-${el.elementId}-window`))() * Math.max(0, rawDur - el.duration)
                                                                             : (el.mediaOffset ?? 0);
                                                                         const localTime = Math.max(0, currentTime - el.startTime) + baseOffset;
                                                                         const safeLocalTime = rawDur !== Infinity ? (localTime % rawDur) : localTime;
@@ -2626,8 +3052,9 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                             ref={(audioEl) => {
                                                                 if (!audioEl) return;
                                                                 const rawDur = (audioEl.duration && !isNaN(audioEl.duration)) ? audioEl.duration : Infinity;
+                                                                const localSeed = variantSeed + (el.seedOffset || 0);
                                                                 const baseOffset = el.randomizeWindow && rawDur !== Infinity
-                                                                    ? mulberry32(hashString(`${variantSeed}-${el.elementId}-window`))() * Math.max(0, rawDur - el.duration)
+                                                                    ? mulberry32(hashString(`${localSeed}-${el.elementId}-window`))() * Math.max(0, rawDur - el.duration)
                                                                     : (el.mediaOffset ?? 0);
                                                                 const localTime = Math.max(0, currentTime - el.startTime) + baseOffset;
                                                                 const safeLocalTime = rawDur !== Infinity ? (localTime % rawDur) : localTime;
@@ -2984,14 +3411,33 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                         )}
 
                                                                         {tracks.map((track) => {
-                                                                            const trackElements = elements.filter(el => (el.trackId || 'track-0') === track.id);
+                                                                            const trackElements = flattenedElements.filter(el => {
+                                                                                if ((el.trackId || 'track-0') !== track.id) return false;
+                                                                                if (el.parentStructureId) {
+                                                                                    const parent = elements.find(p => p.elementId === el.parentStructureId);
+                                                                                    return parent?.isStructureExpanded;
+                                                                                }
+                                                                                return true;
+                                                                            });
+                                                                            let maxTrackOffset = 0;
+                                                                            for (const el of trackElements) {
+                                                                                if (el.parentStructureId) {
+                                                                                    const offset = el.trackOffset || 0;
+                                                                                    if (offset > maxTrackOffset) maxTrackOffset = offset;
+                                                                                }
+                                                                            }
+                                                                            
+                                                                            const numRows = maxTrackOffset + 1;
+                                                                            const trackHeight = 8 + (numRows * 32) + ((numRows - 1) * 2);
+
                                                                             return (
-                                                                                <div key={track.id} data-track-id={track.id} className="relative h-10 px-1 w-full bg-white/5 rounded border border-white/5 shrink-0 flex items-center track-row">
-                                                                                    <div className="relative h-8 w-full bg-black/50 rounded overflow-hidden">
+                                                                                <div key={track.id} data-track-id={track.id} className="relative px-1 w-full bg-white/5 rounded border border-white/5 shrink-0 flex items-center track-row transition-all" style={{ height: `${trackHeight}px` }}>
+                                                                                    <div className="relative w-full bg-black/50 rounded overflow-hidden transition-all" style={{ height: 'calc(100% - 8px)' }}>
                                                                                     {trackElements.sort((a, b) => b.zIndex - a.zIndex).map((el, i) => {
                                                                                         const TOTAL = TOTAL_DURATION;
 
                                                                                         const isMediaEl = el.collectionType === 'video' || el.collectionType === 'audio';
+                                                                                        const isStructure = el.collectionType === 'structure';
                                                                                         const activeVariantMode = getVariantMode(el.elementId);
                                                                                         const isMediaAllMode = isMediaEl && activeVariantMode === 'all';
 
@@ -3023,12 +3469,16 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                                             const origStart = resolvedTiming.startTime;
                                                                                             const dur = resolvedTiming.duration;
                                                                                             const varMode = getVariantMode(el.elementId);
+                                                                                            const origStarts = new Map(elements.map(x => {
+                                                                                                const tm = elementTimings.get(x.elementId) || { startTime: x.startTime };
+                                                                                                return [x.elementId, tm.startTime];
+                                                                                            }));
 
                                                                                             // Precalculate gaps for all tracks at drag start
                                                                                             const gapsByTrack: Record<string, {start: number, end: number}[]> = {};
                                                                                             for (const t of tracks) {
                                                                                                 const occupied = elements
-                                                                                                    .filter(o => o.elementId !== el.elementId && (o.trackId || 'track-0') === t.id)
+                                                                                                    .filter(o => o.elementId !== el.elementId && o.parentStructureId !== el.elementId && (o.trackId || 'track-0') === t.id)
                                                                                                     .map(o => {
                                                                                                         const tm = elementTimings.get(o.elementId) || { startTime: o.startTime, duration: o.duration };
                                                                                                         return { start: tm.startTime, end: tm.startTime + tm.duration };
@@ -3059,6 +3509,15 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                                                 id: tel.getAttribute('data-track-id')!,
                                                                                                 rect: tel.getBoundingClientRect()
                                                                                             }));
+
+                                                                                            const allStructElements = Array.from(document.querySelectorAll('[data-structure-id]')) as HTMLElement[];
+                                                                                            const structBounds = allStructElements.map(sel => ({
+                                                                                                id: sel.getAttribute('data-structure-id')!,
+                                                                                                rect: sel.getBoundingClientRect()
+                                                                                            }));
+
+                                                                                            let currentHoveredStructureId: string | null = null;
+                                                                                            let currentSafeStart = origStart;
 
                                                                                             let currentHoveredTrackId = el.trackId || 'track-0';
                                                                                             const initialGaps = gapsByTrack[currentHoveredTrackId] || [{ start: 0, end: TOTAL }];
@@ -3109,15 +3568,102 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                                                 }
 
                                                                                                 const varMode = getVariantMode(el.elementId);
-                                                                                                setElements(prev => prev.map(x => 
-                                                                                                    x.elementId === el.elementId 
-                                                                                                        ? applyToElement({ ...x, trackId: hoveredTrackId }, { startTime: Math.round(safeStart * 1000) / 1000 }, varMode) 
-                                                                                                        : x
-                                                                                                ));
+                                                                                                const timeDelta = safeStart - origStart;
+                                                                                                currentSafeStart = safeStart;
+
+                                                                                                let hoveredStructureId: string | null = null;
+                                                                                                if (!el.parentStructureId && el.collectionType !== 'structure') {
+                                                                                                    for (const sb of structBounds) {
+                                                                                                        if (sb.id !== el.elementId && ev.clientY >= sb.rect.top && ev.clientY <= sb.rect.bottom && ev.clientX >= sb.rect.left && ev.clientX <= sb.rect.right) {
+                                                                                                            hoveredStructureId = sb.id;
+                                                                                                            break;
+                                                                                                        }
+                                                                                                    }
+                                                                                                }
+                                                                                                currentHoveredStructureId = hoveredStructureId;
+
+                                                                                                allStructElements.forEach(sel => {
+                                                                                                    if (sel.getAttribute('data-structure-id') === hoveredStructureId) {
+                                                                                                        sel.style.boxShadow = '0 0 0 2px #3b82f6';
+                                                                                                    } else {
+                                                                                                        sel.style.boxShadow = '';
+                                                                                                    }
+                                                                                                });
+
+                                                                                                if (el.parentStructureId) {
+                                                                                                    const [structId, childId] = el.elementId.split('_');
+                                                                                                    const parentEl = elements.find(e => e.elementId === structId);
+                                                                                                    if (parentEl) {
+                                                                                                        setStructuralGroups(prev => prev.map(group => {
+                                                                                                            if (group.id === parentEl.collectionId) {
+                                                                                                                return {
+                                                                                                                    ...group,
+                                                                                                                    structures: group.structures.map(structure => ({
+                                                                                                                        ...structure,
+                                                                                                                        elements: structure.elements.map(child => {
+                                                                                                                            if (child.id === childId) {
+                                                                                                                                const parentTiming = elementTimings.get(structId);
+                                                                                                                                const pStart = parentTiming ? parentTiming.startTime : parentEl.startTime;
+                                                                                                                                const newTrackOffset = tracks.findIndex(t => t.id === hoveredTrackId) - tracks.findIndex(t => t.id === (parentEl.trackId || 'track-0'));
+                                                                                                                                return {
+                                                                                                                                    ...child,
+                                                                                                                                    relativeStart: Math.round((safeStart - pStart) * 1000) / 1000,
+                                                                                                                                    trackOffset: newTrackOffset
+                                                                                                                                };
+                                                                                                                            }
+                                                                                                                            return child;
+                                                                                                                        })
+                                                                                                                    }))
+                                                                                                                };
+                                                                                                            }
+                                                                                                            return group;
+                                                                                                        }));
+                                                                                                    }
+                                                                                                } else {
+                                                                                                    setElements(prev => prev.map(x => {
+                                                                                                        if (x.elementId === el.elementId) {
+                                                                                                            return applyToElement({ ...x, trackId: hoveredTrackId }, { startTime: Math.round(safeStart * 1000) / 1000 }, varMode);
+                                                                                                        }
+                                                                                                        return x;
+                                                                                                    }));
+                                                                                                }
                                                                                             };
                                                                                             const onUp = () => {
                                                                                                 window.removeEventListener('pointermove', onMove);
                                                                                                 window.removeEventListener('pointerup', onUp);
+
+                                                                                                allStructElements.forEach(sel => { sel.style.boxShadow = ''; });
+
+                                                                                                if (currentHoveredStructureId && !el.parentStructureId) {
+                                                                                                    const targetStructureId = currentHoveredStructureId;
+                                                                                                    const parentEl = elements.find(e => e.elementId === targetStructureId);
+                                                                                                    if (parentEl) {
+                                                                                                        const parentTiming = elementTimings.get(targetStructureId);
+                                                                                                        const pStart = parentTiming ? parentTiming.startTime : parentEl.startTime;
+                                                                                                        const newTrackOffset = tracks.findIndex(t => t.id === currentHoveredTrackId) - tracks.findIndex(t => t.id === (parentEl.trackId || 'track-0'));
+                                                                                                        
+                                                                                                        setStructuralGroups(prev => prev.map(group => {
+                                                                                                            if (group.id === parentEl.collectionId) {
+                                                                                                                return {
+                                                                                                                    ...group,
+                                                                                                                    structures: group.structures.map(struct => ({
+                                                                                                                        ...struct,
+                                                                                                                        elements: [...struct.elements, {
+                                                                                                                            id: el.elementId,
+                                                                                                                            collectionId: el.collectionId,
+                                                                                                                            relativeStart: Math.round((currentSafeStart - pStart) * 1000) / 1000,
+                                                                                                                            relativeDuration: el.duration,
+                                                                                                                            trackOffset: newTrackOffset
+                                                                                                                        }]
+                                                                                                                    }))
+                                                                                                                };
+                                                                                                            }
+                                                                                                            return group;
+                                                                                                        }));
+
+                                                                                                        setElements(prev => prev.filter(x => x.elementId !== el.elementId));
+                                                                                                    }
+                                                                                                }
                                                                                             };
                                                                                             window.addEventListener('pointermove', onMove);
                                                                                             window.addEventListener('pointerup', onUp);
@@ -3195,7 +3741,37 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                                                         const startDelta = newStart - origStart;
                                                                                                         updates.mediaOffset = Math.max(0, Math.round(((effectiveEl.mediaOffset ?? 0) + startDelta) * 1000) / 1000);
                                                                                                     }
-                                                                                                    setElements(prev => prev.map(x => x.elementId === el.elementId ? applyToElement(x, updates, varMode) : x));
+                                                                                                    if (el.parentStructureId) {
+                                                                                                        const [structId, childId] = el.elementId.split('_');
+                                                                                                        const parentEl = elements.find(e => e.elementId === structId);
+                                                                                                        if (parentEl) {
+                                                                                                            setStructuralGroups(prev => prev.map(group => {
+                                                                                                                if (group.id === parentEl.collectionId) {
+                                                                                                                    return {
+                                                                                                                        ...group,
+                                                                                                                        structures: group.structures.map(structure => ({
+                                                                                                                            ...structure,
+                                                                                                                            elements: structure.elements.map(child => {
+                                                                                                                                if (child.id === childId) {
+                                                                                                                                    const parentTiming = elementTimings.get(structId);
+                                                                                                                                    const pStart = parentTiming ? parentTiming.startTime : parentEl.startTime;
+                                                                                                                                    return {
+                                                                                                                                        ...child,
+                                                                                                                                        ...updates,
+                                                                                                                                        relativeStart: Math.round((newStart - pStart) * 1000) / 1000
+                                                                                                                                    };
+                                                                                                                                }
+                                                                                                                                return child;
+                                                                                                                            })
+                                                                                                                        }))
+                                                                                                                    };
+                                                                                                                }
+                                                                                                                return group;
+                                                                                                            }));
+                                                                                                        }
+                                                                                                    } else {
+                                                                                                        setElements(prev => prev.map(x => x.elementId === el.elementId ? applyToElement(x, updates, varMode) : x));
+                                                                                                    }
                                                                                                 } else {
                                                                                                     let newDur = Math.max(0.5, Math.min(rightLimit - origStart, origDur + dTime));
                                                                                                     if (isMediaEl) {
@@ -3203,7 +3779,30 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                                                         newDur = Math.min(newDur, maxAllowedDur);
                                                                                                     }
                                                                                                     const varMode = getVariantMode(el.elementId);
-                                                                                                    setElements(prev => prev.map(x => x.elementId === el.elementId ? applyToElement(x, { duration: Math.round(newDur * 1000) / 1000 }, varMode) : x));
+                                                                                                    const updates: Partial<CanvasElement> = { duration: Math.round(newDur * 1000) / 1000 };
+                                                                                                    if (el.parentStructureId) {
+                                                                                                        const [structId, childId] = el.elementId.split('_');
+                                                                                                        const parentEl = elements.find(e => e.elementId === structId);
+                                                                                                        if (parentEl) {
+                                                                                                            setStructuralGroups(prev => prev.map(group => {
+                                                                                                                if (group.id === parentEl.collectionId) {
+                                                                                                                    return {
+                                                                                                                        ...group,
+                                                                                                                        structures: group.structures.map(structure => ({
+                                                                                                                            ...structure,
+                                                                                                                            elements: structure.elements.map(child => {
+                                                                                                                                if (child.id === childId) return { ...child, ...updates };
+                                                                                                                                return child;
+                                                                                                                            })
+                                                                                                                        }))
+                                                                                                                    };
+                                                                                                                }
+                                                                                                                return group;
+                                                                                                            }));
+                                                                                                        }
+                                                                                                    } else {
+                                                                                                        setElements(prev => prev.map(x => x.elementId === el.elementId ? applyToElement(x, updates, varMode) : x));
+                                                                                                    }
                                                                                                 }
                                                                                             };
                                                                                             const onUp = () => {
@@ -3222,19 +3821,23 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                                         const displayText = editingVariantStr ? `${el.title} [${editingVariantStr}]` : el.title;
 
                                                                                         return (
-                                                                                            <div key={el.elementId} className="track-element-clip absolute top-1 bottom-1 rounded overflow-hidden bg-black border border-white/10 shrink-0"
+                                                                                            <div key={el.elementId} data-structure-id={el.collectionType === 'structure' ? el.elementId : undefined} className="track-element-clip absolute rounded overflow-hidden bg-black shrink-0 transition-all"
                                                                                                 style={{
                                                                                                     left: `${(effectiveEl.startTime / TOTAL) * 100}%`,
                                                                                                     width: `${(effectiveEl.duration / TOTAL) * 100}%`,
-                                                                                                    zIndex: el.zIndex
+                                                                                                    top: el.parentStructureId ? `${(el.trackOffset || 0) * 34}px` : '0px',
+                                                                                                    height: el.parentStructureId ? '32px' : '100%',
+                                                                                                    zIndex: el.parentStructureId ? el.zIndex + 1 : el.zIndex
                                                                                                 }}>
                                                                                                 <div
                                                                                                     className={cn(
                                                                                                         "absolute inset-0 rounded flex items-center shrink-0 min-w-[20px] transition-colors",
                                                                                                         timelineTool === 'split' ? "" : "cursor-grab active:cursor-grabbing",
+                                                                                                        isStructure && el.isStructureExpanded ? "bg-white/10 border border-white/20 border-dashed" : (
                                                                                                         isMediaAllMode
                                                                                                             ? (selectedElementId === el.elementId ? 'bg-gray-600/60 border border-gray-400/50' : 'bg-gray-700/40 border border-transparent hover:bg-gray-600/40')
                                                                                                             : (selectedElementId === el.elementId ? 'bg-blue-600 border border-blue-400' : 'bg-blue-900 border border-transparent hover:bg-blue-800')
+                                                                                                        )
                                                                                                     )}
                                                                                                     style={{
                                                                                                         cursor: timelineTool === 'split' ? `url('data:image/svg+xml;utf8,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><line x1="20" y1="4" x2="8.12" y2="15.88"/><line x1="14.47" y1="14.48" x2="20" y2="20"/><line x1="8.12" y1="8.12" x2="12" y2="12"/></svg>')}') 12 12, crosshair` : undefined
@@ -3249,6 +3852,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                                                         e.stopPropagation();
                                                                                                         if (isMediaAllMode) setSelectedElementId(el.elementId);
                                                                                                         if (timelineTool === 'split') {
+                                                                                                            if (isStructure) return;
                                                                                                             const trackElement = e.currentTarget.parentElement?.parentElement;
                                                                                                             if (!trackElement) return;
                                                                                                             const trackRect = trackElement.getBoundingClientRect();
@@ -3261,6 +3865,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                                                     }}
                                                                                                     onPointerMove={(e) => {
                                                                                                         if (timelineTool === 'split') {
+                                                                                                            if (isStructure) return;
                                                                                                             const trackElement = e.currentTarget.parentElement?.parentElement;
                                                                                                             if (!trackElement) return;
                                                                                                             const trackRect = trackElement.getBoundingClientRect();
@@ -3279,7 +3884,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                                                         }
                                                                                                     }}
                                                                                                 >
-                                                                                                    {!isMediaAllMode && (
+                                                                                                    {!isMediaAllMode && !isStructure && (
                                                                                                         <div
                                                                                                             className={cn("absolute left-0 top-0 bottom-0 w-2 hover:bg-white/30 z-10", timelineTool === 'split' ? "pointer-events-none" : "cursor-ew-resize")}
                                                                                                             onPointerDown={(e) => {
@@ -3295,10 +3900,21 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                                                             segPxWidth={Math.round((effectiveEl.duration / TOTAL) * Math.max(100, TOTAL_DURATION * 20))}
                                                                                                         />
                                                                                                     )}
-                                                                                                    <span className="text-[9px] font-mono text-white/90 truncate px-2 select-none z-[1] pointer-events-none relative">
-                                                                                                        {isMediaAllMode ? `${displayText} ⬦` : displayText}
-                                                                                                    </span>
-                                                                                                    {!isMediaAllMode && (
+                                                                                                    <div className="text-[9px] font-mono text-white/90 truncate px-2 select-none z-[1] pointer-events-none relative flex items-center gap-1">
+                                                                                                        {isStructure && (
+                                                                                                            <button
+                                                                                                                className="p-0.5 hover:bg-white/20 rounded pointer-events-auto"
+                                                                                                                onClick={(e) => {
+                                                                                                                    e.stopPropagation();
+                                                                                                                    setElements(prev => prev.map(x => x.elementId === el.elementId ? { ...x, isStructureExpanded: !x.isStructureExpanded } : x));
+                                                                                                                }}
+                                                                                                            >
+                                                                                                                <ChevronRight className={cn("w-3 h-3 transition-transform", el.isStructureExpanded && "rotate-90")} />
+                                                                                                            </button>
+                                                                                                        )}
+                                                                                                        <span>{isMediaAllMode ? `${displayText} ⬦` : displayText}</span>
+                                                                                                    </div>
+                                                                                                    {!isMediaAllMode && !isStructure && (
                                                                                                         <div
                                                                                                             className={cn("absolute right-0 top-0 bottom-0 w-2 hover:bg-white/30 z-10", timelineTool === 'split' ? "pointer-events-none" : "cursor-ew-resize")}
                                                                                                             onPointerDown={(e) => {
@@ -3354,6 +3970,18 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                     {/* Header */}
                                     <div className="flex items-center justify-between pb-4 border-b border-white/5">
                                         <div>
+                                            {selectedElement.parentStructureId && (
+                                                <div className="flex items-center gap-1.5 mb-1.5">
+                                                    <button 
+                                                        onClick={() => setSelectedElementId(selectedElement.parentStructureId!)}
+                                                        className="text-[9px] uppercase text-purple-400 hover:text-purple-300 font-bold tracking-widest flex items-center gap-1 cursor-pointer transition-colors"
+                                                    >
+                                                        <Layers className="w-3 h-3" />
+                                                        PARENT STRUCTURE
+                                                    </button>
+                                                    <ChevronRight className="w-3 h-3 text-white/30" />
+                                                </div>
+                                            )}
                                             <span className="text-[9px] uppercase text-blue-400 font-bold tracking-widest">{selectedElement.collectionType}</span>
                                             <h3 className="text-white font-semibold text-sm mt-0.5">{selectedElement.title}</h3>
                                         </div>
@@ -3408,6 +4036,42 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
 
                                     {/* Universal Variant Selector */}
                                     {(() => {
+                                        if (selectedElement.collectionType === 'structure') {
+                                            const group = structuralGroups.find(g => g.id === selectedElement.collectionId);
+                                            const childCount = elements.filter(el => el.parentStructureId === selectedElement.elementId).length;
+                                            return (
+                                                <div className="space-y-4">
+                                                    <div className="bg-[#111] rounded-lg border border-dashed border-white/5 px-3 py-3">
+                                                        <div className="flex items-center justify-between">
+                                                            <span className="text-[10px] text-gray-400 font-mono">Contained Elements</span>
+                                                            <span className="text-xs font-bold text-white">{childCount}</span>
+                                                        </div>
+                                                    </div>
+                                                    
+                                                    <div className="pt-2 border-t border-white/5 space-y-3">
+                                                        <h5 className="text-[9px] font-bold uppercase tracking-widest text-gray-500 font-mono">
+                                                            Global Structure Actions
+                                                        </h5>
+                                                        
+                                                        <button 
+                                                            onClick={() => {
+                                                                setElements(prev => prev.map(el => {
+                                                                    if (el.parentStructureId === selectedElement.elementId) {
+                                                                        return { ...el, seedOffset: (el.seedOffset || 0) + 1 };
+                                                                    }
+                                                                    return el;
+                                                                }));
+                                                            }}
+                                                            className="w-full flex items-center justify-center gap-2 py-2 bg-blue-500/10 text-blue-400 rounded-md hover:bg-blue-500/20 transition-colors border border-blue-500/20"
+                                                        >
+                                                            <Shuffle className="w-3.5 h-3.5" />
+                                                            <span className="text-[10px] font-bold font-mono tracking-wide">RE-RANDOMIZE CHILDREN</span>
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            );
+                                        }
+
                                         const col = collections.find(c => c.id === selectedElement.collectionId);
                                         const variants = col?.items || [];
                                         if (variants.length === 0) return (
@@ -3443,6 +4107,50 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                 </div>
                                                 {selectedVariantMode !== 'all' && (
                                                     <p className="text-[8px] font-mono text-blue-400/50">Changes only apply to this variant</p>
+                                                )}
+
+                                                {/* Local Instance Exclusions */}
+                                                {variants.length > 1 && (
+                                                    <div className="pt-2 mt-2 border-t border-white/5">
+                                                        <h5 className="text-[8px] font-bold uppercase tracking-widest text-gray-600 font-mono mb-1.5 flex items-center gap-1">
+                                                            <Ban className="w-2.5 h-2.5" /> Instance Exclusions
+                                                        </h5>
+                                                        <p className="text-[7px] font-mono text-gray-600 mb-2">Exclude variants only for this element — does not affect other instances of this collection.</p>
+                                                        <div className="flex flex-wrap gap-1">
+                                                            {variants.map(v => {
+                                                                const isLocallyExcluded = selectedElement.localExcludedVariantIds?.includes(v.id) ?? false;
+                                                                const isGloballyExcluded = v.excluded ?? false;
+                                                                return (
+                                                                    <button
+                                                                        key={v.id}
+                                                                        disabled={isGloballyExcluded}
+                                                                        onClick={() => {
+                                                                            setElements(prev => prev.map(el => {
+                                                                                if (el.elementId !== selectedElement.elementId) return el;
+                                                                                const current = el.localExcludedVariantIds || [];
+                                                                                const next = isLocallyExcluded
+                                                                                    ? current.filter(id => id !== v.id)
+                                                                                    : [...current, v.id];
+                                                                                return { ...el, localExcludedVariantIds: next };
+                                                                            }));
+                                                                        }}
+                                                                        className={cn(
+                                                                            "px-2 py-1 rounded text-[8px] font-mono transition-all border flex items-center gap-1 max-w-[120px]",
+                                                                            isGloballyExcluded
+                                                                                ? "border-white/5 bg-white/[0.02] text-gray-700 cursor-not-allowed line-through"
+                                                                                : isLocallyExcluded
+                                                                                    ? "border-orange-500/40 bg-orange-500/10 text-orange-400"
+                                                                                    : "border-white/5 bg-white/5 text-gray-500 hover:text-gray-300 hover:bg-white/10"
+                                                                        )}
+                                                                        title={isGloballyExcluded ? `${v.label} is globally excluded` : isLocallyExcluded ? `Include ${v.label} in this instance` : `Exclude ${v.label} from this instance`}
+                                                                    >
+                                                                        <Ban className={cn("w-2.5 h-2.5 shrink-0", isLocallyExcluded ? "text-orange-400" : "text-gray-600")} />
+                                                                        <span className="truncate">{v.label}</span>
+                                                                    </button>
+                                                                );
+                                                            })}
+                                                        </div>
+                                                    </div>
                                                 )}
                                             </div>
                                         );
@@ -3524,6 +4232,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                     </div>
 
                                     {/* Duration Linking */}
+                                    {selectedElement.collectionType !== 'structure' && (
                                         <div className="space-y-3 pt-4 border-t border-white/5">
                                             <div className="flex items-center justify-between">
                                                 <h4 className="text-[9px] font-bold uppercase tracking-widest text-gray-500 font-mono">Match Duration</h4>
@@ -3657,6 +4366,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                 </div>
                                             </div>
                                         </div>
+                                    )}
 
                                     {/* Text Content — only for text elements when a specific variant is selected */}
                                     {selectedElement.collectionType === 'text' && selectedVariantMode !== 'all' && (() => {
@@ -3955,7 +4665,8 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
 
 
                                     {/* Animations */}
-                                    <div className="space-y-3 pt-4 border-t border-white/5">
+                                    {selectedElement.collectionType !== 'structure' && (
+                                        <div className="space-y-3 pt-4 border-t border-white/5">
                                         <div className="flex items-center justify-between">
                                             <h4 className="text-[9px] font-bold uppercase tracking-widest text-gray-500 font-mono flex items-center gap-1.5">
                                                 <Sparkles className="w-3 h-3 text-purple-400" /> Animations
@@ -4114,6 +4825,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                             </div>
                                         )}
                                     </div>
+                                    )}
                                 </div>
                             )}
                         </div>
@@ -4125,6 +4837,14 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 {activeCollection ? (
                     <div className="opacity-80 scale-105 pointer-events-none origin-top-left w-[220px]">
                         <CollectionCard collection={activeCollection} allCollections={collections} onAddItem={() => { }} onDeleteItem={() => { }} onUpdateItem={() => { }} onDeleteCollection={() => { }} />
+                    </div>
+                ) : activeStructGroup ? (
+                    <div className="opacity-80 scale-105 pointer-events-none origin-top-left w-[200px] bg-[#111] border border-purple-500/30 rounded-lg px-3 py-2">
+                        <div className="flex items-center gap-2">
+                            <Boxes className="w-3.5 h-3.5 text-purple-400" />
+                            <span className="text-[10px] font-mono text-gray-300">{activeStructGroup.name}</span>
+                            <span className="text-[8px] font-mono text-gray-600">({activeStructGroup.structures.length})</span>
+                        </div>
                     </div>
                 ) : null}
             </DragOverlay>

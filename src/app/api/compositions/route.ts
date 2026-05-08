@@ -22,7 +22,8 @@ export async function POST(request: Request) {
                 duration: body.duration || 15.0,
                 elements: JSON.stringify(body.elements || []),
                 tracks: JSON.stringify(body.tracks || []),
-                collections: JSON.stringify(body.collections || [])
+                collections: JSON.stringify(body.collections || []),
+                structuralGroups: JSON.stringify(body.structuralGroups || [])
             }
         });
         return NextResponse.json(composition);
