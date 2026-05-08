@@ -9,7 +9,7 @@ import {
     Film, Loader2, CheckCircle2, AlertCircle, Clapperboard, ListPlus, Link2, Ban
 } from "lucide-react";
 import Link from "next/link";
-import { renderComposition, type RenderProgress, type RenderElement, type RenderFormat } from "./renderer";
+import { renderComposition, type RenderJob, type RenderProgress, type RenderElement, type RenderFormat } from "./renderer";
 import {
     DndContext,
     useSensor,
@@ -132,6 +132,7 @@ export interface CanvasElement {
     matchDurationWithId?: string;
     matchDurationWithIds?: string[];
     matchDurationOffsets?: Record<string, number>;
+    localExcludedVariantIds?: string[]; // Variant IDs excluded only for this instance (not global)
 }
 
 // --- Collection Type Styling ---
@@ -888,19 +889,29 @@ export function resolveElementTimings(
 
         if (item.el.matchDurationWithIds && item.el.matchDurationWithIds.length > 0) {
             resolvedDur = 0;
+            let anyValid = false;
             for (const matchId of item.el.matchDurationWithIds) {
+                // Only resolve if the target element actually exists in this composition
+                if (!initialMap.has(matchId)) continue;
                 const matchTarget = resolveNode(matchId);
                 if (matchTarget) {
                     const offset = item.el.matchDurationOffsets?.[matchId] || 0;
                     resolvedDur += Math.max(0, matchTarget.duration + offset);
+                    anyValid = true;
                 }
             }
+            // If no valid targets remain, fall back to intrinsic duration
+            if (!anyValid) resolvedDur = item.duration;
         } else if (item.el.matchDurationWithId) {
-            const matchTarget = resolveNode(item.el.matchDurationWithId);
-            if (matchTarget) {
-                const offset = item.el.matchDurationOffsets?.[item.el.matchDurationWithId] || 0;
-                resolvedDur = Math.max(0, matchTarget.duration + offset);
+            // Only resolve if the target element actually exists
+            if (initialMap.has(item.el.matchDurationWithId)) {
+                const matchTarget = resolveNode(item.el.matchDurationWithId);
+                if (matchTarget) {
+                    const offset = item.el.matchDurationOffsets?.[item.el.matchDurationWithId] || 0;
+                    resolvedDur = Math.max(0, matchTarget.duration + offset);
+                }
             }
+            // If target doesn't exist, keep intrinsic duration (resolvedDur unchanged)
         }
 
         // Cap duration for media
@@ -916,17 +927,36 @@ export function resolveElementTimings(
         }
 
         if (item.el.syncWith && item.el.syncWith.targetId) {
-            // ANCHORED: depends on syncWith target
-            const targetTiming = resolveNode(item.el.syncWith.targetId);
-            if (targetTiming) {
-                const targetPoint = item.el.syncWith.targetEdge === 'end' 
-                    ? targetTiming.startTime + targetTiming.duration 
-                    : targetTiming.startTime;
-                
-                if (item.el.syncWith.myEdge === 'end') {
-                    resolvedStart = targetPoint - resolvedDur;
+            // ANCHORED: depends on syncWith target — but only if it still exists
+            if (initialMap.has(item.el.syncWith.targetId)) {
+                const targetTiming = resolveNode(item.el.syncWith.targetId);
+                if (targetTiming) {
+                    const targetPoint = item.el.syncWith.targetEdge === 'end' 
+                        ? targetTiming.startTime + targetTiming.duration 
+                        : targetTiming.startTime;
+                    
+                    if (item.el.syncWith.myEdge === 'end') {
+                        resolvedStart = targetPoint - resolvedDur;
+                    } else {
+                        resolvedStart = targetPoint;
+                    }
+                }
+            }
+            // If target doesn't exist, fall through to normal positioning below
+            if (!initialMap.has(item.el.syncWith.targetId)) {
+                // Treat as normal (non-anchored) element
+                const prevId = prevInTrack.get(id);
+                if (prevId) {
+                    const prevTiming = resolveNode(prevId);
+                    const trackConfig = tracks.find(t => t.id === (item.el.trackId || 'track-0'));
+                    const pushStart = prevTiming.startTime + prevTiming.duration;
+                    if (trackConfig?.magnet) {
+                        resolvedStart = pushStart;
+                    } else {
+                        resolvedStart = Math.max(item.startTime, pushStart);
+                    }
                 } else {
-                    resolvedStart = targetPoint;
+                    resolvedStart = item.startTime;
                 }
             }
         } else {
@@ -1189,6 +1219,9 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             return a.startTime - b.startTime; // then by timeline position
         });
         const pickedVariantIds = new Set<string>();
+        // Track which variant IDs have been picked per collection, so elements
+        // sharing the same collection are forced to pick different variants.
+        const pickedByCollection: Record<string, Set<string>> = {};
 
         sortedElements.forEach(el => {
             const col = collections.find(c => c.id === el.collectionId);
@@ -1263,12 +1296,27 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                     });
 
                     // Excluded variants are always removed from the pool
-                    const eligibleCandidates = candidates.filter(v => !v.excluded);
+                    // Apply both global exclusions (variant.excluded) AND local per-instance exclusions
+                    const localExcluded = new Set(el.localExcludedVariantIds || []);
+                    const eligibleCandidates = candidates.filter(v => !v.excluded && !localExcluded.has(v.id));
                     // If link filtering wiped all candidates, fall back to all non-excluded items
-                    const nonExcluded = col.items.filter(v => !v.excluded);
-                    const finalCandidates = eligibleCandidates.length > 0 ? eligibleCandidates
+                    const nonExcluded = col.items.filter(v => !v.excluded && !localExcluded.has(v.id));
+                    let finalCandidates = eligibleCandidates.length > 0 ? eligibleCandidates
                         : nonExcluded.length > 0 ? nonExcluded
-                        : col.items; // last resort: all items (shouldn't happen)
+                        : col.items.filter(v => !v.excluded); // fall back to globally-non-excluded only
+
+                    // --- Same-collection deduplication ---
+                    // If another element from this collection already picked a variant,
+                    // forcibly exclude those variants so every element gets a unique one.
+                    const alreadyPickedInCol = pickedByCollection[col.id];
+                    if (alreadyPickedInCol && alreadyPickedInCol.size > 0) {
+                        const deduped = finalCandidates.filter(v => !alreadyPickedInCol.has(v.id));
+                        // Only apply dedup if there are still candidates left;
+                        // if all variants are exhausted (more elements than variants), allow repeats.
+                        if (deduped.length > 0) {
+                            finalCandidates = deduped;
+                        }
+                    }
 
                     // Calculate weights
                     const usages = finalCandidates.map(v => (variantUsage[v.id] || 0) + (queueUsages[v.id] || 0));
@@ -1299,6 +1347,9 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 variants[el.elementId] = pickedVariant;
                 if (pickedVariant) {
                     pickedVariantIds.add(pickedVariant.id);
+                    // Record per-collection pick for deduplication
+                    if (!pickedByCollection[col.id]) pickedByCollection[col.id] = new Set();
+                    pickedByCollection[col.id].add(pickedVariant.id);
                 }
             } else {
                 variants[el.elementId] = null;
@@ -1902,7 +1953,43 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
 
     const removeSelected = () => {
         if (!selectedElementId) return;
-        setElements(prev => prev.filter(el => el.elementId !== selectedElementId));
+        const removedId = selectedElementId;
+        setElements(prev => prev
+            .filter(el => el.elementId !== removedId)
+            .map(el => {
+                let updated = el;
+                let changed = false;
+
+                // Clean up syncWith if it pointed at the deleted element
+                if (el.syncWith?.targetId === removedId) {
+                    updated = { ...updated, syncWith: null };
+                    changed = true;
+                }
+
+                // Clean up matchDurationWithId (legacy single-link)
+                if (el.matchDurationWithId === removedId) {
+                    updated = { ...updated, matchDurationWithId: undefined };
+                    changed = true;
+                }
+
+                // Clean up matchDurationWithIds (multi-link)
+                if (el.matchDurationWithIds?.includes(removedId)) {
+                    const newIds = el.matchDurationWithIds.filter(id => id !== removedId);
+                    const newOffsets = { ...(el.matchDurationOffsets || {}) };
+                    delete newOffsets[removedId];
+                    updated = { ...updated, matchDurationWithIds: newIds, matchDurationOffsets: newOffsets };
+                    changed = true;
+                } else if (el.matchDurationOffsets?.[removedId] !== undefined) {
+                    // Stale offset entry even if not in the IDs array
+                    const newOffsets = { ...(el.matchDurationOffsets || {}) };
+                    delete newOffsets[removedId];
+                    updated = { ...updated, matchDurationOffsets: newOffsets };
+                    changed = true;
+                }
+
+                return changed ? updated : el;
+            })
+        );
         setSelectedElementId(null);
     };
 
@@ -3443,6 +3530,50 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                 </div>
                                                 {selectedVariantMode !== 'all' && (
                                                     <p className="text-[8px] font-mono text-blue-400/50">Changes only apply to this variant</p>
+                                                )}
+
+                                                {/* Local Instance Exclusions */}
+                                                {variants.length > 1 && (
+                                                    <div className="pt-2 mt-2 border-t border-white/5">
+                                                        <h5 className="text-[8px] font-bold uppercase tracking-widest text-gray-600 font-mono mb-1.5 flex items-center gap-1">
+                                                            <Ban className="w-2.5 h-2.5" /> Instance Exclusions
+                                                        </h5>
+                                                        <p className="text-[7px] font-mono text-gray-600 mb-2">Exclude variants only for this element — does not affect other instances of this collection.</p>
+                                                        <div className="flex flex-wrap gap-1">
+                                                            {variants.map(v => {
+                                                                const isLocallyExcluded = selectedElement.localExcludedVariantIds?.includes(v.id) ?? false;
+                                                                const isGloballyExcluded = v.excluded ?? false;
+                                                                return (
+                                                                    <button
+                                                                        key={v.id}
+                                                                        disabled={isGloballyExcluded}
+                                                                        onClick={() => {
+                                                                            setElements(prev => prev.map(el => {
+                                                                                if (el.elementId !== selectedElement.elementId) return el;
+                                                                                const current = el.localExcludedVariantIds || [];
+                                                                                const next = isLocallyExcluded
+                                                                                    ? current.filter(id => id !== v.id)
+                                                                                    : [...current, v.id];
+                                                                                return { ...el, localExcludedVariantIds: next };
+                                                                            }));
+                                                                        }}
+                                                                        className={cn(
+                                                                            "px-2 py-1 rounded text-[8px] font-mono transition-all border flex items-center gap-1 max-w-[120px]",
+                                                                            isGloballyExcluded
+                                                                                ? "border-white/5 bg-white/[0.02] text-gray-700 cursor-not-allowed line-through"
+                                                                                : isLocallyExcluded
+                                                                                    ? "border-orange-500/40 bg-orange-500/10 text-orange-400"
+                                                                                    : "border-white/5 bg-white/5 text-gray-500 hover:text-gray-300 hover:bg-white/10"
+                                                                        )}
+                                                                        title={isGloballyExcluded ? `${v.label} is globally excluded` : isLocallyExcluded ? `Include ${v.label} in this instance` : `Exclude ${v.label} from this instance`}
+                                                                    >
+                                                                        <Ban className={cn("w-2.5 h-2.5 shrink-0", isLocallyExcluded ? "text-orange-400" : "text-gray-600")} />
+                                                                        <span className="truncate">{v.label}</span>
+                                                                    </button>
+                                                                );
+                                                            })}
+                                                        </div>
+                                                    </div>
                                                 )}
                                             </div>
                                         );
