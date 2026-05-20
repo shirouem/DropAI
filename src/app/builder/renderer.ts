@@ -55,6 +55,7 @@ export interface RenderJob {
     fps?: number;
     videoBitsPerSecond?: number;
     format?: RenderFormat;
+    outputName?: string;
 }
 
 export type RenderProgress = {
@@ -401,7 +402,13 @@ function mixAudio(
         const count = Math.min(Math.floor(el.duration * sr), buf.length - off, n - start);
         const sL = buf.getChannelData(0);
         const sR = buf.numberOfChannels > 1 ? buf.getChannelData(1) : sL;
-        for (let i = 0; i < count; i++) {
+        
+        let startIdx = 0;
+        if (start < 0) {
+            startIdx = -start;
+        }
+        
+        for (let i = startIdx; i < count; i++) {
             // Compute fade multiplier matching the preview ref callback logic
             const elapsed   = i / sr;                    // seconds since element start
             const remaining = el.duration - elapsed;     // seconds until element end
@@ -413,6 +420,16 @@ function mixAudio(
             R[start + i] += (sR[off + i] ?? 0) * v;
         }
     }
+    
+    // Clamp values to [-1.0, 1.0] to prevent integer overflow (static) in the audio encoder
+    for (let i = 0; i < n; i++) {
+        if (L[i] > 1.0) L[i] = 1.0;
+        else if (L[i] < -1.0) L[i] = -1.0;
+        
+        if (R[i] > 1.0) R[i] = 1.0;
+        else if (R[i] < -1.0) R[i] = -1.0;
+    }
+    
     return [L, R];
 }
 
@@ -567,7 +584,12 @@ export async function renderComposition(job: RenderJob, onProgress: ProgressCb, 
         }
 
         const url = URL.createObjectURL(blob);
-        const a = document.createElement('a'); a.href = url; a.download = `export-${Date.now()}.${format}`; a.click();
+        const safeName = (job.outputName || `export-${Date.now()}`)
+            .replace(/[<>:"/\\|?*\x00-\x1F]/g, '-')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 120) || `export-${Date.now()}`;
+        const a = document.createElement('a'); a.href = url; a.download = `${safeName}.${format}`; a.click();
         
         // Clean up the final export URL after download
         setTimeout(() => URL.revokeObjectURL(url), 10000);
@@ -575,6 +597,7 @@ export async function renderComposition(job: RenderJob, onProgress: ProgressCb, 
         onProgress({ phase: 'done', progress: 1, message: 'Export complete' });
     } catch (e: unknown) {
         onProgress({ phase: 'error', progress: 0, message: 'Export failed', error: e instanceof Error ? e.message : String(e) });
+        throw e;
     } finally {
         await actx.close().catch(() => {});
         for (const url of objectUrls) {

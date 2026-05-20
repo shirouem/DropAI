@@ -6,7 +6,7 @@ import {
     Play, Pause, Plus, Image as ImageIcon, Music, Download, Upload,
     Layers, X, Type, MonitorPlay, SlidersHorizontal, GripVertical, Shuffle, SkipBack, Video, Trash2, Sparkles, ChevronDown, Eye, EyeOff,
     Bold, Italic, Underline, AlignLeft, AlignCenter, AlignRight, Scissors, MousePointer2, Settings, Lock, Unlock, ArrowUp, ArrowDown,
-    Film, Loader2, CheckCircle2, AlertCircle, Clapperboard, ListPlus, Link2, Ban
+    Film, Loader2, CheckCircle2, AlertCircle, Clapperboard, ListPlus, Link2, Ban, RotateCcw, RotateCw
 } from "lucide-react";
 import Link from "next/link";
 import { renderComposition, type RenderJob, type RenderProgress, type RenderElement, type RenderFormat } from "./renderer";
@@ -43,6 +43,12 @@ interface CollectionItem {
     title: string;
     type: CollectionType;
     items: CollectionVariant[];
+}
+
+interface TextCollectionGroup {
+    id: string;
+    title: string;
+    collectionIds: string[];
 }
 
 // --- Animation Presets ---
@@ -133,7 +139,15 @@ export interface CanvasElement {
     matchDurationWithIds?: string[];
     matchDurationOffsets?: Record<string, number>;
     localExcludedVariantIds?: string[]; // Variant IDs excluded only for this instance (not global)
+    textCollectionMode?: string; // "all" | specific grouped text collection id
 }
+
+type QueuedRenderJob = {
+    id: string;
+    name: string;
+    job: RenderJob;
+    usedVariantIds: string[];
+};
 
 // --- Collection Type Styling ---
 const COLLECTION_COLORS: Record<CollectionType, { bg: string; border: string; text: string; icon: string }> = {
@@ -227,6 +241,8 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
     const [isAdding, setIsAdding] = useState(false);
     const [newLabel, setNewLabel] = useState("");
     const [newValue, setNewValue] = useState("");
+    const [isBulkTextMode, setIsBulkTextMode] = useState(false);
+    const [bulkTextValues, setBulkTextValues] = useState("");
     const fileInputRef = useRef<HTMLInputElement>(null);
     const updateFileRef = useRef<HTMLInputElement>(null);
     const [updatingItemId, setUpdatingItemId] = useState<string | null>(null);
@@ -328,6 +344,37 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
         onAddItem(collection.id, newLabel.trim(), newValue.trim());
         setNewLabel("");
         setNewValue("");
+        setIsAdding(false);
+    };
+
+    const handleBulkTextAdd = () => {
+        const lines = bulkTextValues
+            .split(/[,\r\n]+/)
+            .map(line => line.trim())
+            .filter(Boolean);
+        if (lines.length === 0) return;
+
+        const startIndex = collection.items.length + 1;
+        const labelPrefix = newLabel.trim();
+
+        lines.forEach((line, idx) => {
+            const pipeIndex = line.indexOf("|");
+            if (pipeIndex > -1) {
+                const parsedLabel = line.slice(0, pipeIndex).trim();
+                const parsedValue = line.slice(pipeIndex + 1).trim();
+                if (!parsedValue) return;
+                const fallbackLabel = labelPrefix ? `${labelPrefix} ${idx + 1}` : `Variant ${startIndex + idx}`;
+                onAddItem(collection.id, parsedLabel || fallbackLabel, parsedValue);
+                return;
+            }
+
+            const fallbackLabel = labelPrefix ? `${labelPrefix} ${idx + 1}` : `Variant ${startIndex + idx}`;
+            onAddItem(collection.id, fallbackLabel, line);
+        });
+
+        setNewLabel("");
+        setBulkTextValues("");
+        setIsBulkTextMode(false);
         setIsAdding(false);
     };
 
@@ -505,10 +552,32 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
                             {/* Add Item Form */}
                             {isAdding ? (
                                 <div className="space-y-1.5 pt-1">
+                                    {!isMedia && (
+                                        <div className="flex gap-1">
+                                            <button
+                                                onClick={() => setIsBulkTextMode(false)}
+                                                className={cn(
+                                                    "flex-1 text-[9px] font-mono py-1 rounded border transition-colors",
+                                                    !isBulkTextMode ? "bg-amber-500/20 border-amber-500/40 text-amber-300" : "bg-white/5 border-white/10 text-gray-500 hover:text-gray-300"
+                                                )}
+                                            >
+                                                Single
+                                            </button>
+                                            <button
+                                                onClick={() => setIsBulkTextMode(true)}
+                                                className={cn(
+                                                    "flex-1 text-[9px] font-mono py-1 rounded border transition-colors",
+                                                    isBulkTextMode ? "bg-amber-500/20 border-amber-500/40 text-amber-300" : "bg-white/5 border-white/10 text-gray-500 hover:text-gray-300"
+                                                )}
+                                            >
+                                                Bulk
+                                            </button>
+                                        </div>
+                                    )}
                                     <input
                                         value={newLabel}
                                         onChange={(e) => setNewLabel(e.target.value)}
-                                        placeholder="Label (e.g. Hook A)"
+                                        placeholder={isBulkTextMode ? "Label prefix (optional)" : "Label (e.g. Hook A)"}
                                         className="w-full text-[10px] font-mono bg-black/40 border border-white/10 rounded px-2 py-1.5 text-gray-300 placeholder:text-gray-600 outline-none focus:border-white/20"
                                         onPointerDown={(e) => e.stopPropagation()}
                                     />
@@ -538,6 +607,22 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
                                                 <span className="text-[9px] font-mono">Choose {collection.type} file(s)</span>
                                             </button>
                                         </>
+                                    ) : isBulkTextMode ? (
+                                        <>
+                                            <textarea
+                                                value={bulkTextValues}
+                                                onChange={(e) => setBulkTextValues(e.target.value)}
+                                                placeholder={"Comma-separated variants (or one per line)\nOptional format: Label | Text"}
+                                                className="w-full min-h-[88px] resize-y text-[10px] font-mono bg-black/40 border border-white/10 rounded px-2 py-1.5 text-gray-300 placeholder:text-gray-600 outline-none focus:border-white/20"
+                                                onPointerDown={(e) => e.stopPropagation()}
+                                                onKeyDown={(e) => {
+                                                    if ((e.ctrlKey || e.metaKey) && e.key === "Enter") handleBulkTextAdd();
+                                                }}
+                                            />
+                                            <p className="text-[8px] text-gray-600 font-mono">
+                                                Use commas or new lines between variants. Use <span className="text-gray-500">Label | Text</span> for custom labels.
+                                            </p>
+                                        </>
                                     ) : (
                                         <input
                                             value={newValue}
@@ -549,8 +634,26 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
                                         />
                                     )}
                                     <div className="flex gap-1.5">
-                                        {!isMedia && <button onClick={handleAdd} className="flex-1 text-[9px] font-mono py-1 bg-white/10 hover:bg-white/20 text-gray-300 rounded transition-colors">Add</button>}
-                                        <button onClick={() => { setIsAdding(false); setNewLabel(""); setNewValue(""); }} className="flex-1 text-[9px] font-mono py-1 bg-white/5 hover:bg-white/10 text-gray-500 rounded transition-colors">Cancel</button>
+                                        {!isMedia && (
+                                            <button
+                                                onClick={isBulkTextMode ? handleBulkTextAdd : handleAdd}
+                                                className="flex-1 text-[9px] font-mono py-1 bg-white/10 hover:bg-white/20 text-gray-300 rounded transition-colors"
+                                            >
+                                                {isBulkTextMode ? "Bulk Add" : "Add"}
+                                            </button>
+                                        )}
+                                        <button
+                                            onClick={() => {
+                                                setIsAdding(false);
+                                                setNewLabel("");
+                                                setNewValue("");
+                                                setBulkTextValues("");
+                                                setIsBulkTextMode(false);
+                                            }}
+                                            className="flex-1 text-[9px] font-mono py-1 bg-white/5 hover:bg-white/10 text-gray-500 rounded transition-colors"
+                                        >
+                                            Cancel
+                                        </button>
                                     </div>
                                 </div>
                             ) : (
@@ -1024,13 +1127,16 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     const [elements, setElements] = useState<CanvasElement[]>([]);
     const [tracks, setTracks] = useState<TrackConfig[]>([{ id: 'track-0', magnet: false }]);
     const [collections, setCollections] = useState<CollectionItem[]>(SEED_COLLECTIONS);
+    const [textCollectionGroups, setTextCollectionGroups] = useState<TextCollectionGroup[]>([]);
     const [selectedElementId, setSelectedElementId] = useState<string | null>(null);
     const [centerView, setCenterView] = useState<"canvas" | "preview">("canvas");
     const [inspectorVariantModes, setInspectorVariantModes] = useState<Record<string, string>>({}); // elementId -> "all" | variantId
     const [inspectorLocked, setInspectorLocked] = useState(false);
     const [saving, setSaving] = useState(false);
-    const [fetching, setFetching] = useState(false);
+    const [fetching, setFetching] = useState(!!compositionId);
     const [toast, setToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
+    const [copiedProperties, setCopiedProperties] = useState<Partial<CanvasElement> | null>(null);
+    const [TOTAL_DURATION, setTOTAL_DURATION] = useState(120);
 
     const showToast = (message: string, type: 'success' | 'error') => {
         setToast({ message, type });
@@ -1041,7 +1147,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     const [isExportModalOpen, setIsExportModalOpen] = useState(false);
     const [renderProgress, setRenderProgress] = useState<RenderProgress | null>(null);
     const renderAbortRef = useRef<AbortController | null>(null);
-    const [renderQueue, setRenderQueue] = useState<{ id: string; name: string; job: RenderJob; usedVariantIds: string[] }[]>([]);
+    const [renderQueue, setRenderQueue] = useState<QueuedRenderJob[]>([]);
     const renderQueueRef = useRef(renderQueue);
     renderQueueRef.current = renderQueue;
     const [exportSettings, setExportSettings] = useState({
@@ -1050,6 +1156,67 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         bitrate: 8 as 4 | 8 | 16,
         format: 'mp4' as RenderFormat,
     });
+    type EditorSnapshot = {
+        title: string;
+        duration: number;
+        elements: CanvasElement[];
+        tracks: TrackConfig[];
+        collections: CollectionItem[];
+        textCollectionGroups: TextCollectionGroup[];
+    };
+    const HISTORY_LIMIT = 100;
+    const HISTORY_DEBOUNCE_MS = 450;
+    const undoStackRef = useRef<EditorSnapshot[]>([]);
+    const redoStackRef = useRef<EditorSnapshot[]>([]);
+    const lastSnapshotRef = useRef<EditorSnapshot | null>(null);
+    const historyInitializedRef = useRef(false);
+    const historyApplyingRef = useRef(false);
+    const historyDebounceRef = useRef<number | null>(null);
+    const [canUndo, setCanUndo] = useState(false);
+    const [canRedo, setCanRedo] = useState(false);
+
+    const clonePlain = useCallback(<T,>(input: T): T => JSON.parse(JSON.stringify(input)) as T, []);
+    const snapshotKey = useCallback((snapshot: EditorSnapshot) => JSON.stringify(snapshot), []);
+    const refreshHistoryAvailability = useCallback(() => {
+        setCanUndo(undoStackRef.current.length > 0);
+        setCanRedo(redoStackRef.current.length > 0);
+    }, []);
+    const captureSnapshot = useCallback((): EditorSnapshot => ({
+        title,
+        duration: TOTAL_DURATION,
+        elements: clonePlain(elements),
+        tracks: clonePlain(tracks),
+        collections: clonePlain(collections),
+        textCollectionGroups: clonePlain(textCollectionGroups),
+    }), [title, TOTAL_DURATION, elements, tracks, collections, textCollectionGroups, clonePlain]);
+    const applySnapshot = useCallback((snapshot: EditorSnapshot) => {
+        historyApplyingRef.current = true;
+        setTitle(snapshot.title);
+        setTOTAL_DURATION(snapshot.duration);
+        setElements(clonePlain(snapshot.elements));
+        setTracks(clonePlain(snapshot.tracks));
+        setCollections(clonePlain(snapshot.collections));
+        setTextCollectionGroups(clonePlain(snapshot.textCollectionGroups || []));
+        lastSnapshotRef.current = clonePlain(snapshot);
+        window.setTimeout(() => {
+            historyApplyingRef.current = false;
+        }, 0);
+    }, [clonePlain]);
+    const commitSnapshotToHistory = useCallback((currentSnapshot: EditorSnapshot) => {
+        const previousSnapshot = lastSnapshotRef.current;
+        if (!previousSnapshot) {
+            lastSnapshotRef.current = clonePlain(currentSnapshot);
+            return false;
+        }
+        if (snapshotKey(previousSnapshot) === snapshotKey(currentSnapshot)) return false;
+
+        undoStackRef.current.push(clonePlain(previousSnapshot));
+        if (undoStackRef.current.length > HISTORY_LIMIT) undoStackRef.current.shift();
+        redoStackRef.current = [];
+        lastSnapshotRef.current = clonePlain(currentSnapshot);
+        refreshHistoryAvailability();
+        return true;
+    }, [clonePlain, snapshotKey, refreshHistoryAvailability]);
 
     // Helper: get the variant mode for an element, auto-selecting single variants
     const getVariantMode = useCallback((elementId: string): string => {
@@ -1080,6 +1247,12 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
 
     useEffect(() => {
         if (compositionId) {
+            undoStackRef.current = [];
+            redoStackRef.current = [];
+            lastSnapshotRef.current = null;
+            historyInitializedRef.current = false;
+            refreshHistoryAvailability();
+            setRenderQueue([]);
             setFetching(true);
             fetch(`/api/compositions/${compositionId}`)
                 .then(res => res.json())
@@ -1093,10 +1266,18 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                             if (parsedTracks && parsedTracks.length > 0) setTracks(parsedTracks);
                         } catch (e) { }
                     }
-                    if (data.collections?.length) {
+                    if (data.collections) {
                         try {
                             const parsedCols = typeof data.collections === 'string' ? JSON.parse(data.collections) : data.collections;
-                            if (parsedCols.length > 0) setCollections(parsedCols);
+                            if (Array.isArray(parsedCols)) {
+                                if (parsedCols.length > 0) setCollections(parsedCols);
+                                setTextCollectionGroups([]);
+                            } else if (parsedCols && typeof parsedCols === 'object') {
+                                const wrapped = parsedCols as { items?: CollectionItem[]; textGroups?: TextCollectionGroup[]; renderQueue?: QueuedRenderJob[] };
+                                if (Array.isArray(wrapped.items) && wrapped.items.length > 0) setCollections(wrapped.items);
+                                if (Array.isArray(wrapped.textGroups)) setTextCollectionGroups(wrapped.textGroups);
+                                if (Array.isArray(wrapped.renderQueue)) setRenderQueue(wrapped.renderQueue);
+                            }
                         } catch (e) { }
                     }
                     if (data.duration) {
@@ -1109,12 +1290,103 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 .catch(err => console.error("Failed to fetch composition", err))
                 .finally(() => setFetching(false));
         }
-    }, [compositionId]);
+    }, [compositionId, refreshHistoryAvailability]);
+
+    useEffect(() => {
+        if (fetching) return;
+
+        const currentSnapshot = captureSnapshot();
+
+        if (!historyInitializedRef.current) {
+            lastSnapshotRef.current = clonePlain(currentSnapshot);
+            historyInitializedRef.current = true;
+            return;
+        }
+        if (historyApplyingRef.current) {
+            lastSnapshotRef.current = clonePlain(currentSnapshot);
+            return;
+        }
+
+        if (historyDebounceRef.current) {
+            window.clearTimeout(historyDebounceRef.current);
+        }
+        historyDebounceRef.current = window.setTimeout(() => {
+            historyDebounceRef.current = null;
+            commitSnapshotToHistory(currentSnapshot);
+        }, HISTORY_DEBOUNCE_MS);
+
+        return () => {
+            if (historyDebounceRef.current) {
+                window.clearTimeout(historyDebounceRef.current);
+            }
+        };
+    }, [fetching, captureSnapshot, clonePlain, commitSnapshotToHistory]);
+
+    const undoHistory = useCallback(() => {
+        if (historyDebounceRef.current) {
+            window.clearTimeout(historyDebounceRef.current);
+            historyDebounceRef.current = null;
+        }
+        commitSnapshotToHistory(captureSnapshot());
+
+        const previousSnapshot = undoStackRef.current.pop();
+        if (!previousSnapshot) return;
+
+        const currentSnapshot = captureSnapshot();
+        redoStackRef.current.push(clonePlain(currentSnapshot));
+        applySnapshot(previousSnapshot);
+        refreshHistoryAvailability();
+    }, [captureSnapshot, clonePlain, applySnapshot, refreshHistoryAvailability, commitSnapshotToHistory]);
+
+    const redoHistory = useCallback(() => {
+        if (historyDebounceRef.current) {
+            window.clearTimeout(historyDebounceRef.current);
+            historyDebounceRef.current = null;
+        }
+        commitSnapshotToHistory(captureSnapshot());
+
+        const nextSnapshot = redoStackRef.current.pop();
+        if (!nextSnapshot) return;
+
+        const currentSnapshot = captureSnapshot();
+        undoStackRef.current.push(clonePlain(currentSnapshot));
+        applySnapshot(nextSnapshot);
+        refreshHistoryAvailability();
+    }, [captureSnapshot, clonePlain, applySnapshot, refreshHistoryAvailability, commitSnapshotToHistory]);
+
+    useEffect(() => {
+        const onKeyDown = (event: KeyboardEvent) => {
+            const isMeta = event.metaKey || event.ctrlKey;
+            if (!isMeta) return;
+
+            const target = event.target as HTMLElement | null;
+            const tag = target?.tagName?.toLowerCase();
+            const isTyping = tag === 'input' || tag === 'textarea' || !!target?.isContentEditable;
+            if (isTyping) return;
+
+            const key = event.key.toLowerCase();
+            if (key === 'z') {
+                event.preventDefault();
+                if (event.shiftKey) redoHistory();
+                else undoHistory();
+                return;
+            }
+            if (key === 'y') {
+                event.preventDefault();
+                redoHistory();
+            }
+        };
+        window.addEventListener('keydown', onKeyDown);
+        return () => window.removeEventListener('keydown', onKeyDown);
+    }, [undoHistory, redoHistory]);
 
     // New Collection form
     const [isCreatingCollection, setIsCreatingCollection] = useState(false);
     const [newCollectionTitle, setNewCollectionTitle] = useState("");
     const [newCollectionType, setNewCollectionType] = useState<CollectionType>("text");
+    const [isCreatingTextGroup, setIsCreatingTextGroup] = useState(false);
+    const [newTextGroupTitle, setNewTextGroupTitle] = useState("");
+    const [newTextGroupSelection, setNewTextGroupSelection] = useState<Record<string, boolean>>({});
 
     // Drag state for overlay
     const [activeCollection, setActiveCollection] = useState<CollectionItem | null>(null);
@@ -1135,7 +1407,6 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     const [splitHoverPosition, setSplitHoverPosition] = useState<{ elementId: string, time: number, relativePx: number } | null>(null);
 
     // --- Playback Engine State ---
-    const [TOTAL_DURATION, setTOTAL_DURATION] = useState(120);
     const [isSettingsOpen, setIsSettingsOpen] = useState(false);
     const [isPlaying, setIsPlaying] = useState(false);
     const [currentTime, setCurrentTime] = useState(0);
@@ -1163,7 +1434,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
 
     function mulberry32(a: number) {
         return function() {
-            var t = a += 0x6D2B79F5;
+            let t = a += 0x6D2B79F5;
             t = Math.imul(t ^ (t >>> 15), t | 1);
             t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
             return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
@@ -1190,11 +1461,127 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         });
     }, []);
 
+    const getSelectionKey = useCallback((el: CanvasElement) => {
+        const srcId = el.sourceElementId || el.elementId;
+        return srcId === el.elementId ? srcId : `${srcId}-${el.elementId}`;
+    }, []);
+
+    const pickWeighted = useCallback(<T extends { id: string },>(
+        candidates: T[],
+        seedKey: string,
+        usageLookup: Record<string, number>,
+        usageScale = 2
+    ): T | null => {
+        if (candidates.length === 0) return null;
+        if (candidates.length === 1) return candidates[0];
+
+        const random = mulberry32(hashString(seedKey));
+        const usages = candidates.map(candidate => usageLookup[candidate.id] || 0);
+        const minUsage = Math.min(...usages);
+        const weights = candidates.map((_, index) => {
+            const relativeUsage = usages[index] - minUsage;
+            return 100 / (1 + relativeUsage * usageScale);
+        });
+
+        const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+        if (!Number.isFinite(totalWeight) || totalWeight <= 0) {
+            return candidates[Math.floor(random() * candidates.length)] ?? candidates[0];
+        }
+
+        let cursor = random() * totalWeight;
+        for (let i = 0; i < candidates.length; i++) {
+            cursor -= weights[i];
+            if (cursor <= 0) return candidates[i];
+        }
+
+        return candidates[candidates.length - 1];
+    }, []);
+
+    const collectionToTextGroupId = useMemo(() => {
+        const map: Record<string, string> = {};
+        for (const group of textCollectionGroups) {
+            for (const colId of group.collectionIds) {
+                if (!map[colId]) map[colId] = group.id;
+            }
+        }
+        return map;
+    }, [textCollectionGroups]);
+
+    const textGroupById = useMemo(() => {
+        const map: Record<string, TextCollectionGroup> = {};
+        for (const group of textCollectionGroups) map[group.id] = group;
+        return map;
+    }, [textCollectionGroups]);
+
+    const resolvedCollectionIdByElement = useMemo(() => {
+        const result: Record<string, string> = {};
+        const queueUsages = renderQueue.reduce((acc, curr) => {
+            curr.usedVariantIds?.forEach(id => {
+                acc[id] = (acc[id] || 0) + 1;
+            });
+            return acc;
+        }, {} as Record<string, number>);
+
+        for (const el of elements) {
+            if (el.collectionType !== 'text') {
+                result[el.elementId] = el.collectionId;
+                continue;
+            }
+
+            const groupId = collectionToTextGroupId[el.collectionId];
+            if (!groupId) {
+                result[el.elementId] = el.collectionId;
+                continue;
+            }
+
+            const group = textGroupById[groupId];
+            if (!group) {
+                result[el.elementId] = el.collectionId;
+                continue;
+            }
+            const localExcluded = new Set(el.localExcludedVariantIds || []);
+
+            const candidateIds = group.collectionIds.filter((colId) => {
+                const col = collections.find(c => c.id === colId);
+                if (!col || col.type !== 'text' || col.items.length === 0) return false;
+                return col.items.some(v => !v.excluded && !localExcluded.has(v.id));
+            });
+            if (candidateIds.length === 0) {
+                result[el.elementId] = el.collectionId;
+                continue;
+            }
+
+            const mode = el.textCollectionMode || 'all';
+            if (mode !== 'all' && candidateIds.includes(mode)) {
+                result[el.elementId] = mode;
+                continue;
+            }
+
+            const collectionUsage = Object.fromEntries(candidateIds.map((colId) => {
+                const col = collections.find(c => c.id === colId);
+                const usage = col?.items.reduce((sum, item) => {
+                    if (item.excluded || localExcluded.has(item.id)) return sum;
+                    return sum + (variantUsage[item.id] || 0) + (queueUsages[item.id] || 0);
+                }, 0) ?? 0;
+                return [colId, usage];
+            }));
+            const pickedCollectionId = pickWeighted(
+                candidateIds.map(id => ({ id })),
+                `${variantSeed}-${getSelectionKey(el)}-group-${group.id}`,
+                collectionUsage,
+                1
+            )?.id;
+            result[el.elementId] = pickedCollectionId || candidateIds[0];
+        }
+
+        return result;
+    }, [elements, collectionToTextGroupId, textGroupById, collections, variantSeed, variantUsage, renderQueue, getSelectionKey, pickWeighted]);
+
     const previewVariants = useMemo(() => {
         const variants: Record<string, CollectionVariant | null> = {};
         
         // Calculate usage from currently queued items to apply bias even before rendering starts
-        const queueUsages = renderQueueRef.current.reduce((acc, curr) => {
+        const queueUsages = renderQueue.reduce((acc, curr) => {
             if (curr.usedVariantIds) {
                 curr.usedVariantIds.forEach(id => {
                     acc[id] = (acc[id] || 0) + 1;
@@ -1202,19 +1589,30 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             }
             return acc;
         }, {} as Record<string, number>);
+        const combinedUsage = { ...variantUsage };
+        for (const [id, count] of Object.entries(queueUsages)) {
+            combinedUsage[id] = (combinedUsage[id] || 0) + count;
+        }
+        const collectionById = new Map(collections.map(c => [c.id, c]));
+        const variantToCollectionId = new Map<string, string>();
+        for (const collection of collections) {
+            collection.items.forEach(item => variantToCollectionId.set(item.id, collection.id));
+        }
 
         // Sort elements so link-source collections are always evaluated first.
         // A "link source" collection is one where at least one variant defines outgoing links.
         // This ensures that when we evaluate the hook/dependent collection, the linked variant
         // from the source collection is already in pickedVariantIds — regardless of startTime order.
         const isLinkSourceCollection = (colId: string) => {
-            const c = collections.find(c => c.id === colId);
+            const c = collectionById.get(colId);
             return c ? c.items.some(v => v.linkedVariantIds && v.linkedVariantIds.length > 0) : false;
         };
 
         const sortedElements = [...elements].sort((a, b) => {
-            const aIsSource = isLinkSourceCollection(a.collectionId) ? 0 : 1;
-            const bIsSource = isLinkSourceCollection(b.collectionId) ? 0 : 1;
+            const aColId = resolvedCollectionIdByElement[a.elementId] || a.collectionId;
+            const bColId = resolvedCollectionIdByElement[b.elementId] || b.collectionId;
+            const aIsSource = isLinkSourceCollection(aColId) ? 0 : 1;
+            const bIsSource = isLinkSourceCollection(bColId) ? 0 : 1;
             if (aIsSource !== bIsSource) return aIsSource - bIsSource; // sources first
             return a.startTime - b.startTime; // then by timeline position
         });
@@ -1224,34 +1622,35 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         const pickedByCollection: Record<string, Set<string>> = {};
 
         sortedElements.forEach(el => {
-            const col = collections.find(c => c.id === el.collectionId);
+            const resolvedColId = resolvedCollectionIdByElement[el.elementId] || el.collectionId;
+            const col = collectionById.get(resolvedColId);
             if (col && col.items.length > 0) {
-                const srcId = el.sourceElementId || el.elementId;
+                const selectionKey = getSelectionKey(el);
                 const userMode = getVariantModeRef.current(el.elementId);
+                const localExcluded = new Set(el.localExcludedVariantIds || []);
                 
                 let pickedVariant: CollectionVariant | null = null;
                 
                 if (userMode !== 'all') {
-                    pickedVariant = col.items.find(v => v.id === userMode) || null;
+                    const requested = col.items.find(v => v.id === userMode) || null;
+                    pickedVariant = requested && !requested.excluded && !localExcluded.has(requested.id)
+                        ? requested
+                        : null;
                 }
 
                 if (!pickedVariant) {
-                    const seededHash = hashString(`${variantSeed}-${srcId}`);
-                    const random = mulberry32(seededHash);
-                    
                     // Linked variant resolution
                     const allowedByLinks = new Set<string>();
                     let hasLinksToThisCollection = false;
 
                     for (const prevId of pickedVariantIds) {
-                        for (const c of collections) {
-                            const prevVariant = c.items.find(i => i.id === prevId);
-                            if (prevVariant && prevVariant.linkedVariantIds && prevVariant.linkedVariantIds.length > 0) {
-                                const linksInThisCollection = prevVariant.linkedVariantIds.filter(lid => col.items.some(i => i.id === lid));
-                                if (linksInThisCollection.length > 0) {
-                                    hasLinksToThisCollection = true;
-                                    linksInThisCollection.forEach(lid => allowedByLinks.add(lid));
-                                }
+                        const prevColId = variantToCollectionId.get(prevId);
+                        const prevVariant = prevColId ? collectionById.get(prevColId)?.items.find(i => i.id === prevId) : null;
+                        if (prevVariant && prevVariant.linkedVariantIds && prevVariant.linkedVariantIds.length > 0) {
+                            const linksInThisCollection = prevVariant.linkedVariantIds.filter(lid => col.items.some(i => i.id === lid));
+                            if (linksInThisCollection.length > 0) {
+                                hasLinksToThisCollection = true;
+                                linksInThisCollection.forEach(lid => allowedByLinks.add(lid));
                             }
                         }
                     }
@@ -1259,11 +1658,13 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                     // Get list of collections that have already been evaluated (have at least one picked variant)
                     const evaluatedColIds = new Set<string>();
                     for (const pid of pickedVariantIds) {
-                        const pCol = collections.find(c => c.items.some(i => i.id === pid));
-                        if (pCol) evaluatedColIds.add(pCol.id);
+                        const pColId = variantToCollectionId.get(pid);
+                        if (pColId) evaluatedColIds.add(pColId);
                     }
 
                     const candidates = col.items.filter(v => {
+                        if (v.excluded || localExcluded.has(v.id)) return false;
+
                         // 1. Forward check (from previously picked to candidate)
                         if (hasLinksToThisCollection && !allowedByLinks.has(v.id)) {
                             return false;
@@ -1275,7 +1676,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                         if (v.linkedVariantIds && v.linkedVariantIds.length > 0) {
                             for (const evalColId of evaluatedColIds) {
                                 if (evalColId === col.id) continue;
-                                const evalCol = collections.find(c => c.id === evalColId);
+                                const evalCol = collectionById.get(evalColId);
                                 if (!evalCol) continue;
 
                                 const vLinksToEvalCol = v.linkedVariantIds.filter(lid => evalCol.items.some(i => i.id === lid));
@@ -1295,20 +1696,16 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                         return true;
                     });
 
-                    // Excluded variants are always removed from the pool
-                    // Apply both global exclusions (variant.excluded) AND local per-instance exclusions
-                    const localExcluded = new Set(el.localExcludedVariantIds || []);
-                    const eligibleCandidates = candidates.filter(v => !v.excluded && !localExcluded.has(v.id));
-                    // If link filtering wiped all candidates, fall back to all non-excluded items
-                    const nonExcluded = col.items.filter(v => !v.excluded && !localExcluded.has(v.id));
-                    let finalCandidates = eligibleCandidates.length > 0 ? eligibleCandidates
-                        : nonExcluded.length > 0 ? nonExcluded
-                        : col.items.filter(v => !v.excluded); // fall back to globally-non-excluded only
+                    let finalCandidates = candidates;
+                    if (finalCandidates.length === 0) {
+                        variants[el.elementId] = null;
+                        return;
+                    }
 
                     // --- Same-collection deduplication ---
                     // If another element from this collection already picked a variant,
                     // forcibly exclude those variants so every element gets a unique one.
-                    const alreadyPickedInCol = pickedByCollection[col.id];
+                    const alreadyPickedInCol = pickedByCollection[resolvedColId];
                     if (alreadyPickedInCol && alreadyPickedInCol.size > 0) {
                         const deduped = finalCandidates.filter(v => !alreadyPickedInCol.has(v.id));
                         // Only apply dedup if there are still candidates left;
@@ -1318,53 +1715,31 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                         }
                     }
 
-                    // Calculate weights
-                    const usages = finalCandidates.map(v => (variantUsage[v.id] || 0) + (queueUsages[v.id] || 0));
-                    const minUsage = Math.min(...usages);
-                    
-                    const weights = finalCandidates.map((v, i) => {
-                        const relativeUsage = usages[i] - minUsage;
-                        // Use a softer linear penalty so items don't get completely locked out during preview
-                        return 100 / (1 + relativeUsage * 2);
-                    });
-                    
-                    const totalWeight = weights.reduce((a, b) => a + b, 0);
-                    const randomVal = random();
-                    let rand = randomVal * totalWeight;
-                    let index = 0;
-                    for (let i = 0; i < weights.length; i++) {
-                        rand -= weights[i];
-                        if (rand <= 0) {
-                            index = i;
-                            break;
-                        }
-                    }
-                    pickedVariant = finalCandidates[index];
-                    
-                    console.log(`[Shuffle Debug] Element: ${el.elementId} (src: ${srcId}), Seed: ${variantSeed}, Hash: ${seededHash}, Rand: ${randomVal}, Candidates: ${finalCandidates.map(c=>c.id).join(',')}, Weights: ${weights.join(',')}, Picked: ${pickedVariant?.id}`);
+                    pickedVariant = pickWeighted(finalCandidates, `${variantSeed}-${selectionKey}-variant`, combinedUsage);
                 }
                 
                 variants[el.elementId] = pickedVariant;
                 if (pickedVariant) {
                     pickedVariantIds.add(pickedVariant.id);
                     // Record per-collection pick for deduplication
-                    if (!pickedByCollection[col.id]) pickedByCollection[col.id] = new Set();
-                    pickedByCollection[col.id].add(pickedVariant.id);
+                    if (!pickedByCollection[resolvedColId]) pickedByCollection[resolvedColId] = new Set();
+                    pickedByCollection[resolvedColId].add(pickedVariant.id);
                 }
             } else {
                 variants[el.elementId] = null;
             }
         });
         return variants;
-    }, [elements, collections, variantSeed, variantUsage, inspectorVariantModes]);
+    }, [elements, collections, variantSeed, variantUsage, renderQueue, resolvedCollectionIdByElement, getSelectionKey, pickWeighted]);
 
     const activeVariantModes = useMemo(() => {
         const modes: Record<string, string> = {};
         for (const el of elements) {
             const userMode = getVariantMode(el.elementId);
-            modes[el.elementId] = userMode === 'all'
-                ? (previewVariants[el.elementId]?.id || 'all')
-                : userMode;
+            const previewMode = previewVariants[el.elementId]?.id || 'all';
+            modes[el.elementId] = userMode !== 'all' && previewMode === userMode
+                ? userMode
+                : previewMode;
         }
         return modes;
     }, [elements, previewVariants, getVariantMode]);
@@ -1919,6 +2294,10 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     };
 
     const selectedElement = elements.find(e => e.elementId === selectedElementId);
+    const selectedResolvedCollectionId = selectedElement ? (resolvedCollectionIdByElement[selectedElement.elementId] || selectedElement.collectionId) : null;
+    const selectedTextCollectionGroup = selectedElement && selectedElement.collectionType === 'text'
+        ? textGroupById[collectionToTextGroupId[selectedElement.collectionId] || ""]
+        : undefined;
 
     // Get the effective element with variant overrides merged in
     const getEffectiveElement = (el: CanvasElement, variantId: string): CanvasElement => {
@@ -1949,6 +2328,132 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             }
         }
         setElements(prev => prev.map(el => el.elementId === selectedElementId ? applyToElement(el, finalUpdates, selectedVariantMode) : el));
+    };
+
+    type PropertyCopyScope = 'all' | 'transform' | 'animation' | 'textStyle';
+    const SCOPE_LABEL: Record<PropertyCopyScope, string> = {
+        all: 'Properties',
+        transform: 'Transform',
+        animation: 'Animation',
+        textStyle: 'Text Style',
+    };
+    const COPY_SCOPE_KEYS: Record<Exclude<PropertyCopyScope, 'all'>, (keyof CanvasElement)[]> = {
+        transform: ['x', 'y', 'width', 'height', 'rotation', 'opacity', 'zIndex', 'aspectRatioLocked'],
+        animation: ['animations'],
+        textStyle: ['fontSize', 'lineHeight', 'letterSpacing', 'fontWeight', 'fontStyle', 'textDecoration', 'textAlign', 'textStrokeColor', 'textStrokeWidth'],
+    };
+
+    const extractCopyableProperties = (el: CanvasElement, scope: PropertyCopyScope = 'all'): Partial<CanvasElement> => {
+        if (scope === 'textStyle') {
+            return {
+                fontSize: el.fontSize ?? 16,
+                lineHeight: el.lineHeight ?? 1.4,
+                letterSpacing: el.letterSpacing ?? 0,
+                fontWeight: el.fontWeight ?? 'bold',
+                fontStyle: el.fontStyle ?? 'normal',
+                textDecoration: el.textDecoration ?? 'none',
+                textAlign: el.textAlign ?? 'center',
+                textStrokeColor: el.textStrokeColor ?? '#000000',
+                textStrokeWidth: el.textStrokeWidth ?? 0,
+            };
+        }
+
+        const copy = clonePlain(el) as unknown as Record<string, unknown>;
+        delete copy.elementId;
+        delete copy.collectionId;
+        delete copy.collectionType;
+        delete copy.title;
+        delete copy.sourceElementId;
+        delete copy.selectedVariantId;
+        delete copy.variantOverrides;
+
+        if (scope !== 'all') {
+            const allowed = new Set<string>(COPY_SCOPE_KEYS[scope].map(k => String(k)));
+            Object.keys(copy).forEach((key) => {
+                if (!allowed.has(key)) delete copy[key];
+            });
+        }
+
+        return copy as Partial<CanvasElement>;
+    };
+
+    const isValueTypeCompatible = (targetValue: unknown, sourceValue: unknown): boolean => {
+        if (sourceValue === undefined) return false;
+        if (targetValue === undefined || targetValue === null) return true;
+        if (Array.isArray(targetValue)) return Array.isArray(sourceValue);
+        if (typeof targetValue === 'object') return typeof sourceValue === 'object' && sourceValue !== null && !Array.isArray(sourceValue);
+        return typeof targetValue === typeof sourceValue;
+    };
+
+    const copyAllProperties = async (scope: PropertyCopyScope = 'all') => {
+        const sourceEl = effectiveElement || selectedElement;
+        if (!sourceEl) return;
+
+        const nextCopied = extractCopyableProperties(sourceEl, scope);
+        if (Object.keys(nextCopied).length === 0) {
+            showToast(`No ${SCOPE_LABEL[scope]} to copy`, "error");
+            return;
+        }
+        setCopiedProperties(nextCopied);
+
+        try {
+            await navigator.clipboard.writeText(JSON.stringify(nextCopied));
+            showToast(`${SCOPE_LABEL[scope]} copied`, "success");
+        } catch {
+            showToast(`${SCOPE_LABEL[scope]} copied (local only)`, "success");
+        }
+    };
+
+    const pasteAllProperties = async (scope: PropertyCopyScope = 'all') => {
+        const targetEl = effectiveElement || selectedElement;
+        if (!targetEl) return;
+
+        let source: Record<string, unknown> | null = null;
+
+        try {
+            const clipboardText = await navigator.clipboard.readText();
+            if (clipboardText.trim()) {
+                const parsed = JSON.parse(clipboardText) as unknown;
+                if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                    source = parsed as Record<string, unknown>;
+                }
+            }
+        } catch {
+            // no-op fallback below
+        }
+
+        if (!source && copiedProperties) {
+            source = copiedProperties as Record<string, unknown>;
+        }
+
+        if (!source) {
+            showToast("No copied properties found", "error");
+            return;
+        }
+
+        const scopedSourceEntries = Object.entries(source).filter(([key]) => {
+            if (scope === 'all') return true;
+            return COPY_SCOPE_KEYS[scope].includes(key as keyof CanvasElement);
+        });
+
+        const targetObject = targetEl as unknown as Record<string, unknown>;
+        const matchedEntries = scopedSourceEntries.filter(([key, value]) => {
+            if (scope === 'all') {
+                return key in targetObject && isValueTypeCompatible(targetObject[key], value);
+            }
+            // For scoped pastes (transform/animation/textStyle), allow applying optional keys
+            // even if they are not explicitly present on the current element object yet.
+            return isValueTypeCompatible(targetObject[key], value);
+        });
+
+        if (matchedEntries.length === 0) {
+            showToast(`No matching ${SCOPE_LABEL[scope].toLowerCase()} to paste`, "error");
+            return;
+        }
+
+        const updates = Object.fromEntries(matchedEntries) as Partial<CanvasElement>;
+        updateSelected(updates);
+        showToast(`Pasted ${matchedEntries.length} ${SCOPE_LABEL[scope].toLowerCase()}`, "success");
     };
 
     const removeSelected = () => {
@@ -1993,6 +2498,33 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         setSelectedElementId(null);
     };
 
+    const persistRenderQueue = useCallback(async (nextQueue: QueuedRenderJob[], successMessage?: string) => {
+        setRenderQueue(nextQueue);
+        if (!compositionId) {
+            if (successMessage) showToast(successMessage, "success");
+            return;
+        }
+
+        try {
+            const res = await fetch(`/api/compositions/${compositionId}`, {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    collections: {
+                        items: collections,
+                        textGroups: textCollectionGroups,
+                        renderQueue: nextQueue,
+                    },
+                }),
+            });
+            if (!res.ok) throw new Error("Failed to save render queue");
+            if (successMessage) showToast(successMessage, "success");
+        } catch (e) {
+            console.error("Failed to persist render queue", e);
+            showToast("Queue updated locally, but failed to save.", "error");
+        }
+    }, [compositionId, collections, textCollectionGroups]);
+
     // --- Build a flat RenderJob from current state ---
     const buildRenderJob = useCallback(() => {
         const [rw, rh] = exportSettings.resolution.split('x').map(Number);
@@ -2005,7 +2537,8 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             })
             .map(el => {
             const timingEntry = elementTimings.get(el.elementId) ?? { startTime: el.startTime, duration: el.duration };
-            const col = collections.find(c => c.id === el.collectionId);
+            const resolvedColId = resolvedCollectionIdByElement[el.elementId] || el.collectionId;
+            const col = collections.find(c => c.id === resolvedColId);
             const chosenVariant = previewVariants[el.elementId];
 
             // Resolve actual content/URL from selected variant
@@ -2029,6 +2562,8 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
 
             const startTime = timingEntry.startTime;
             const duration = variantOverride?.duration ?? timingEntry.duration;
+            const trackIndex = tracks.findIndex(t => t.id === (el.trackId || 'track-0'));
+            const baseZ = 1000 - (Math.max(0, trackIndex) * 10);
 
             // Randomize window: bake a seeded-random offset into the export, same as preview
             const isMedia = el.collectionType === 'video' || el.collectionType === 'audio';
@@ -2059,7 +2594,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 speed: el.speed,
                 audioFadeIn: el.audioFadeIn,
                 audioFadeOut: el.audioFadeOut,
-                zIndex: el.zIndex,
+                zIndex: baseZ + (el.zIndex || 0),
                 fontSize: el.fontSize,
                 fontWeight: el.fontWeight,
                 fontStyle: el.fontStyle,
@@ -2098,14 +2633,20 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             videoBitsPerSecond: exportSettings.bitrate * 1_000_000,
             format: exportSettings.format,
         };
-    }, [elements, collections, previewVariants, elementTimings, exportSettings, TOTAL_DURATION]);
+    }, [elements, collections, previewVariants, elementTimings, exportSettings, TOTAL_DURATION, resolvedCollectionIdByElement, tracks, variantSeed]);
 
     const queueCurrentVariant = useCallback(() => {
         const job = buildRenderJob();
         const currentUsedVariantIds = elements.map(el => activeVariantModes[el.elementId]).filter(id => id !== 'all') as string[];
-        setRenderQueue(prev => [...prev, { id: `job-${Date.now()}`, name: `Variant ${prev.length + 1} (Seed ${variantSeed})`, job, usedVariantIds: currentUsedVariantIds }]);
-        showToast("Variant added to render queue", "success");
-    }, [buildRenderJob, variantSeed, elements, activeVariantModes]);
+        const name = `Variant ${renderQueueRef.current.length + 1} (Seed ${variantSeed})`;
+        const queuedJob: QueuedRenderJob = {
+            id: `job-${Date.now()}`,
+            name,
+            job: { ...job, outputName: `${title} - ${name}` },
+            usedVariantIds: currentUsedVariantIds,
+        };
+        void persistRenderQueue([...renderQueueRef.current, queuedJob], "Variant added to composition bucket");
+    }, [buildRenderJob, variantSeed, title, elements, activeVariantModes, persistRenderQueue]);
 
     const startRender = useCallback(async () => {
         const currentUsedVariantIds = elements.map(el => activeVariantModes[el.elementId]).filter(id => id !== 'all') as string[];
@@ -2135,9 +2676,9 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 // Record usage for negative bias in future randomizations
                 recordVariantUsage(item.usedVariantIds);
 
-                // Remove from queue if successful
                 if (jobsToRender.length > 1) {
-                    setRenderQueue(prev => prev.filter(q => q.id !== item.id));
+                    const nextQueue = renderQueueRef.current.filter(q => q.id !== item.id);
+                    await persistRenderQueue(nextQueue);
                 }
             }
             if (!abortCtrl.signal.aborted) {
@@ -2146,13 +2687,13 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         } catch (e: unknown) {
             setRenderProgress({ phase: 'error', progress: 0, message: 'Render failed', error: e instanceof Error ? e.message : String(e) });
         }
-    }, [buildRenderJob, renderQueue]);
+    }, [buildRenderJob, renderQueue, elements, activeVariantModes, persistRenderQueue, recordVariantUsage]);
 
     const cancelRender = useCallback(() => {
         renderAbortRef.current?.abort();
     }, []);
 
-    const saveSkeleton = async (overrides?: { tracks?: TrackConfig[], silent?: boolean }) => {
+    const saveSkeleton = useCallback(async (overrides?: { tracks?: TrackConfig[], silent?: boolean }) => {
         setSaving(true);
         try {
             const payload = {
@@ -2160,7 +2701,11 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 duration: TOTAL_DURATION,
                 elements: elements,
                 tracks: overrides?.tracks || tracks,
-                collections: collections,
+                collections: {
+                    items: collections,
+                    textGroups: textCollectionGroups,
+                    renderQueue,
+                },
             };
             const endpoint = compositionId ? `/api/compositions/${compositionId}` : '/api/compositions';
             const method = compositionId ? 'PUT' : 'POST';
@@ -2175,7 +2720,34 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             else { if (!overrides?.silent) showToast("Failed to save composition.", "error"); }
             } catch { if (!overrides?.silent) showToast("Failed to save.", "error"); }
             finally { setSaving(false); }
-            };
+            }, [title, TOTAL_DURATION, elements, tracks, collections, textCollectionGroups, renderQueue, compositionId]);
+
+    const saveSkeletonRef = useRef(saveSkeleton);
+    const savingRef = useRef(saving);
+    const fetchingRef = useRef(fetching);
+
+    useEffect(() => {
+        saveSkeletonRef.current = saveSkeleton;
+    }, [saveSkeleton]);
+
+    useEffect(() => {
+        savingRef.current = saving;
+    }, [saving]);
+
+    useEffect(() => {
+        fetchingRef.current = fetching;
+    }, [fetching]);
+
+    useEffect(() => {
+        if (!compositionId) return;
+
+        const intervalId = window.setInterval(() => {
+            if (fetchingRef.current || savingRef.current) return;
+            saveSkeletonRef.current({ silent: true });
+        }, 30_000);
+
+        return () => window.clearInterval(intervalId);
+    }, [compositionId]);
 
     return (
         <DndContext sensors={sensors} onDragStart={handleDragStart} onDragMove={handleDragMove} onDragEnd={handleDragEnd} collisionDetection={pointerWithin}>
@@ -2221,6 +2793,24 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                         </div>
                     </div>
                     <div className="flex items-center gap-3">
+                        <div className="flex items-center gap-1">
+                            <button
+                                onClick={undoHistory}
+                                disabled={!canUndo}
+                                title="Undo (Ctrl/Cmd+Z)"
+                                className="p-1.5 px-2 bg-white/5 hover:bg-white/10 border border-white/10 disabled:opacity-40 disabled:cursor-not-allowed text-gray-300 hover:text-white rounded-md transition-colors flex items-center justify-center"
+                            >
+                                <RotateCcw className="w-4 h-4" />
+                            </button>
+                            <button
+                                onClick={redoHistory}
+                                disabled={!canRedo}
+                                title="Redo (Ctrl/Cmd+Y or Ctrl/Cmd+Shift+Z)"
+                                className="p-1.5 px-2 bg-white/5 hover:bg-white/10 border border-white/10 disabled:opacity-40 disabled:cursor-not-allowed text-gray-300 hover:text-white rounded-md transition-colors flex items-center justify-center"
+                            >
+                                <RotateCw className="w-4 h-4" />
+                            </button>
+                        </div>
                         <div className="relative">
                             <button onClick={() => setIsSettingsOpen(!isSettingsOpen)} title="Project Settings" className="p-1.5 px-2 bg-white/5 hover:bg-white/10 border border-white/10 text-gray-300 hover:text-white rounded-md transition-colors flex items-center justify-center">
                                 <Settings className="w-4 h-4" />
@@ -2357,6 +2947,103 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                         </AnimatePresence>
 
                         <div className="flex-1 overflow-y-auto p-3 space-y-2 custom-scrollbar">
+                            <div className="rounded-lg border border-amber-500/20 bg-amber-500/5 p-2.5 space-y-2">
+                                <div className="flex items-center justify-between">
+                                    <h3 className="text-[9px] font-bold uppercase tracking-widest text-amber-300/80 font-mono">Text Groups</h3>
+                                    <button
+                                        onClick={() => setIsCreatingTextGroup(v => !v)}
+                                        className="text-amber-300/60 hover:text-amber-200 transition-colors"
+                                        title="Create text group"
+                                    >
+                                        <Plus className="w-3.5 h-3.5" />
+                                    </button>
+                                </div>
+                                {isCreatingTextGroup && (
+                                    <div className="space-y-1.5 border border-amber-500/20 rounded-md p-2 bg-black/20">
+                                        <input
+                                            value={newTextGroupTitle}
+                                            onChange={(e) => setNewTextGroupTitle(e.target.value)}
+                                            placeholder="Group name (e.g. Hooks)"
+                                            className="w-full text-[10px] font-mono bg-black/40 border border-white/10 rounded px-2 py-1.5 text-gray-300 placeholder:text-gray-600 outline-none focus:border-white/20"
+                                        />
+                                        <div className="space-y-1 max-h-28 overflow-y-auto custom-scrollbar pr-1">
+                                            {collections.filter(c => c.type === 'text').map(tc => (
+                                                <label key={tc.id} className="flex items-center gap-2 text-[9px] font-mono text-gray-400 cursor-pointer">
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={!!newTextGroupSelection[tc.id]}
+                                                        onChange={(e) => setNewTextGroupSelection(prev => ({ ...prev, [tc.id]: e.target.checked }))}
+                                                        className="accent-amber-400"
+                                                    />
+                                                    <span className="truncate">{tc.title}</span>
+                                                </label>
+                                            ))}
+                                        </div>
+                                        <div className="flex gap-1.5">
+                                            <button
+                                                onClick={() => {
+                                                    const selectedIds = Object.entries(newTextGroupSelection).filter(([, v]) => v).map(([id]) => id);
+                                                    if (!newTextGroupTitle.trim() || selectedIds.length < 2) return;
+                                                    setTextCollectionGroups(prev => {
+                                                        const cleaned = prev
+                                                            .map(g => ({ ...g, collectionIds: g.collectionIds.filter(id => !selectedIds.includes(id)) }))
+                                                            .filter(g => g.collectionIds.length > 1);
+                                                        return [...cleaned, {
+                                                            id: `tg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+                                                            title: newTextGroupTitle.trim(),
+                                                            collectionIds: selectedIds,
+                                                        }];
+                                                    });
+                                                    setNewTextGroupTitle("");
+                                                    setNewTextGroupSelection({});
+                                                    setIsCreatingTextGroup(false);
+                                                }}
+                                                className="flex-1 text-[9px] font-mono py-1 bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 rounded transition-colors"
+                                            >
+                                                Create
+                                            </button>
+                                            <button
+                                                onClick={() => { setIsCreatingTextGroup(false); setNewTextGroupTitle(""); setNewTextGroupSelection({}); }}
+                                                className="flex-1 text-[9px] font-mono py-1 bg-white/5 hover:bg-white/10 text-gray-500 rounded transition-colors"
+                                            >
+                                                Cancel
+                                            </button>
+                                        </div>
+                                        <p className="text-[8px] text-gray-600 font-mono">Pick at least 2 text collections.</p>
+                                    </div>
+                                )}
+                                {textCollectionGroups.length === 0 ? (
+                                    <p className="text-[8px] font-mono text-gray-600">Create a group to treat collections as higher-level variants.</p>
+                                ) : (
+                                    <div className="space-y-1.5">
+                                        {textCollectionGroups.map(group => (
+                                            <div key={group.id} className="border border-amber-500/20 rounded-md p-2 bg-black/20">
+                                                <div className="flex items-center justify-between gap-2">
+                                                    <span className="text-[9px] font-mono text-amber-200 truncate">{group.title}</span>
+                                                    <button
+                                                        onClick={() => setTextCollectionGroups(prev => prev.filter(g => g.id !== group.id))}
+                                                        className="text-gray-500 hover:text-red-400 transition-colors"
+                                                        title="Delete text group"
+                                                    >
+                                                        <X className="w-3 h-3" />
+                                                    </button>
+                                                </div>
+                                                <div className="mt-1 flex flex-wrap gap-1">
+                                                    {group.collectionIds.map(colId => {
+                                                        const col = collections.find(c => c.id === colId);
+                                                        if (!col) return null;
+                                                        return (
+                                                            <span key={colId} className="px-1.5 py-0.5 rounded bg-white/5 text-[8px] font-mono text-gray-400">
+                                                                {col.title}
+                                                            </span>
+                                                        );
+                                                    })}
+                                                </div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
                             {collections.map(col => (
                                 <CollectionCard
                                     key={col.id}
@@ -2380,6 +3067,9 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                     onDeleteCollection={(colId) => {
                                         setCollections(prev => prev.filter(c => c.id !== colId));
                                         setElements(prev => prev.filter(el => el.collectionId !== colId));
+                                        setTextCollectionGroups(prev => prev
+                                            .map(g => ({ ...g, collectionIds: g.collectionIds.filter(id => id !== colId) }))
+                                            .filter(g => g.collectionIds.length > 1));
                                         if (elements.find(el => el.elementId === selectedElementId && el.collectionId === colId)) {
                                             setSelectedElementId(null);
                                         }
@@ -2539,14 +3229,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                 .map(baseEl => {
                                                     // When a specific variant is selected in inspector, use it for preview
                                                     // When 'all', fall back to random seed-based preview
-                                                    let variant: CollectionVariant | null = null;
-                                                    const elMode = getVariantMode(baseEl.elementId);
-                                                    if (elMode !== 'all') {
-                                                        const col = collections.find(c => c.id === baseEl.collectionId);
-                                                        variant = col?.items.find(v => v.id === elMode) ?? previewVariants[baseEl.elementId];
-                                                    } else {
-                                                        variant = previewVariants[baseEl.elementId];
-                                                    }
+                                                    const variant = previewVariants[baseEl.elementId];
                                                     const overrides = variant ? getEffectiveElement(baseEl, variant.id) : baseEl;
                                                     const timing = elementTimings.get(baseEl.elementId) || { startTime: baseEl.startTime, duration: baseEl.duration };
                                                     const el = { ...overrides, ...timing };
@@ -2693,14 +3376,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                             {elements
                                                 .filter(baseEl => baseEl.collectionType === 'audio' && baseEl.visible !== false)
                                                 .map(baseEl => {
-                                                    let variant: CollectionVariant | null = null;
-                                                    const elMode = getVariantMode(baseEl.elementId);
-                                                    if (elMode !== 'all') {
-                                                        const col = collections.find(c => c.id === baseEl.collectionId);
-                                                        variant = col?.items.find(v => v.id === elMode) ?? previewVariants[baseEl.elementId];
-                                                    } else {
-                                                        variant = previewVariants[baseEl.elementId];
-                                                    }
+                                                    const variant = previewVariants[baseEl.elementId];
                                                     const overrides = variant ? getEffectiveElement(baseEl, variant.id) : baseEl;
                                                     const timing = elementTimings.get(baseEl.elementId) || { startTime: baseEl.startTime, duration: baseEl.duration };
                                                     const el = { ...overrides, ...timing };
@@ -3303,7 +3979,8 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
 
                                                                                         const colors = COLLECTION_COLORS[el.collectionType];
                                                                                         const isSelected = selectedElementId === el.elementId;
-                                                                                        const col = collections.find(c => c.id === el.collectionId);
+                                                                                        const resolvedColId = resolvedCollectionIdByElement[el.elementId] || el.collectionId;
+                                                                                        const col = collections.find(c => c.id === resolvedColId);
                                                                                         const elVarMode = getVariantMode(el.elementId);
                                                                                         const editingVariantStr = elVarMode !== 'all' ? col?.items.find(v => v.id === elVarMode)?.label : null;
                                                                                         const displayText = editingVariantStr ? `${el.title} [${editingVariantStr}]` : el.title;
@@ -3495,7 +4172,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
 
                                     {/* Universal Variant Selector */}
                                     {(() => {
-                                        const col = collections.find(c => c.id === selectedElement.collectionId);
+                                        const col = collections.find(c => c.id === selectedResolvedCollectionId);
                                         const variants = col?.items || [];
                                         if (variants.length === 0) return (
                                             <div className="bg-[#111] rounded-lg border border-dashed border-white/5 px-3 py-3 text-center">
@@ -3504,6 +4181,42 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                         );
                                         return (
                                             <div className="space-y-2 pb-4 border-b border-white/5">
+                                                {selectedElement.collectionType === 'text' && selectedTextCollectionGroup && (
+                                                    <div className="space-y-1.5 mb-2">
+                                                        <h4 className="text-[9px] font-bold uppercase tracking-widest text-gray-500 font-mono flex items-center gap-1.5">
+                                                            <ListPlus className="w-3 h-3 text-amber-400" /> Text Collection Variant
+                                                            <span className="text-amber-400/60">({selectedTextCollectionGroup.collectionIds.length})</span>
+                                                        </h4>
+                                                        <div className="flex flex-wrap gap-1">
+                                                            {selectedTextCollectionGroup.collectionIds.length > 1 && (
+                                                                <button
+                                                                    onClick={() => setElements(prev => prev.map(el => el.elementId === selectedElement.elementId ? { ...el, textCollectionMode: 'all' } : el))}
+                                                                    className={cn("px-2.5 py-1.5 rounded-md text-[9px] font-mono font-bold uppercase tracking-wide transition-all border", (selectedElement.textCollectionMode || 'all') === 'all' ? "bg-amber-500/20 border-amber-500/40 text-amber-300 shadow-[0_0_8px_rgba(245,158,11,0.15)]" : "bg-white/5 border-white/5 text-gray-500 hover:text-gray-300 hover:bg-white/10")}
+                                                                >
+                                                                    ✦ All
+                                                                </button>
+                                                            )}
+                                                            {selectedTextCollectionGroup.collectionIds.map(groupColId => {
+                                                                const groupCol = collections.find(c => c.id === groupColId);
+                                                                if (!groupCol) return null;
+                                                                const isActive = (selectedElement.textCollectionMode || 'all') === groupColId;
+                                                                return (
+                                                                    <button
+                                                                        key={groupColId}
+                                                                        onClick={() => setElements(prev => prev.map(el => el.elementId === selectedElement.elementId ? { ...el, textCollectionMode: groupColId } : el))}
+                                                                        className={cn("px-2.5 py-1.5 rounded-md text-[9px] font-mono transition-all border truncate max-w-[140px]", isActive ? "bg-amber-500/20 border-amber-500/40 text-amber-300 shadow-[0_0_8px_rgba(245,158,11,0.15)]" : "bg-white/5 border-white/5 text-gray-500 hover:text-gray-300 hover:bg-white/10")}
+                                                                        title={groupCol.title}
+                                                                    >
+                                                                        {groupCol.title}
+                                                                    </button>
+                                                                );
+                                                            })}
+                                                        </div>
+                                                        <p className="text-[8px] font-mono text-amber-400/50">
+                                                            Group source: <span className="text-amber-300/80">{col?.title || "N/A"}</span>
+                                                        </p>
+                                                    </div>
+                                                )}
                                                 <h4 className="text-[9px] font-bold uppercase tracking-widest text-gray-500 font-mono flex items-center gap-1.5">
                                                     <Shuffle className="w-3 h-3 text-cyan-400" /> Editing Variant
                                                     <span className="text-cyan-400/60">({variants.length})</span>
@@ -3791,7 +4504,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
 
                                     {/* Text Content — only for text elements when a specific variant is selected */}
                                     {selectedElement.collectionType === 'text' && selectedVariantMode !== 'all' && (() => {
-                                        const col = collections.find(c => c.id === selectedElement.collectionId);
+                                        const col = collections.find(c => c.id === selectedResolvedCollectionId);
                                         const variant = col?.items.find(v => v.id === selectedVariantMode);
                                         if (!variant || !col) return null;
                                         return (
@@ -3815,6 +4528,20 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                     {selectedElement.collectionType === 'text' && (
                                         <div className="space-y-3 pt-4 border-t border-white/5">
                                             <h4 className="text-[9px] font-bold uppercase tracking-widest text-gray-500 font-mono">Text Style</h4>
+                                            <div className="grid grid-cols-2 gap-2">
+                                                <button
+                                                    onClick={() => { void copyAllProperties('textStyle'); }}
+                                                    className="text-[9px] font-mono py-1.5 rounded border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 text-amber-200 transition-colors"
+                                                >
+                                                    Copy Text Style
+                                                </button>
+                                                <button
+                                                    onClick={() => { void pasteAllProperties('textStyle'); }}
+                                                    className="text-[9px] font-mono py-1.5 rounded border border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/20 text-amber-200 transition-colors"
+                                                >
+                                                    Paste Text Style
+                                                </button>
+                                            </div>
                                             {/* Font Size & Line Height */}
                                             <div className="grid grid-cols-2 gap-2">
                                                 <div className="flex items-center bg-[#111] rounded-md border border-white/10 px-2.5 py-2 focus-within:border-blue-500/50 transition-colors">
@@ -4065,7 +4792,8 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                     {elements
                                                         .filter(el => el.elementId !== selectedElement.elementId && el.trackId !== selectedElement.trackId)
                                                         .map(el => {
-                                                            const col = collections.find(c => c.id === el.collectionId);
+                                                            const resolvedColId = resolvedCollectionIdByElement[el.elementId] || el.collectionId;
+                                                            const col = collections.find(c => c.id === resolvedColId);
                                                             const label = col?.title || "Element";
                                                             return (
                                                                 <option key={el.elementId} value={el.elementId} className="bg-[#111]">
@@ -4245,6 +4973,63 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                             </div>
                                         )}
                                     </div>
+
+                                    {/* All Properties */}
+                                    <div className="space-y-3 pt-4 border-t border-white/5">
+                                        <div className="flex items-center justify-between">
+                                            <h4 className="text-[9px] font-bold uppercase tracking-widest text-gray-500 font-mono">
+                                                All Properties
+                                            </h4>
+                                            <span className="text-[8px] font-mono text-gray-600">
+                                                Paste matches by key + type
+                                            </span>
+                                        </div>
+                                        <div className="grid grid-cols-2 gap-2">
+                                            <button
+                                                onClick={() => { void copyAllProperties(); }}
+                                                className="text-[9px] font-mono py-1.5 rounded border border-white/10 bg-white/5 hover:bg-white/10 text-gray-300 transition-colors"
+                                            >
+                                                Copy Properties
+                                            </button>
+                                            <button
+                                                onClick={() => { void pasteAllProperties(); }}
+                                                className="text-[9px] font-mono py-1.5 rounded border border-cyan-500/30 bg-cyan-500/10 hover:bg-cyan-500/20 text-cyan-200 transition-colors"
+                                            >
+                                                Paste Properties
+                                            </button>
+                                        </div>
+                                        <div className="grid grid-cols-2 gap-2">
+                                            <button
+                                                onClick={() => { void copyAllProperties('transform'); }}
+                                                className="text-[9px] font-mono py-1.5 rounded border border-blue-500/30 bg-blue-500/10 hover:bg-blue-500/20 text-blue-200 transition-colors"
+                                            >
+                                                Copy Transform
+                                            </button>
+                                            <button
+                                                onClick={() => { void pasteAllProperties('transform'); }}
+                                                className="text-[9px] font-mono py-1.5 rounded border border-blue-500/30 bg-blue-500/10 hover:bg-blue-500/20 text-blue-200 transition-colors"
+                                            >
+                                                Paste Transform
+                                            </button>
+                                        </div>
+                                        <div className="grid grid-cols-2 gap-2">
+                                            <button
+                                                onClick={() => { void copyAllProperties('animation'); }}
+                                                className="text-[9px] font-mono py-1.5 rounded border border-purple-500/30 bg-purple-500/10 hover:bg-purple-500/20 text-purple-200 transition-colors"
+                                            >
+                                                Copy Animation
+                                            </button>
+                                            <button
+                                                onClick={() => { void pasteAllProperties('animation'); }}
+                                                className="text-[9px] font-mono py-1.5 rounded border border-purple-500/30 bg-purple-500/10 hover:bg-purple-500/20 text-purple-200 transition-colors"
+                                            >
+                                                Paste Animation
+                                            </button>
+                                        </div>
+                                        <pre className="max-h-28 overflow-auto rounded-md border border-white/10 bg-black/30 p-2 text-[8px] leading-relaxed text-gray-500 font-mono custom-scrollbar">
+                                            {JSON.stringify(extractCopyableProperties((effectiveElement || selectedElement)), null, 2)}
+                                        </pre>
+                                    </div>
                                 </div>
                             )}
                         </div>
@@ -4395,7 +5180,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                             </div>
                                             <div className="flex items-center gap-3 text-[10px] font-mono text-gray-400">
                                                 <span>{renderQueue.length} variant(s) queued</span>
-                                                <button onClick={() => setRenderQueue([])} className="text-red-400 hover:text-red-300">Clear</button>
+                                                <button onClick={() => void persistRenderQueue([], "Composition bucket cleared")} className="text-red-400 hover:text-red-300">Clear</button>
                                             </div>
                                         </div>
                                     )}
