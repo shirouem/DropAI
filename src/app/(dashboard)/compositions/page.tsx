@@ -120,6 +120,9 @@ export default function CompositionsPage() {
         if (masterQueue.length === 0 || isMasterRendering) return;
 
         const abortCtrl = new AbortController();
+        const queueByComposition = new Map(
+            compositions.map(comp => [comp.id, getRenderQueue(comp)])
+        );
         masterAbortRef.current = abortCtrl;
         setIsMasterRendering(true);
         setMasterProgress({ phase: "preparing", progress: 0, message: "Starting master render..." });
@@ -146,7 +149,9 @@ export default function CompositionsPage() {
                     abortCtrl.signal
                 );
 
-                const nextQueue = getRenderQueue(comp).filter(queueItem => queueItem.id !== item.id);
+                const currentQueue = queueByComposition.get(comp.id) ?? getRenderQueue(comp);
+                const nextQueue = currentQueue.filter(queueItem => queueItem.id !== item.id);
+                queueByComposition.set(comp.id, nextQueue);
                 await updateCompositionQueue(comp, nextQueue);
             }
 
