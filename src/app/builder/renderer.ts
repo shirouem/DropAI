@@ -23,7 +23,7 @@ export type RenderElement = {
     mediaUrl?: string;
     mediaOffset?: number;
     volume?: number;
-    speed?: number;        // Playback rate (for future resampling; stored for completeness)
+    speed?: number;        // Playback rate
     audioFadeIn?: number;  // Fade-in duration in seconds
     audioFadeOut?: number; // Fade-out duration in seconds
     zIndex: number;
@@ -45,6 +45,18 @@ export type RenderElement = {
         from?: number;
         to?: number;
     }>;
+    nestedCompositionTransform?: {
+        x: number;
+        y: number;
+        width: number;
+        height: number;
+        rotation?: number;
+        opacity?: number;
+        startTime: number;
+        duration: number;
+        animations: RenderElement["animations"];
+    };
+    nestedCompositionBlur?: number;
 };
 
 export interface RenderJob {
@@ -183,6 +195,46 @@ function evaluateAnimations(el: RenderElement, currentTime: number): AnimatedSty
 }
 
 // ─── Asset Loaders ───────────────────────────────────────────────────────────
+function applyNestedCompositionTransform(el: RenderElement, currentTime: number): RenderElement {
+    const group = el.nestedCompositionTransform;
+    if (!group) return el;
+
+    const groupAnim = evaluateAnimations({
+        ...el,
+        startTime: group.startTime,
+        duration: group.duration,
+        opacity: group.opacity ?? 1,
+        animations: group.animations || [],
+    }, currentTime);
+
+    const baseCenterX = group.x + group.width / 2;
+    const baseCenterY = group.y + group.height / 2;
+    const childCenterX = group.x + ((el.x + el.width / 2) / 100) * group.width;
+    const childCenterY = group.y + ((el.y + el.height / 2) / 100) * group.height;
+    const scale = groupAnim.scale;
+    const rotation = (group.rotation || 0) + groupAnim.rotate;
+    const rad = rotation * Math.PI / 180;
+    const dx = (childCenterX - baseCenterX) * scale;
+    const dy = (childCenterY - baseCenterY) * scale;
+    const rotatedDx = dx * Math.cos(rad) - dy * Math.sin(rad);
+    const rotatedDy = dx * Math.sin(rad) + dy * Math.cos(rad);
+    const width = (el.width / 100) * group.width * scale;
+    const height = (el.height / 100) * group.height * scale;
+    const centerX = baseCenterX + groupAnim.translateX + rotatedDx;
+    const centerY = baseCenterY + groupAnim.translateY + rotatedDy;
+
+    return {
+        ...el,
+        x: centerX - width / 2,
+        y: centerY - height / 2,
+        width,
+        height,
+        rotation: (el.rotation || 0) + rotation,
+        opacity: (el.opacity ?? 1) * groupAnim.opacity,
+        nestedCompositionBlur: Math.max(el.nestedCompositionBlur || 0, groupAnim.blur || 0),
+    };
+}
+
 function loadImage(url: string): Promise<HTMLImageElement> {
     return new Promise((res, rej) => {
         const img = new Image();
@@ -292,22 +344,24 @@ function drawFrame(
         if (el.collectionType === 'audio') continue;
         if (t < el.startTime || t >= el.startTime + el.duration - 0.0001) continue;
 
-        const anim = evaluateAnimations(el, t);
+        const visualEl = applyNestedCompositionTransform(el, t);
+        const anim = evaluateAnimations(visualEl, t);
         if (anim.opacity <= 0.001) continue;
 
-        const px = (el.x / 100) * W;
-        const py = (el.y / 100) * H;
-        const pw = (el.width / 100) * W;
-        const ph = (el.height / 100) * H;
+        const px = (visualEl.x / 100) * W;
+        const py = (visualEl.y / 100) * H;
+        const pw = (visualEl.width / 100) * W;
+        const ph = (visualEl.height / 100) * H;
         const cx = px + pw / 2 + (anim.translateX / 100) * W;
         const cy = py + ph / 2 + (anim.translateY / 100) * H;
 
         ctx.save();
         ctx.globalAlpha = Math.max(0, Math.min(1, anim.opacity));
-        if (anim.blur > 0) ctx.filter = `blur(${anim.blur}px)`;
+        const blur = Math.max(anim.blur, visualEl.nestedCompositionBlur || 0);
+        if (blur > 0) ctx.filter = `blur(${blur}px)`;
 
         ctx.translate(cx, cy);
-        ctx.rotate(((el.rotation ?? 0) + anim.rotate) * Math.PI / 180);
+        ctx.rotate(((visualEl.rotation ?? 0) + anim.rotate) * Math.PI / 180);
         const s = Math.max(0.001, anim.scale);
         ctx.scale(s, s);
         ctx.translate(-pw / 2, -ph / 2);
@@ -397,9 +451,10 @@ function mixAudio(
         const baseVol = el.volume ?? 1;
         const fadeIn  = el.audioFadeIn  ?? 0;
         const fadeOut = el.audioFadeOut ?? 0;
-        const off   = Math.floor((el.mediaOffset ?? 0) * sr);
+        const off = Math.max(0, (el.mediaOffset ?? 0) * sr);
+        const speed = Math.max(0.05, el.speed ?? 1);
         const start = Math.floor(el.startTime * sr);
-        const count = Math.min(Math.floor(el.duration * sr), buf.length - off, n - start);
+        const count = Math.max(0, Math.min(Math.floor(el.duration * sr), Math.floor((buf.length - off) / speed), n - start));
         const sL = buf.getChannelData(0);
         const sR = buf.numberOfChannels > 1 ? buf.getChannelData(1) : sL;
         
@@ -416,8 +471,14 @@ function mixAudio(
             if (fadeIn  > 0 && elapsed   < fadeIn)  fadeMult = Math.min(1, elapsed   / fadeIn);
             else if (fadeOut > 0 && remaining < fadeOut) fadeMult = Math.min(1, remaining / fadeOut);
             const v = baseVol * fadeMult;
-            L[start + i] += (sL[off + i] ?? 0) * v;
-            R[start + i] += (sR[off + i] ?? 0) * v;
+            const srcPos = off + i * speed;
+            const srcIdx = Math.floor(srcPos);
+            const frac = srcPos - srcIdx;
+            const nextIdx = Math.min(srcIdx + 1, buf.length - 1);
+            const sampleL = (sL[srcIdx] ?? 0) * (1 - frac) + (sL[nextIdx] ?? 0) * frac;
+            const sampleR = (sR[srcIdx] ?? 0) * (1 - frac) + (sR[nextIdx] ?? 0) * frac;
+            L[start + i] += sampleL * v;
+            R[start + i] += sampleR * v;
         }
     }
     
@@ -490,7 +551,7 @@ async function encodeComposition(
             if (el.collectionType !== 'video' || !el.mediaUrl) continue;
             if (t < el.startTime || t >= el.startTime + el.duration) continue;
             const vid = videos.get(el.elementId);
-            if (vid) await seekTo(vid, t - el.startTime + (el.mediaOffset ?? 0));
+            if (vid) await seekTo(vid, (t - el.startTime) * Math.max(0.05, el.speed ?? 1) + (el.mediaOffset ?? 0));
         }
 
         drawFrame(ctx, W, H, sorted, images, videos, t, lastFrames);

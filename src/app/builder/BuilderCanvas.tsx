@@ -6,7 +6,7 @@ import {
     Play, Pause, Plus, Image as ImageIcon, Music, Download, Upload,
     Layers, X, Type, MonitorPlay, SlidersHorizontal, GripVertical, Shuffle, SkipBack, Video, Trash2, Sparkles, ChevronDown, Eye, EyeOff,
     Bold, Italic, Underline, AlignLeft, AlignCenter, AlignRight, Scissors, MousePointer2, Settings, Lock, Unlock, ArrowUp, ArrowDown,
-    Film, Loader2, CheckCircle2, AlertCircle, Clapperboard, ListPlus, Link2, Ban, RotateCcw, RotateCw
+    Film, Loader2, CheckCircle2, AlertCircle, Clapperboard, ListPlus, Link2, Ban, RotateCcw, RotateCw, Copy
 } from "lucide-react";
 import Link from "next/link";
 import { renderComposition, type RenderJob, type RenderProgress, type RenderElement, type RenderFormat } from "./renderer";
@@ -27,7 +27,10 @@ import { CSS } from "@dnd-kit/utilities";
 import { cn } from "@/lib/utils";
 
 // --- Types ---
-type CollectionType = "text" | "image" | "video" | "audio";
+type CollectionType = "text" | "image" | "video" | "audio" | "subComposition";
+type PlayableCollectionType = Exclude<CollectionType, "subComposition">;
+type TimelineElementType = PlayableCollectionType | "nestedSequence";
+type CollectionVisualType = CollectionType | TimelineElementType;
 
 interface CollectionVariant {
     id: string;
@@ -72,6 +75,18 @@ interface ElementAnimation {
     to?: number;         // ending value (e.g., scale)
 }
 
+interface CompositionTransform {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    rotation?: number;
+    opacity?: number;
+    startTime: number;
+    duration: number;
+    animations: ElementAnimation[];
+}
+
 const ANIMATION_PRESETS: Record<AnimationType, { label: string; category: 'in' | 'out' }> = {
     fadeIn: { label: 'Fade In', category: 'in' },
     fadeOut: { label: 'Fade Out', category: 'out' },
@@ -100,7 +115,7 @@ export interface TrackConfig {
 export interface CanvasElement {
     elementId: string;
     collectionId: string;
-    collectionType: CollectionType;
+    collectionType: TimelineElementType;
     title: string;
     x: number;
     y: number;
@@ -140,7 +155,22 @@ export interface CanvasElement {
     matchDurationOffsets?: Record<string, number>;
     localExcludedVariantIds?: string[]; // Variant IDs excluded only for this instance (not global)
     textCollectionMode?: string; // "all" | specific grouped text collection id
+    nestedSequenceId?: string;
+    variantSeedKey?: string;
+    nestedCompositionTransform?: CompositionTransform;
+    nestedCompositionBlur?: number;
 }
+
+type NestedSequenceRecord = {
+    id: string;
+    title: string;
+    duration: number;
+    elements: string | CanvasElement[];
+    tracks: string | TrackConfig[];
+    collections: string | { items?: CollectionItem[]; textGroups?: TextCollectionGroup[]; renderQueue?: QueuedRenderJob[] } | CollectionItem[];
+    parentId?: string | null;
+    kind?: string;
+};
 
 type QueuedRenderJob = {
     id: string;
@@ -150,19 +180,56 @@ type QueuedRenderJob = {
 };
 
 // --- Collection Type Styling ---
-const COLLECTION_COLORS: Record<CollectionType, { bg: string; border: string; text: string; icon: string }> = {
+const COLLECTION_COLORS: Record<CollectionVisualType, { bg: string; border: string; text: string; icon: string }> = {
     text: { bg: "bg-amber-500/15", border: "border-amber-500/40", text: "text-amber-400", icon: "text-amber-500" },
     image: { bg: "bg-blue-500/15", border: "border-blue-500/40", text: "text-blue-400", icon: "text-blue-500" },
     video: { bg: "bg-purple-500/15", border: "border-purple-500/40", text: "text-purple-400", icon: "text-purple-500" },
     audio: { bg: "bg-emerald-500/15", border: "border-emerald-500/40", text: "text-emerald-400", icon: "text-emerald-500" },
+    subComposition: { bg: "bg-violet-500/15", border: "border-violet-500/40", text: "text-violet-300", icon: "text-violet-400" },
+    nestedSequence: { bg: "bg-violet-500/15", border: "border-violet-500/40", text: "text-violet-300", icon: "text-violet-400" },
 };
 
-const COLLECTION_ICONS: Record<CollectionType, React.ReactNode> = {
+const COLLECTION_ICONS: Record<CollectionVisualType, React.ReactNode> = {
     text: <Type className="w-3.5 h-3.5" />,
     image: <ImageIcon className="w-3.5 h-3.5" />,
     video: <MonitorPlay className="w-3.5 h-3.5" />,
     audio: <Music className="w-3.5 h-3.5" />,
+    subComposition: <Film className="w-3.5 h-3.5" />,
+    nestedSequence: <Film className="w-3.5 h-3.5" />,
 };
+
+const EMPTY_NESTED_COMPOSITION_DISPLAY_DURATION = 5;
+
+function withoutSubCompositionCollections(collections: CollectionItem[]) {
+    return collections.filter(collection => collection.type !== "subComposition");
+}
+
+function pruneTextGroupsForCollections(groups: TextCollectionGroup[], collections: CollectionItem[]) {
+    const collectionIds = new Set(collections.map(collection => collection.id));
+    return groups
+        .map(group => ({
+            ...group,
+            collectionIds: group.collectionIds.filter(collectionId => collectionIds.has(collectionId)),
+        }))
+        .filter(group => group.collectionIds.length > 1);
+}
+
+function syncSubCompositionVariantLabels(collections: CollectionItem[], sequences: NestedSequenceRecord[]) {
+    if (sequences.length === 0) return collections;
+    const sequenceById = new Map(sequences.map(sequence => [sequence.id, sequence]));
+    let changed = false;
+    const nextCollections = collections.map(collection => {
+        if (collection.type !== "subComposition") return collection;
+        const nextItems = collection.items.map(item => {
+            const sequence = sequenceById.get(item.value || item.id);
+            if (!sequence || item.label === sequence.title) return item;
+            changed = true;
+            return { ...item, label: sequence.title };
+        });
+        return nextItems === collection.items ? collection : { ...collection, items: nextItems };
+    });
+    return changed ? nextCollections : collections;
+}
 
 function ScrubInput({ value, onChange, min, max, step, className }: { value: number; onChange: (v: number) => void; min?: number; max?: number; step?: string | number; className?: string }) {
     const [local, setLocal] = useState(value?.toString() || "0");
@@ -229,13 +296,15 @@ const SEED_COLLECTIONS: CollectionItem[] = [
 
 
 // --- Draggable Collection Card ---
-function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, onUpdateItem, onDeleteCollection }: {
+function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, onUpdateItem, onDuplicateItem, onDeleteCollection, onCreateSubComposition }: {
     collection: CollectionItem;
     allCollections: CollectionItem[];
     onAddItem: (collectionId: string, label: string, value: string, duration?: number) => void;
     onDeleteItem: (collectionId: string, variantId: string) => void;
     onUpdateItem: (collectionId: string, variantId: string, updates: Partial<CollectionVariant>) => void;
+    onDuplicateItem: (collectionId: string, variantId: string) => Promise<void> | void;
     onDeleteCollection: (collectionId: string) => void;
+    onCreateSubComposition: (collectionId: string, name: string) => Promise<void> | void;
 }) {
     const [isOpen, setIsOpen] = useState(false);
     const [isAdding, setIsAdding] = useState(false);
@@ -248,8 +317,9 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
     const [updatingItemId, setUpdatingItemId] = useState<string | null>(null);
     const [linkingVariantId, setLinkingVariantId] = useState<string | null>(null);
 
-    const isMedia = collection.type !== "text";
-    const acceptMap: Record<CollectionType, string> = {
+    const isSubComposition = collection.type === "subComposition";
+    const isMedia = collection.type === "image" || collection.type === "video" || collection.type === "audio";
+    const acceptMap: Record<PlayableCollectionType, string> = {
         text: "",
         image: "image/*",
         video: "video/*",
@@ -347,6 +417,15 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
         setIsAdding(false);
     };
 
+    const handleCreateSubComposition = async () => {
+        const name = newLabel.trim();
+        if (!name) return;
+        await onCreateSubComposition(collection.id, name);
+        setNewLabel("");
+        setNewValue("");
+        setIsAdding(false);
+    };
+
     const handleBulkTextAdd = () => {
         const lines = bulkTextValues
             .split(/[,\r\n]+/)
@@ -425,6 +504,11 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
                             {collection.items.map((item) => (
                                     <div key={item.id} className={cn("flex items-center gap-2 group", item.excluded && "opacity-40")}>
                                         {/* Thumbnail preview for media items */}
+                                        {isSubComposition && (
+                                            <div className="w-8 h-8 rounded overflow-hidden border border-violet-500/20 shrink-0 bg-violet-500/10 flex items-center justify-center">
+                                                <Film className="w-3.5 h-3.5 text-violet-300" />
+                                            </div>
+                                        )}
                                         {isMedia && item.value && (
                                             <div className="w-8 h-8 rounded overflow-hidden border border-white/10 shrink-0 bg-black/40">
                                                 {collection.type === "image" ? (
@@ -438,7 +522,8 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
                                         )}
                                         <div className={cn("flex-1 text-[10px] font-mono text-gray-400 bg-black/30 rounded px-2 py-1.5 truncate min-w-0 relative", item.excluded && "line-through text-gray-600")}>
                                             <span className="text-gray-500 mr-1.5">{item.label}</span>
-                                            {!isMedia && <span className="text-gray-300">: {item.value}</span>}
+                                            {!isMedia && !isSubComposition && <span className="text-gray-300">: {item.value}</span>}
+                                            {isSubComposition && <span className="text-violet-300/70">composition variant</span>}
                                             {item.excluded && <span className="ml-1.5 text-[8px] text-orange-500/70 font-bold uppercase tracking-wider">excl.</span>}
                                         </div>
                                         {/* Exclude toggle */}
@@ -460,6 +545,13 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
                                         >
                                             <Link2 className="w-3 h-3" />
                                         </button>
+                                        <button
+                                            onClick={() => { void onDuplicateItem(collection.id, item.id); }}
+                                            className="opacity-0 group-hover:opacity-100 text-gray-600 hover:text-cyan-300 transition-all"
+                                            title="Duplicate variant"
+                                        >
+                                            <Copy className="w-3 h-3" />
+                                        </button>
                                         {/* Replace asset button for media */}
                                         {isMedia && (
                                             <button
@@ -469,6 +561,16 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
                                             >
                                                 <Upload className="w-3 h-3" />
                                             </button>
+                                        )}
+                                        {isSubComposition && item.value && (
+                                            <Link
+                                                href={`/builder/${item.value}`}
+                                                onClick={(e) => e.stopPropagation()}
+                                                className="opacity-0 group-hover:opacity-100 text-gray-600 hover:text-violet-300 transition-all"
+                                                title="Open editor"
+                                            >
+                                                <Film className="w-3 h-3" />
+                                            </Link>
                                         )}
                                         <button
                                             onClick={() => onDeleteItem(collection.id, item.id)}
@@ -537,22 +639,24 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
                             )}
 
                             {/* Hidden file input for updating existing items */}
-                            <input
-                                ref={updateFileRef}
-                                type="file"
-                                accept={acceptMap[collection.type]}
-                                className="hidden"
-                                onChange={(e) => {
-                                    const file = e.target.files?.[0];
-                                    if (file && updatingItemId) handleUpdateFile(file, updatingItemId);
-                                    e.target.value = "";
-                                }}
-                            />
+                            {isMedia && (
+                                <input
+                                    ref={updateFileRef}
+                                    type="file"
+                                    accept={collection.type === "image" || collection.type === "video" || collection.type === "audio" ? acceptMap[collection.type] : ""}
+                                    className="hidden"
+                                    onChange={(e) => {
+                                        const file = e.target.files?.[0];
+                                        if (file && updatingItemId) handleUpdateFile(file, updatingItemId);
+                                        e.target.value = "";
+                                    }}
+                                />
+                            )}
 
                             {/* Add Item Form */}
                             {isAdding ? (
                                 <div className="space-y-1.5 pt-1">
-                                    {!isMedia && (
+                                    {!isMedia && !isSubComposition && (
                                         <div className="flex gap-1">
                                             <button
                                                 onClick={() => setIsBulkTextMode(false)}
@@ -577,9 +681,10 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
                                     <input
                                         value={newLabel}
                                         onChange={(e) => setNewLabel(e.target.value)}
-                                        placeholder={isBulkTextMode ? "Label prefix (optional)" : "Label (e.g. Hook A)"}
+                                        placeholder={isSubComposition ? "Sub-composition name" : isBulkTextMode ? "Label prefix (optional)" : "Label (e.g. Hook A)"}
                                         className="w-full text-[10px] font-mono bg-black/40 border border-white/10 rounded px-2 py-1.5 text-gray-300 placeholder:text-gray-600 outline-none focus:border-white/20"
                                         onPointerDown={(e) => e.stopPropagation()}
+                                        onKeyDown={(e) => { if (isSubComposition && e.key === "Enter") void handleCreateSubComposition(); }}
                                     />
                                     {isMedia ? (
                                         <>
@@ -587,7 +692,7 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
                                                 ref={fileInputRef}
                                                 type="file"
                                                 multiple
-                                                accept={acceptMap[collection.type]}
+                                                accept={collection.type === "image" || collection.type === "video" || collection.type === "audio" ? acceptMap[collection.type] : ""}
                                                 className="hidden"
                                                 onChange={(e) => {
                                                     const files = Array.from(e.target.files || []);
@@ -607,6 +712,10 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
                                                 <span className="text-[9px] font-mono">Choose {collection.type} file(s)</span>
                                             </button>
                                         </>
+                                    ) : isSubComposition ? (
+                                        <p className="text-[8px] text-gray-600 font-mono">
+                                            Creates a child composition and adds it to this collection as a variant.
+                                        </p>
                                     ) : isBulkTextMode ? (
                                         <>
                                             <textarea
@@ -634,7 +743,14 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
                                         />
                                     )}
                                     <div className="flex gap-1.5">
-                                        {!isMedia && (
+                                        {isSubComposition ? (
+                                            <button
+                                                onClick={() => void handleCreateSubComposition()}
+                                                className="flex-1 text-[9px] font-mono py-1 bg-violet-500/20 hover:bg-violet-500/30 text-violet-200 rounded transition-colors"
+                                            >
+                                                Create Composition
+                                            </button>
+                                        ) : !isMedia && (
                                             <button
                                                 onClick={isBulkTextMode ? handleBulkTextAdd : handleAdd}
                                                 className="flex-1 text-[9px] font-mono py-1 bg-white/10 hover:bg-white/20 text-gray-300 rounded transition-colors"
@@ -661,7 +777,7 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
                                     onClick={() => setIsAdding(true)}
                                     className="w-full text-[9px] font-mono py-1.5 text-gray-500 hover:text-gray-300 border border-dashed border-white/10 hover:border-white/20 rounded transition-colors"
                                 >
-                                    + Add Item
+                                    {isSubComposition ? "+ Create Composition" : "+ Add Item"}
                                 </button>
                             )}
                         </div>
@@ -919,24 +1035,6 @@ export function resolveElementTimings(
         const isMedia = el.collectionType === 'video' || el.collectionType === 'audio';
 
         if (isMedia) {
-            // Default to underlying variant native duration if not overridden
-            if (varMode !== 'all') {
-                const col = collections.find(c => c.id === el.collectionId);
-                const variant = col?.items.find(v => v.id === varMode);
-                if (variant && variant.duration !== undefined) {
-                    baseDur = variant.duration;
-                }
-            } else {
-                const col = collections.find(c => c.id === el.collectionId);
-                if (col && col.items.length > 0) {
-                    let maxDur = baseDur;
-                    for (const v of col.items) {
-                        if (v.duration !== undefined && v.duration > maxDur) maxDur = v.duration;
-                    }
-                    baseDur = maxDur;
-                }
-            }
-
             // User overrides take precedence
             if (el.variantOverrides) {
                 if (varMode !== 'all' && el.variantOverrides[varMode]) {
@@ -1020,9 +1118,7 @@ export function resolveElementTimings(
         // Cap duration for media
         if (item.el.collectionType === 'video' || item.el.collectionType === 'audio') {
             const varMode = getVariantMode(item.el.elementId);
-            const maxAvailableDuration = getMediaDurationLimit(item.el, varMode, collections, 9999);
-            const mediaStart = item.el.mediaOffset || 0;
-            const remainingDuration = maxAvailableDuration - mediaStart;
+            const remainingDuration = getMediaDurationLimit(item.el, varMode, collections, 9999);
             
             if (resolvedDur > remainingDuration) {
                 resolvedDur = Math.max(0.1, remainingDuration);
@@ -1098,25 +1194,114 @@ export function resolveElementTimings(
 }
 
 // Helper to safely get the media duration bound for an element, respecting variant overrides
+function getElementPlaybackSpeed(el: Pick<CanvasElement, "speed">) {
+    return Math.max(0.05, el.speed ?? 1);
+}
+
 function getMediaDurationLimit(el: CanvasElement, variantMode: string, collections: CollectionItem[], fallbackDuration: number) {
     const col = collections.find(c => c.id === el.collectionId);
     if (!col || (col.type !== 'video' && col.type !== 'audio')) return fallbackDuration;
+    const speed = getElementPlaybackSpeed(el);
+    const mediaOffset = el.mediaOffset ?? 0;
 
     if (variantMode !== 'all') {
         const variant = col.items.find(i => i.id === variantMode);
-        return variant?.duration || fallbackDuration;
+        return variant?.duration !== undefined
+            ? Math.max(0.1, (variant.duration - mediaOffset) / speed)
+            : fallbackDuration;
     } else {
         // In "all" mode, return the maximum duration among all items so user can extend up to that max
         let maxDur = 0;
         let hasDurations = false;
         for (const item of col.items) {
-            if (item.duration) {
-                maxDur = Math.max(maxDur, item.duration);
+            if (item.duration !== undefined) {
+                maxDur = Math.max(maxDur, (item.duration - mediaOffset) / speed);
                 hasDurations = true;
             }
         }
-        return hasDurations ? maxDur : fallbackDuration;
+        return hasDurations ? Math.max(0.1, maxDur) : fallbackDuration;
     }
+}
+
+function getElementSelectionKey(el: CanvasElement) {
+    if (el.variantSeedKey) return el.variantSeedKey;
+    const srcId = el.sourceElementId || el.elementId;
+    return srcId === el.elementId ? srcId : `${srcId}-${el.elementId}`;
+}
+
+function getPreviewMediaTime(currentTime: number, el: CanvasElement, baseOffset: number, rawDuration: number) {
+    const elapsed = Math.max(0, currentTime - el.startTime);
+    const sourceElapsed = elapsed * getElementPlaybackSpeed(el);
+    if (!Number.isFinite(rawDuration)) {
+        return { time: sourceElapsed + baseOffset, sourceExhausted: false };
+    }
+
+    const lastSafeTime = Math.max(0, rawDuration - 0.05);
+    const time = Math.min(sourceElapsed + baseOffset, lastSafeTime);
+    return {
+        time,
+        sourceExhausted: sourceElapsed + baseOffset >= lastSafeTime,
+    };
+}
+
+function hasDurationMatch(el: CanvasElement) {
+    return Boolean(el.matchDurationWithId || (el.matchDurationWithIds && el.matchDurationWithIds.length > 0));
+}
+
+function getPlaybackDuration(
+    el: CanvasElement,
+    timing: { startTime: number; duration: number },
+    variantOverride?: Partial<CanvasElement>,
+) {
+    return hasDurationMatch(el)
+        ? timing.duration
+        : variantOverride?.duration ?? timing.duration;
+}
+
+function getTrackStackZ(trackIndex: number, localZ = 0, boost = 0) {
+    const safeTrackIndex = Math.max(0, trackIndex);
+    const safeLocalZ = Math.max(0, Math.min(9999, localZ || 0));
+    return 1_000_000 - safeTrackIndex * 10_000 + safeLocalZ + boost;
+}
+
+function applyNestedCompositionTransform(el: CanvasElement, currentTime: number): CanvasElement {
+    const group = el.nestedCompositionTransform;
+    if (!group) return el;
+
+    const groupAnim = evaluateAnimations({
+        ...el,
+        startTime: group.startTime,
+        duration: group.duration,
+        opacity: group.opacity ?? 1,
+        animations: group.animations || [],
+    }, currentTime);
+
+    const baseCenterX = group.x + group.width / 2;
+    const baseCenterY = group.y + group.height / 2;
+    const childCenterX = group.x + ((el.x + el.width / 2) / 100) * group.width;
+    const childCenterY = group.y + ((el.y + el.height / 2) / 100) * group.height;
+    const scale = groupAnim.scale;
+    const rotation = (group.rotation || 0) + groupAnim.rotate;
+    const rad = rotation * Math.PI / 180;
+    const dx = (childCenterX - baseCenterX) * scale;
+    const dy = (childCenterY - baseCenterY) * scale;
+    const rotatedDx = dx * Math.cos(rad) - dy * Math.sin(rad);
+    const rotatedDy = dx * Math.sin(rad) + dy * Math.cos(rad);
+    const width = (el.width / 100) * group.width * scale;
+    const height = (el.height / 100) * group.height * scale;
+    const centerX = baseCenterX + groupAnim.translateX + rotatedDx;
+    const centerY = baseCenterY + groupAnim.translateY + rotatedDy;
+
+    return {
+        ...el,
+        x: centerX - width / 2,
+        y: centerY - height / 2,
+        width,
+        height,
+        rotation: (el.rotation || 0) + rotation,
+        opacity: (el.opacity ?? 1) * groupAnim.opacity,
+        nestedCompositionBlur: Math.max(el.nestedCompositionBlur || 0, groupAnim.blur || 0),
+    };
 }
 
 // --- Main Builder (inner, only rendered on client) ---
@@ -1128,6 +1313,11 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     const [tracks, setTracks] = useState<TrackConfig[]>([{ id: 'track-0', magnet: false }]);
     const [collections, setCollections] = useState<CollectionItem[]>(SEED_COLLECTIONS);
     const [textCollectionGroups, setTextCollectionGroups] = useState<TextCollectionGroup[]>([]);
+    const [nestedSequences, setNestedSequences] = useState<NestedSequenceRecord[]>([]);
+    const [isSubCompositionEditor, setIsSubCompositionEditor] = useState(false);
+    const collectionsRef = useRef<CollectionItem[]>(SEED_COLLECTIONS);
+    const textCollectionGroupsRef = useRef<TextCollectionGroup[]>([]);
+    const nestedSequencesRef = useRef<NestedSequenceRecord[]>([]);
     const [selectedElementId, setSelectedElementId] = useState<string | null>(null);
     const [centerView, setCenterView] = useState<"canvas" | "preview">("canvas");
     const [inspectorVariantModes, setInspectorVariantModes] = useState<Record<string, string>>({}); // elementId -> "all" | variantId
@@ -1195,8 +1385,12 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         setTOTAL_DURATION(snapshot.duration);
         setElements(clonePlain(snapshot.elements));
         setTracks(clonePlain(snapshot.tracks));
-        setCollections(clonePlain(snapshot.collections));
-        setTextCollectionGroups(clonePlain(snapshot.textCollectionGroups || []));
+        const nextCollections = clonePlain(snapshot.collections);
+        const nextTextGroups = clonePlain(snapshot.textCollectionGroups || []);
+        collectionsRef.current = nextCollections;
+        textCollectionGroupsRef.current = nextTextGroups;
+        setCollections(nextCollections);
+        setTextCollectionGroups(nextTextGroups);
         lastSnapshotRef.current = clonePlain(snapshot);
         window.setTimeout(() => {
             historyApplyingRef.current = false;
@@ -1245,6 +1439,37 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         setInspectorVariantModes(prev => ({ ...prev, [elementId]: mode }));
     }, []);
 
+    const replaceCollections = useCallback((nextCollections: CollectionItem[]) => {
+        collectionsRef.current = nextCollections;
+        setCollections(nextCollections);
+    }, []);
+
+    const replaceTextCollectionGroups = useCallback((nextGroups: TextCollectionGroup[]) => {
+        textCollectionGroupsRef.current = nextGroups;
+        setTextCollectionGroups(nextGroups);
+    }, []);
+
+    useEffect(() => {
+        const loadNestedSequences = async () => {
+            if (!compositionId) {
+                setNestedSequences([]);
+                return;
+            }
+            try {
+                const res = await fetch(`/api/compositions?parentId=${compositionId}&kind=sequence`);
+                if (!res.ok) throw new Error("Failed to fetch nested compositions");
+                const data = await res.json();
+                const sequences = Array.isArray(data) ? data : [];
+                nestedSequencesRef.current = sequences;
+                setNestedSequences(sequences);
+                replaceCollections(syncSubCompositionVariantLabels(collectionsRef.current, sequences));
+            } catch (error) {
+                console.error("Failed to fetch nested compositions", error);
+            }
+        };
+        void loadNestedSequences();
+    }, [compositionId, replaceCollections]);
+
     useEffect(() => {
         if (compositionId) {
             undoStackRef.current = [];
@@ -1257,6 +1482,8 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             fetch(`/api/compositions/${compositionId}`)
                 .then(res => res.json())
                 .then(data => {
+                    const isChildComposition = Boolean(data.parentId);
+                    setIsSubCompositionEditor(isChildComposition);
                     if (data.elements) {
                         try { setElements(typeof data.elements === 'string' ? JSON.parse(data.elements) : data.elements); } catch (e) { }
                     }
@@ -1270,12 +1497,19 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                         try {
                             const parsedCols = typeof data.collections === 'string' ? JSON.parse(data.collections) : data.collections;
                             if (Array.isArray(parsedCols)) {
-                                if (parsedCols.length > 0) setCollections(parsedCols);
-                                setTextCollectionGroups([]);
+                                const visibleCollections = isChildComposition ? withoutSubCompositionCollections(parsedCols) : parsedCols;
+                                replaceCollections(syncSubCompositionVariantLabels(visibleCollections, nestedSequencesRef.current));
+                                replaceTextCollectionGroups([]);
                             } else if (parsedCols && typeof parsedCols === 'object') {
                                 const wrapped = parsedCols as { items?: CollectionItem[]; textGroups?: TextCollectionGroup[]; renderQueue?: QueuedRenderJob[] };
-                                if (Array.isArray(wrapped.items) && wrapped.items.length > 0) setCollections(wrapped.items);
-                                if (Array.isArray(wrapped.textGroups)) setTextCollectionGroups(wrapped.textGroups);
+                                const visibleCollections = Array.isArray(wrapped.items)
+                                    ? (isChildComposition ? withoutSubCompositionCollections(wrapped.items) : wrapped.items)
+                                    : [];
+                                const syncedCollections = syncSubCompositionVariantLabels(visibleCollections, nestedSequencesRef.current);
+                                replaceCollections(syncedCollections);
+                                if (Array.isArray(wrapped.textGroups)) {
+                                    replaceTextCollectionGroups(pruneTextGroupsForCollections(wrapped.textGroups, syncedCollections));
+                                }
                                 if (Array.isArray(wrapped.renderQueue)) setRenderQueue(wrapped.renderQueue);
                             }
                         } catch (e) { }
@@ -1290,7 +1524,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 .catch(err => console.error("Failed to fetch composition", err))
                 .finally(() => setFetching(false));
         }
-    }, [compositionId, refreshHistoryAvailability]);
+    }, [compositionId, refreshHistoryAvailability, replaceCollections, replaceTextCollectionGroups]);
 
     useEffect(() => {
         if (fetching) return;
@@ -1387,7 +1621,6 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     const [isCreatingTextGroup, setIsCreatingTextGroup] = useState(false);
     const [newTextGroupTitle, setNewTextGroupTitle] = useState("");
     const [newTextGroupSelection, setNewTextGroupSelection] = useState<Record<string, boolean>>({});
-
     // Drag state for overlay
     const [activeCollection, setActiveCollection] = useState<CollectionItem | null>(null);
     const [activeDragElement, setActiveDragElement] = useState<CanvasElement | null>(null);
@@ -1441,6 +1674,37 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         }
     }
 
+    const pickWeightedByUsage = useCallback(<T extends { id: string },>(
+        candidates: T[],
+        seedKey: string,
+        usageLookup: Record<string, number>,
+        usageScale = 2
+    ): T | null => {
+        if (candidates.length === 0) return null;
+        if (candidates.length === 1) return candidates[0];
+
+        const random = mulberry32(hashString(seedKey));
+        const usages = candidates.map(candidate => usageLookup[candidate.id] || 0);
+        const minUsage = Math.min(...usages);
+        const weights = candidates.map((_, index) => {
+            const relativeUsage = usages[index] - minUsage;
+            return 100 / (1 + relativeUsage * usageScale);
+        });
+
+        const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+        if (!Number.isFinite(totalWeight) || totalWeight <= 0) {
+            return candidates[Math.floor(random() * candidates.length)] ?? candidates[0];
+        }
+
+        let cursor = random() * totalWeight;
+        for (let i = 0; i < candidates.length; i++) {
+            cursor -= weights[i];
+            if (cursor <= 0) return candidates[i];
+        }
+
+        return candidates[candidates.length - 1];
+    }, []);
+
     const [variantUsage, setVariantUsage] = useState<Record<string, number>>(() => {
         if (typeof window !== 'undefined') {
             try { return JSON.parse(localStorage.getItem('dropai_variant_usage') || '{}'); } catch(e) {}
@@ -1461,9 +1725,285 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         });
     }, []);
 
+    const isCollectionElement = useCallback((type: TimelineElementType): type is PlayableCollectionType => {
+        return type === 'text' || type === 'image' || type === 'video' || type === 'audio';
+    }, []);
+
+    const parseNestedSequence = useCallback((sequence: NestedSequenceRecord) => {
+        const parsedCollections = typeof sequence.collections === 'string'
+            ? JSON.parse(sequence.collections || '{}')
+            : sequence.collections;
+        const sequenceCollections = Array.isArray(parsedCollections)
+            ? parsedCollections
+            : (parsedCollections?.items || []);
+        const sequenceTracks = typeof sequence.tracks === 'string'
+            ? JSON.parse(sequence.tracks || '[]')
+            : sequence.tracks;
+        const sequenceElements = typeof sequence.elements === 'string'
+            ? JSON.parse(sequence.elements || '[]')
+            : sequence.elements;
+
+        return {
+            collections: sequenceCollections as CollectionItem[],
+            tracks: (Array.isArray(sequenceTracks) && sequenceTracks.length > 0 ? sequenceTracks : [{ id: 'track-0', magnet: false }]) as TrackConfig[],
+            elements: (Array.isArray(sequenceElements) ? sequenceElements : []) as CanvasElement[],
+        };
+    }, []);
+
+    const getVariantModesForElements = useCallback((targetElements: CanvasElement[], targetCollections: CollectionItem[]) => {
+        const modes: Record<string, string> = {};
+        const collectionById = new Map(targetCollections.map(c => [c.id, c]));
+        const pickedByCollection: Record<string, Set<string>> = {};
+
+        const sortedElements = [...targetElements].sort((a, b) => a.startTime - b.startTime);
+        for (const el of sortedElements) {
+            if (!isCollectionElement(el.collectionType)) continue;
+            const col = collectionById.get(el.collectionId);
+            if (!col?.items.length) continue;
+
+            const localExcluded = new Set(el.localExcludedVariantIds || []);
+            const selectedVariant = el.selectedVariantId
+                ? col.items.find(item => item.id === el.selectedVariantId && !item.excluded && !localExcluded.has(item.id))
+                : undefined;
+
+            let picked = selectedVariant || null;
+            if (!picked) {
+                let candidates = col.items.filter(item => !item.excluded && !localExcluded.has(item.id));
+                const alreadyPicked = pickedByCollection[col.id];
+                if (alreadyPicked && candidates.some(item => !alreadyPicked.has(item.id))) {
+                    candidates = candidates.filter(item => !alreadyPicked.has(item.id));
+                }
+                picked = pickWeightedByUsage(candidates, `${variantSeed}-${getElementSelectionKey(el)}-variant`, variantUsage);
+            }
+
+            if (picked) {
+                modes[el.elementId] = picked.id;
+                if (!pickedByCollection[col.id]) pickedByCollection[col.id] = new Set();
+                pickedByCollection[col.id].add(picked.id);
+            }
+        }
+
+        return modes;
+    }, [isCollectionElement, pickWeightedByUsage, variantSeed, variantUsage]);
+
+    const resolveNestedSequenceVariant = useCallback((parent: CanvasElement, sourceCollections: CollectionItem[] = collections) => {
+        const variantCollection = sourceCollections.find(c => c.id === parent.collectionId && c.type === 'subComposition')
+            || collections.find(c => c.id === parent.collectionId && c.type === 'subComposition');
+
+        if (!variantCollection) {
+            const sequenceId = parent.nestedSequenceId;
+            const sequence = sequenceId ? nestedSequences.find(s => s.id === sequenceId) : null;
+            return sequence ? { sequence, variantId: sequenceId } : null;
+        }
+
+        const localExcluded = new Set(parent.localExcludedVariantIds || []);
+        const requestedMode = parent.selectedVariantId || getVariantMode(parent.elementId);
+        let picked = requestedMode && requestedMode !== 'all'
+            ? variantCollection.items.find(item => item.id === requestedMode && !item.excluded && !localExcluded.has(item.id)) || null
+            : null;
+
+        if (!picked) {
+            picked = pickWeightedByUsage(
+                variantCollection.items.filter(item => !item.excluded && !localExcluded.has(item.id)),
+                `${variantSeed}-${getElementSelectionKey(parent)}-subcomposition`,
+                variantUsage,
+            );
+        }
+
+        const sequenceId = picked?.value || picked?.id || parent.nestedSequenceId;
+        const sequence = sequenceId ? nestedSequences.find(s => s.id === sequenceId) : null;
+        return sequence ? { sequence, variantId: picked?.id || sequenceId } : null;
+    }, [collections, getVariantMode, nestedSequences, pickWeightedByUsage, variantSeed, variantUsage]);
+
+    const getNestedSequenceDuration = useCallback(function computeDuration(sequence: NestedSequenceRecord, path: string[] = []): number {
+        if (path.includes(sequence.id)) return Math.max(0.1, sequence.duration || 0.1);
+
+        const parsed = parseNestedSequence(sequence);
+        if (parsed.elements.length === 0) return EMPTY_NESTED_COMPOSITION_DISPLAY_DURATION;
+
+        const elementsWithNestedDurations = parsed.elements.map(el => {
+            if (el.collectionType !== 'nestedSequence') return el;
+            const resolved = resolveNestedSequenceVariant(el, parsed.collections);
+            if (!resolved) return el;
+            return {
+                ...el,
+                nestedSequenceId: resolved.sequence.id,
+                selectedVariantId: resolved.variantId,
+                duration: Math.min(el.duration, computeDuration(resolved.sequence, [...path, sequence.id])),
+            };
+        });
+
+        const childVariantModes = getVariantModesForElements(elementsWithNestedDurations, parsed.collections);
+        const childTimings = resolveElementTimings(elementsWithNestedDurations, parsed.tracks, parsed.collections, elId => childVariantModes[elId] || 'all');
+        const maxEnd = elementsWithNestedDurations.reduce((max, el) => {
+            const timing = childTimings.get(el.elementId) || { startTime: el.startTime, duration: el.duration };
+            return Math.max(max, timing.startTime + timing.duration);
+        }, 0);
+
+        return Math.max(0.1, Math.round(maxEnd * 1000) / 1000);
+    }, [getVariantModesForElements, parseNestedSequence, resolveNestedSequenceVariant]);
+
+    const nestedSequenceDurations = useMemo(() => {
+        const durations: Record<string, number> = {};
+        for (const sequence of nestedSequences) {
+            durations[sequence.id] = getNestedSequenceDuration(sequence);
+        }
+        return durations;
+    }, [nestedSequences, getNestedSequenceDuration]);
+
+    const createSubCompositionGroupClip = useCallback((
+        collection: CollectionItem,
+        placement?: { x?: number; y?: number; startTime?: number },
+    ): CanvasElement => {
+        const targetTrackId = tracks.length > 0 ? tracks[0].id : 'track-0';
+        const trackSiblings = elements.filter(e => (e.trackId || 'track-0') === targetTrackId);
+        let bestStart = 0;
+        for (const sib of trackSiblings) {
+            const subCompositionCollection = collections.find(c => c.id === sib.collectionId && c.type === 'subComposition');
+            const siblingDuration = subCompositionCollection
+                ? Math.min(sib.duration, Math.max(0.1, ...subCompositionCollection.items.map(item => nestedSequenceDurations[item.value || item.id] ?? 0.1)))
+                : sib.collectionType === 'nestedSequence' && sib.nestedSequenceId
+                    ? Math.min(sib.duration, nestedSequenceDurations[sib.nestedSequenceId] ?? sib.duration)
+                    : sib.duration;
+            bestStart = Math.max(bestStart, sib.startTime + siblingDuration);
+        }
+
+        const sequenceIds = collection.items.map(item => item.value || item.id).filter(Boolean);
+        const durations = sequenceIds.map(id => nestedSequenceDurations[id] ?? nestedSequences.find(seq => seq.id === id)?.duration ?? 0.1);
+        const maxDuration = Math.max(0.1, ...durations);
+        const firstSequenceId = sequenceIds[0];
+        const newId = `el-subcomp-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+
+        return {
+            elementId: newId,
+            sourceElementId: newId,
+            collectionId: collection.id,
+            collectionType: 'nestedSequence',
+            title: collection.title,
+            x: placement?.x ?? 12,
+            y: placement?.y ?? 12,
+            width: 76,
+            height: 12,
+            zIndex: elements.length + 1,
+            content: "Nested Composition",
+            startTime: placement?.startTime ?? Math.round(bestStart * 10) / 10,
+            duration: maxDuration,
+            trackId: targetTrackId,
+            rotation: 0,
+            opacity: 1,
+            visible: true,
+            animations: [],
+            nestedSequenceId: firstSequenceId,
+        };
+    }, [collections, elements, nestedSequenceDurations, nestedSequences, tracks]);
+
+    const expandNestedSequenceClip = useCallback((parent: CanvasElement, path: string[] = []): CanvasElement[] => {
+        const resolvedParent = resolveNestedSequenceVariant(parent);
+        if (!resolvedParent) return [];
+        if (path.includes(resolvedParent.sequence.id)) {
+            throw new Error(`Circular nested composition reference detected: ${[...path, resolvedParent.sequence.id].join(" -> ")}`);
+        }
+        const sequence = resolvedParent.sequence;
+        const parsed = parseNestedSequence(sequence);
+        const parentDuration = Math.min(parent.duration, getNestedSequenceDuration(sequence, path));
+        const elementsWithNestedDurations = parsed.elements.map(child => {
+            if (child.collectionType !== 'nestedSequence') return child;
+            const resolvedChild = resolveNestedSequenceVariant(child, parsed.collections);
+            if (!resolvedChild) return child;
+            return {
+                ...child,
+                nestedSequenceId: resolvedChild.sequence.id,
+                selectedVariantId: resolvedChild.variantId,
+                duration: Math.min(child.duration, getNestedSequenceDuration(resolvedChild.sequence, [...path, sequence.id])),
+            };
+        });
+        const childVariantModes = getVariantModesForElements(elementsWithNestedDurations, parsed.collections);
+        const childTimings = resolveElementTimings(elementsWithNestedDurations, parsed.tracks, parsed.collections, elId => childVariantModes[elId] || 'all');
+
+        return elementsWithNestedDurations.flatMap((child, index) => {
+            const timing = childTimings.get(child.elementId) || { startTime: child.startTime, duration: child.duration };
+            const remainingDuration = parentDuration - timing.startTime;
+            if (remainingDuration <= 0) return [];
+            const childBase: CanvasElement = {
+                ...child,
+                elementId: `${parent.elementId}-${child.elementId}`,
+                sourceElementId: `${parent.elementId}-${child.elementId}`,
+                variantSeedKey: getElementSelectionKey(child),
+                selectedVariantId: childVariantModes[child.elementId],
+                nestedCompositionTransform: {
+                    x: parent.x,
+                    y: parent.y,
+                    width: parent.width,
+                    height: parent.height,
+                    rotation: parent.rotation,
+                    opacity: parent.opacity,
+                    startTime: parent.startTime,
+                    duration: parentDuration,
+                    animations: parent.animations || [],
+                },
+                startTime: parent.startTime + timing.startTime,
+                duration: Math.min(timing.duration, remainingDuration),
+                trackId: parent.trackId,
+                zIndex: (parent.zIndex || 0) * 100 + (child.zIndex || index) + 1,
+            };
+            if (childBase.collectionType === 'nestedSequence') {
+                return expandNestedSequenceClip(childBase, [...path, sequence.id]);
+            }
+            return [childBase];
+        });
+    }, [getNestedSequenceDuration, getVariantModesForElements, parseNestedSequence, resolveNestedSequenceVariant]);
+
+    const flattenTimelineElements = useCallback((): CanvasElement[] => {
+        const flattened: CanvasElement[] = [];
+        const pickedBySubCompositionCollection: Record<string, Set<string>> = {};
+        for (const el of elements) {
+            if (isCollectionElement(el.collectionType)) {
+                flattened.push(el);
+                continue;
+            }
+
+            if (el.collectionType === 'nestedSequence') {
+                const subCompositionCollection = collections.find(c => c.id === el.collectionId && c.type === 'subComposition');
+                if (!subCompositionCollection) {
+                    flattened.push(...expandNestedSequenceClip(el));
+                    continue;
+                }
+
+                const localExcluded = new Set(el.localExcludedVariantIds || []);
+                const requestedMode = getVariantMode(el.elementId);
+                let picked = requestedMode !== 'all'
+                    ? subCompositionCollection.items.find(item => item.id === requestedMode && !item.excluded && !localExcluded.has(item.id)) || null
+                    : null;
+
+                if (!picked) {
+                    let candidates = subCompositionCollection.items.filter(item => !item.excluded && !localExcluded.has(item.id));
+                    const alreadyPicked = pickedBySubCompositionCollection[subCompositionCollection.id];
+                    if (alreadyPicked && candidates.some(item => !alreadyPicked.has(item.id))) {
+                        candidates = candidates.filter(item => !alreadyPicked.has(item.id));
+                    }
+                    picked = pickWeightedByUsage(candidates, `${variantSeed}-${getElementSelectionKey(el)}-subcomposition`, variantUsage);
+                }
+
+                const selectedSequenceId = picked?.value || picked?.id || el.nestedSequenceId;
+                if (picked) {
+                    if (!pickedBySubCompositionCollection[subCompositionCollection.id]) {
+                        pickedBySubCompositionCollection[subCompositionCollection.id] = new Set();
+                    }
+                    pickedBySubCompositionCollection[subCompositionCollection.id].add(picked.id);
+                }
+
+                flattened.push(...expandNestedSequenceClip({
+                    ...el,
+                    nestedSequenceId: selectedSequenceId,
+                    selectedVariantId: picked?.id,
+                }));
+            }
+        }
+        return flattened;
+    }, [collections, elements, expandNestedSequenceClip, getVariantMode, isCollectionElement, pickWeightedByUsage, variantSeed, variantUsage]);
+
     const getSelectionKey = useCallback((el: CanvasElement) => {
-        const srcId = el.sourceElementId || el.elementId;
-        return srcId === el.elementId ? srcId : `${srcId}-${el.elementId}`;
+        return getElementSelectionKey(el);
     }, []);
 
     const pickWeighted = useCallback(<T extends { id: string },>(
@@ -1626,7 +2166,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             const col = collectionById.get(resolvedColId);
             if (col && col.items.length > 0) {
                 const selectionKey = getSelectionKey(el);
-                const userMode = getVariantModeRef.current(el.elementId);
+                const userMode = getVariantMode(el.elementId);
                 const localExcluded = new Set(el.localExcludedVariantIds || []);
                 
                 let pickedVariant: CollectionVariant | null = null;
@@ -1730,7 +2270,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             }
         });
         return variants;
-    }, [elements, collections, variantSeed, variantUsage, renderQueue, resolvedCollectionIdByElement, getSelectionKey, pickWeighted]);
+    }, [elements, collections, variantSeed, variantUsage, renderQueue, resolvedCollectionIdByElement, getSelectionKey, getVariantMode, pickWeighted]);
 
     const activeVariantModes = useMemo(() => {
         const modes: Record<string, string> = {};
@@ -1744,9 +2284,26 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         return modes;
     }, [elements, previewVariants, getVariantMode]);
 
+    const elementsWithNestedDurations = useMemo(() => {
+        return elements.map(el => {
+            if (el.collectionType !== 'nestedSequence') return el;
+            const subCompositionCollection = collections.find(c => c.id === el.collectionId && c.type === 'subComposition');
+            const sequenceDuration = subCompositionCollection
+                ? Math.max(0.1, ...subCompositionCollection.items.map(item => nestedSequenceDurations[item.value || item.id] ?? 0.1))
+                : el.nestedSequenceId
+                    ? nestedSequenceDurations[el.nestedSequenceId]
+                    : undefined;
+            if (!sequenceDuration) return el;
+            return {
+                ...el,
+                duration: Math.min(el.duration, sequenceDuration),
+            };
+        });
+    }, [collections, elements, nestedSequenceDurations]);
+
     const elementTimings = useMemo(() => {
-        return resolveElementTimings(elements, tracks, collections, elId => activeVariantModes[elId] || 'all');
-    }, [elements, tracks, collections, activeVariantModes]);
+        return resolveElementTimings(elementsWithNestedDurations, tracks, collections, elId => activeVariantModes[elId] || 'all');
+    }, [elementsWithNestedDurations, tracks, collections, activeVariantModes]);
 
     // Auto-expand playback duration when elements extend beyond the current timeline length
     useEffect(() => {
@@ -1916,7 +2473,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             // This prevents them from being lost when variant mode switches back to 'all'.
             const BASE_PROPS = new Set(['randomizeWindow', 'volume', 'speed', 'audioFadeIn', 'audioFadeOut',
                 'x', 'y', 'width', 'height', 'rotation', 'opacity', 'zIndex', 'visible',
-                'aspectRatioLocked', 'animations', 'syncWith', 'matchDurationWithIds',
+                'aspectRatioLocked', 'animations', 'syncWith', 'matchDurationWithId', 'matchDurationWithIds', 'matchDurationOffsets',
                 'textStrokeColor', 'textStrokeWidth', 'fontSize', 'fontWeight', 'fontStyle',
                 'textDecoration', 'letterSpacing', 'lineHeight', 'textAlign']);
 
@@ -2195,6 +2752,26 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             const data = active.data.current as { collection: CollectionItem } | undefined;
             const col = data?.collection;
             if (!col) return;
+            if (col.type === 'subComposition') {
+                if (col.items.length === 0) {
+                    showToast("Create a sub-composition in this collection first.", "error");
+                    return;
+                }
+                const rect = canvasRef.current?.getBoundingClientRect();
+                let dropX = 12;
+                let dropY = 12;
+                if (rect) {
+                    const pointer = event.activatorEvent as PointerEvent;
+                    const endX = pointer.clientX + delta.x;
+                    const endY = pointer.clientY + delta.y;
+                    dropX = Math.max(0, Math.min(90, ((endX - rect.left) / rect.width) * 100 - 5));
+                    dropY = Math.max(0, Math.min(90, ((endY - rect.top) / rect.height) * 100 - 5));
+                }
+                const newEl = createSubCompositionGroupClip(col, { x: dropX, y: dropY });
+                setElements(prev => [...prev, newEl]);
+                setSelectedElementId(newEl.elementId);
+                return;
+            }
 
             const rect = canvasRef.current?.getBoundingClientRect();
             let dropX = 10;
@@ -2207,11 +2784,12 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 dropY = Math.max(0, Math.min(90, ((endY - rect.top) / rect.height) * 100 - 5));
             }
 
-            const w = col.type === 'text' ? 80 : 60;
-            const h = col.type === 'text' ? 8 : 40;
+            const playableType = col.type as PlayableCollectionType;
+            const w = playableType === 'text' ? 80 : 60;
+            const h = playableType === 'text' ? 8 : 40;
             const newId = `el-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
             // For audio/video, initialize per-variant timing overrides
-            const isMedia = col.type === 'video' || col.type === 'audio';
+            const isMedia = playableType === 'video' || playableType === 'audio';
             const variantOverrides: Record<string, Partial<CanvasElement>> = {};
             if (isMedia) {
                 for (const item of col.items) {
@@ -2241,14 +2819,14 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 elementId: newId,
                 sourceElementId: newId,
                 collectionId: col.id,
-                collectionType: col.type,
+                collectionType: playableType,
                 title: col.title,
                 x: dropX,
                 y: dropY,
                 width: w,
                 height: h,
                 zIndex: elements.length + 1,
-                content: col.type === 'text' ? col.items[0]?.value || "YOUR TEXT HERE" : undefined,
+                content: playableType === 'text' ? col.items[0]?.value || "YOUR TEXT HERE" : undefined,
                 startTime: Math.round(bestStart * 10) / 10,
                 duration: baseDuration,
                 trackId: targetTrackId,
@@ -2314,6 +2892,124 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         const timing = elementTimings.get(selectedElementId);
         if (timing) effectiveElement = { ...effectiveElement, ...timing };
     }
+
+    const selectedNestedEditorTarget = useMemo(() => {
+        if (!selectedElement || selectedElement.collectionType !== 'nestedSequence') return null;
+
+        const subCompositionCollection = collections.find(c => c.id === selectedElement.collectionId && c.type === 'subComposition');
+        if (subCompositionCollection) {
+            const pickedVariantId = selectedVariantMode !== 'all'
+                ? selectedVariantMode
+                : previewVariants[selectedElement.elementId]?.id;
+            const variant = pickedVariantId
+                ? subCompositionCollection.items.find(item => item.id === pickedVariantId)
+                : subCompositionCollection.items[0];
+            const sequenceId = variant?.value || variant?.id || selectedElement.nestedSequenceId;
+            if (!sequenceId) return null;
+            const sequence = nestedSequences.find(item => item.id === sequenceId);
+            return {
+                id: sequenceId,
+                title: sequence?.title || variant?.label || selectedElement.title,
+            };
+        }
+
+        if (!selectedElement.nestedSequenceId) return null;
+        const sequence = nestedSequences.find(item => item.id === selectedElement.nestedSequenceId);
+        return {
+            id: selectedElement.nestedSequenceId,
+            title: sequence?.title || selectedElement.title,
+        };
+    }, [collections, nestedSequences, previewVariants, selectedElement, selectedVariantMode]);
+
+    const previewTimelineItems = useMemo(() => {
+        const collectionById = new Map<string, CollectionItem>(collections.map(c => [c.id, c]));
+        for (const sequence of nestedSequences) {
+            try {
+                for (const collection of parseNestedSequence(sequence).collections) {
+                    if (!collectionById.has(collection.id)) collectionById.set(collection.id, collection);
+                }
+            } catch (error) {
+            console.warn("Failed to parse nested composition for preview", error);
+            }
+        }
+
+        let timelineElements: CanvasElement[];
+        try {
+            timelineElements = flattenTimelineElements();
+        } catch (error) {
+            console.warn("Failed to flatten nested compositions for preview", error);
+            timelineElements = elements;
+        }
+
+        const pickedByCollection: Record<string, Set<string>> = {};
+
+        return timelineElements.map(baseEl => {
+            const resolvedColId = resolvedCollectionIdByElement[baseEl.elementId] || baseEl.collectionId;
+            const col = collectionById.get(resolvedColId) || collectionById.get(baseEl.collectionId);
+            const explicitMode = getVariantMode(baseEl.elementId);
+            const explicitPicked = explicitMode !== 'all'
+                ? col?.items.find(item => item.id === explicitMode) || null
+                : null;
+            const nestedPicked = baseEl.selectedVariantId
+                ? col?.items.find(item => item.id === baseEl.selectedVariantId) || null
+                : null;
+            const statePicked = explicitPicked || nestedPicked || previewVariants[baseEl.elementId];
+            let variant: CollectionVariant | null = statePicked && col?.items.some(item => item.id === statePicked.id)
+                ? statePicked
+                : null;
+
+            if (!variant && col?.items.length) {
+                const localExcluded = new Set(baseEl.localExcludedVariantIds || []);
+                let candidates = col.items.filter(item => !item.excluded && !localExcluded.has(item.id));
+                const alreadyPicked = pickedByCollection[col.id];
+                if (alreadyPicked && candidates.some(item => !alreadyPicked.has(item.id))) {
+                    candidates = candidates.filter(item => !alreadyPicked.has(item.id));
+                }
+
+                variant = pickWeighted(candidates, `${variantSeed}-${getSelectionKey(baseEl)}-variant`, variantUsage);
+            }
+
+            if (variant && col) {
+                if (!pickedByCollection[col.id]) pickedByCollection[col.id] = new Set();
+                pickedByCollection[col.id].add(variant.id);
+            }
+
+            const variantOverride = variant ? baseEl.variantOverrides?.[variant.id] : undefined;
+            const overrides = variant ? getEffectiveElement(baseEl, variant.id) : baseEl;
+            const timing = elementTimings.get(baseEl.elementId) || { startTime: baseEl.startTime, duration: baseEl.duration };
+            const isMedia = baseEl.collectionType === 'video' || baseEl.collectionType === 'audio';
+            const mediaOffset = (variantOverride as Partial<CanvasElement> | undefined)?.mediaOffset ?? baseEl.mediaOffset ?? 0;
+            const requestedDuration = getPlaybackDuration(baseEl, timing, variantOverride);
+            const speed = getElementPlaybackSpeed(overrides);
+            const playableDuration = isMedia && variant?.duration !== undefined
+                ? Math.max(0, (variant.duration - mediaOffset) / speed)
+                : requestedDuration;
+            return {
+                el: {
+                    ...applyNestedCompositionTransform(overrides, currentTime),
+                    startTime: timing.startTime,
+                    duration: Math.max(0.001, Math.min(requestedDuration, playableDuration)),
+                },
+                variant,
+            };
+        });
+    }, [
+        collections,
+        nestedSequences,
+        parseNestedSequence,
+        flattenTimelineElements,
+        elements,
+        resolvedCollectionIdByElement,
+        previewVariants,
+        pickWeighted,
+        variantSeed,
+        getSelectionKey,
+        getVariantMode,
+        variantUsage,
+        getEffectiveElement,
+        elementTimings,
+        currentTime,
+    ]);
 
     const updateSelected = (updates: Partial<CanvasElement>) => {
         if (!selectedElementId) return;
@@ -2525,21 +3221,183 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         }
     }, [compositionId, collections, textCollectionGroups]);
 
+    const persistCollections = useCallback(async (
+        nextCollections: CollectionItem[],
+        nextTextGroups = textCollectionGroups,
+        nextQueue = renderQueue,
+    ) => {
+        if (!compositionId) return;
+        const persistedCollections = isSubCompositionEditor
+            ? withoutSubCompositionCollections(nextCollections)
+            : nextCollections;
+        const persistedTextGroups = pruneTextGroupsForCollections(nextTextGroups, persistedCollections);
+
+        try {
+            const res = await fetch(`/api/compositions/${compositionId}`, {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    collections: {
+                        items: persistedCollections,
+                        textGroups: persistedTextGroups,
+                        renderQueue: nextQueue,
+                    },
+                }),
+            });
+            if (!res.ok) throw new Error("Failed to save collections");
+        } catch (error) {
+            console.error("Failed to persist collections", error);
+            showToast("Collection change updated locally, but failed to save.", "error");
+        }
+    }, [compositionId, isSubCompositionEditor, renderQueue, textCollectionGroups]);
+
+    const applyCollectionsChange = useCallback((
+        updater: (current: CollectionItem[]) => CollectionItem[],
+        nextTextGroups = textCollectionGroupsRef.current,
+    ) => {
+        const nextCollections = updater(collectionsRef.current);
+        replaceCollections(nextCollections);
+        void persistCollections(nextCollections, nextTextGroups);
+        return nextCollections;
+    }, [persistCollections, replaceCollections]);
+
+    const createSubComposition = useCallback(async (collectionId: string, name: string) => {
+        if (!compositionId) {
+            showToast("Save this composition before creating sub-compositions.", "error");
+            return;
+        }
+        const title = name.trim();
+        if (!title) {
+            showToast("Name the sub-composition first.", "error");
+            return;
+        }
+        const childCollections = withoutSubCompositionCollections(collections);
+        const childTextGroups = pruneTextGroupsForCollections(textCollectionGroups, childCollections);
+
+        try {
+            const res = await fetch('/api/compositions', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    title,
+                    kind: 'sequence',
+                    parentId: compositionId,
+                    duration: TOTAL_DURATION,
+                    elements: [],
+                    tracks: [{ id: 'track-0', magnet: false }],
+                    collections: {
+                        items: childCollections,
+                        textGroups: childTextGroups,
+                        renderQueue: [],
+                    },
+                }),
+            });
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || "Failed to create sub-composition");
+            setNestedSequences(prev => [data, ...prev]);
+            nestedSequencesRef.current = [data, ...nestedSequencesRef.current];
+            const nextCollections = collections.map(collection =>
+                collection.id === collectionId
+                    ? {
+                        ...collection,
+                        items: [
+                            ...collection.items,
+                            {
+                                id: data.id,
+                                label: data.title || title,
+                                value: data.id,
+                                duration: Math.max(0.1, data.duration || TOTAL_DURATION),
+                            },
+                        ],
+                    }
+                    : collection
+            );
+            replaceCollections(nextCollections);
+            void persistCollections(nextCollections);
+            showToast("Sub-composition created.", "success");
+        } catch (error) {
+            showToast(error instanceof Error ? error.message : "Failed to create sub-composition.", "error");
+        }
+    }, [TOTAL_DURATION, collections, compositionId, persistCollections, textCollectionGroups]);
+
+    const deleteNestedSequence = useCallback(async (sequenceId: string) => {
+        try {
+            const res = await fetch(`/api/compositions/${sequenceId}`, { method: 'DELETE' });
+            if (!res.ok) throw new Error("Failed to delete nested composition");
+            setNestedSequences(prev => prev.filter(seq => seq.id !== sequenceId));
+            nestedSequencesRef.current = nestedSequencesRef.current.filter(seq => seq.id !== sequenceId);
+            const nextCollections = collections.map(collection => collection.type === 'subComposition'
+                ? { ...collection, items: collection.items.filter(item => (item.value || item.id) !== sequenceId) }
+                : collection
+            );
+            replaceCollections(nextCollections);
+            void persistCollections(nextCollections);
+            setElements(prev => prev.filter(el => el.nestedSequenceId !== sequenceId));
+            showToast("Sub-composition deleted.", "success");
+        } catch (error) {
+            showToast(error instanceof Error ? error.message : "Failed to delete sub-composition.", "error");
+        }
+    }, [collections, persistCollections]);
+
     // --- Build a flat RenderJob from current state ---
     const buildRenderJob = useCallback(() => {
         const [rw, rh] = exportSettings.resolution.split('x').map(Number);
+        const timelineElements = flattenTimelineElements();
+        const collectionById = new Map(collections.map(c => [c.id, c]));
+        for (const sequence of nestedSequences) {
+            try {
+                for (const collection of parseNestedSequence(sequence).collections) {
+                    if (!collectionById.has(collection.id)) collectionById.set(collection.id, collection);
+                }
+            } catch {
+                // Ignore malformed child payloads here; flattening will surface render errors when needed.
+            }
+        }
+        const pickedByCollection: Record<string, Set<string>> = {};
+        const chosenVariants: Record<string, CollectionVariant | null> = {};
 
-        const renderEls: RenderElement[] = elements
+        for (const el of timelineElements) {
+            const col = collectionById.get(el.collectionId);
+            if (!col) {
+                chosenVariants[el.elementId] = null;
+                continue;
+            }
+
+            const nestedPicked = el.selectedVariantId
+                ? col.items.find(item => item.id === el.selectedVariantId) || null
+                : null;
+            const statePicked = nestedPicked || previewVariants[el.elementId];
+            if (statePicked && col.items.some(item => item.id === statePicked.id)) {
+                chosenVariants[el.elementId] = statePicked;
+                continue;
+            }
+
+            const localExcluded = new Set(el.localExcludedVariantIds || []);
+            let candidates = col.items.filter(item => !item.excluded && !localExcluded.has(item.id));
+            const alreadyPicked = pickedByCollection[col.id];
+            if (alreadyPicked && candidates.some(item => !alreadyPicked.has(item.id))) {
+                candidates = candidates.filter(item => !alreadyPicked.has(item.id));
+            }
+
+            const picked = pickWeighted(candidates, `${variantSeed}-${getSelectionKey(el)}-variant`, variantUsage);
+            chosenVariants[el.elementId] = picked;
+            if (picked) {
+                if (!pickedByCollection[col.id]) pickedByCollection[col.id] = new Set();
+                pickedByCollection[col.id].add(picked.id);
+            }
+        }
+
+        const renderEls: RenderElement[] = timelineElements
             .filter(el => {
-                const chosenVariant = previewVariants[el.elementId];
+                const chosenVariant = chosenVariants[el.elementId];
                 const effectiveEl = getEffectiveElement(el, chosenVariant?.id || 'all');
                 return effectiveEl.visible !== false;
             })
             .map(el => {
             const timingEntry = elementTimings.get(el.elementId) ?? { startTime: el.startTime, duration: el.duration };
             const resolvedColId = resolvedCollectionIdByElement[el.elementId] || el.collectionId;
-            const col = collections.find(c => c.id === resolvedColId);
-            const chosenVariant = previewVariants[el.elementId];
+            const col = collectionById.get(resolvedColId) || collectionById.get(el.collectionId);
+            const chosenVariant = chosenVariants[el.elementId];
 
             // Resolve actual content/URL from selected variant
             let mediaUrl: string | undefined;
@@ -2561,9 +3419,8 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             const variantOverride = variantId ? el.variantOverrides?.[variantId] : undefined;
 
             const startTime = timingEntry.startTime;
-            const duration = variantOverride?.duration ?? timingEntry.duration;
+            const duration = getPlaybackDuration(el, timingEntry, variantOverride);
             const trackIndex = tracks.findIndex(t => t.id === (el.trackId || 'track-0'));
-            const baseZ = 1000 - (Math.max(0, trackIndex) * 10);
 
             // Randomize window: bake a seeded-random offset into the export, same as preview
             const isMedia = el.collectionType === 'video' || el.collectionType === 'audio';
@@ -2571,14 +3428,15 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             let mediaOffset = rawMediaOffset;
             if (isMedia && el.randomizeWindow) {
                 const fullMediaDur = chosenVariant?.duration ?? col?.items[0]?.duration;
-                if (fullMediaDur && fullMediaDur > duration) {
-                    mediaOffset = mulberry32(hashString(`${variantSeed}-${el.elementId}-window`))() * (fullMediaDur - duration);
+                const sourceSpan = duration * getElementPlaybackSpeed(el);
+                if (fullMediaDur && fullMediaDur > sourceSpan) {
+                    mediaOffset = mulberry32(hashString(`${variantSeed}-${getSelectionKey(el)}-window`))() * (fullMediaDur - sourceSpan);
                 }
             }
 
             return {
                 elementId: el.elementId,
-                collectionType: el.collectionType,
+                collectionType: el.collectionType as RenderElement["collectionType"],
                 startTime,
                 duration,
                 x: el.x,         // already 0–100 percent of canvas
@@ -2594,7 +3452,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 speed: el.speed,
                 audioFadeIn: el.audioFadeIn,
                 audioFadeOut: el.audioFadeOut,
-                zIndex: baseZ + (el.zIndex || 0),
+                zIndex: getTrackStackZ(trackIndex, el.zIndex || 0),
                 fontSize: el.fontSize,
                 fontWeight: el.fontWeight,
                 fontStyle: el.fontStyle,
@@ -2605,6 +3463,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 textStrokeColor: el.textStrokeColor,
                 textStrokeWidth: el.textStrokeWidth,
                 animations: el.animations ?? [],
+                nestedCompositionTransform: el.nestedCompositionTransform,
             } satisfies RenderElement;
         });
 
@@ -2633,7 +3492,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             videoBitsPerSecond: exportSettings.bitrate * 1_000_000,
             format: exportSettings.format,
         };
-    }, [elements, collections, previewVariants, elementTimings, exportSettings, TOTAL_DURATION, resolvedCollectionIdByElement, tracks, variantSeed]);
+    }, [collections, exportSettings, TOTAL_DURATION, resolvedCollectionIdByElement, tracks, variantSeed, flattenTimelineElements, pickWeighted, previewVariants, variantUsage, nestedSequences, parseNestedSequence, elementTimings, getSelectionKey]);
 
     const queueCurrentVariant = useCallback(() => {
         const job = buildRenderJob();
@@ -2696,14 +3555,18 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     const saveSkeleton = useCallback(async (overrides?: { tracks?: TrackConfig[], silent?: boolean }) => {
         setSaving(true);
         try {
+            const persistedCollections = isSubCompositionEditor
+                ? withoutSubCompositionCollections(collections)
+                : collections;
+            const persistedTextGroups = pruneTextGroupsForCollections(textCollectionGroups, persistedCollections);
             const payload = {
                 title: title,
                 duration: TOTAL_DURATION,
                 elements: elements,
                 tracks: overrides?.tracks || tracks,
                 collections: {
-                    items: collections,
-                    textGroups: textCollectionGroups,
+                    items: persistedCollections,
+                    textGroups: persistedTextGroups,
                     renderQueue,
                 },
             };
@@ -2720,7 +3583,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             else { if (!overrides?.silent) showToast("Failed to save composition.", "error"); }
             } catch { if (!overrides?.silent) showToast("Failed to save.", "error"); }
             finally { setSaving(false); }
-            }, [title, TOTAL_DURATION, elements, tracks, collections, textCollectionGroups, renderQueue, compositionId]);
+            }, [title, TOTAL_DURATION, elements, tracks, collections, textCollectionGroups, renderQueue, compositionId, isSubCompositionEditor]);
 
     const saveSkeletonRef = useRef(saveSkeleton);
     const savingRef = useRef(saving);
@@ -2749,6 +3612,25 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         return () => window.clearInterval(intervalId);
     }, [compositionId]);
 
+    const commitTitle = useCallback(async (nextTitle: string) => {
+        const cleanTitle = nextTitle.trim();
+        if (!cleanTitle) return;
+        setTitle(cleanTitle);
+        if (!compositionId) return;
+
+        try {
+            const res = await fetch(`/api/compositions/${compositionId}`, {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ title: cleanTitle }),
+            });
+            if (!res.ok) throw new Error("Failed to save title");
+        } catch (error) {
+            console.error("Failed to persist title", error);
+            showToast("Title updated locally, but failed to save.", "error");
+        }
+    }, [compositionId]);
+
     return (
         <DndContext sensors={sensors} onDragStart={handleDragStart} onDragMove={handleDragMove} onDragEnd={handleDragEnd} collisionDetection={pointerWithin}>
             <div className="text-gray-300 h-screen w-full overflow-hidden flex flex-col antialiased bg-[#050505]">
@@ -2766,17 +3648,17 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                     autoFocus
                                     type="text"
                                     value={editTitle}
-                                    onChange={(e) => setEditTitle(e.target.value)}
-                                    onBlur={() => {
-                                        if (editTitle.trim()) setTitle(editTitle.trim());
-                                        setIsRenaming(false);
-                                    }}
-                                    onKeyDown={(e) => {
-                                        if (e.key === 'Enter') {
-                                            if (editTitle.trim()) setTitle(editTitle.trim());
-                                            setIsRenaming(false);
-                                        }
-                                    }}
+	                                    onChange={(e) => setEditTitle(e.target.value)}
+	                                    onBlur={() => {
+	                                        void commitTitle(editTitle);
+	                                        setIsRenaming(false);
+	                                    }}
+	                                    onKeyDown={(e) => {
+	                                        if (e.key === 'Enter') {
+	                                            void commitTitle(editTitle);
+	                                            setIsRenaming(false);
+	                                        }
+	                                    }}
                                     className="bg-white/10 border-none outline-none text-white px-1 rounded"
                                 />
                             ) : (
@@ -2897,8 +3779,11 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                             placeholder="Collection name..."
                                             className="w-full text-[11px] font-mono bg-black/40 border border-white/10 rounded px-2.5 py-2 text-gray-300 placeholder:text-gray-600 outline-none focus:border-white/20"
                                         />
-                                        <div className="grid grid-cols-4 gap-1">
-                                            {(["text", "image", "video", "audio"] as CollectionType[]).map(t => {
+                                        <div className="grid grid-cols-2 gap-1">
+                                            {(isSubCompositionEditor
+                                                ? (["text", "image", "video", "audio"] as CollectionType[])
+                                                : (["text", "image", "video", "audio", "subComposition"] as CollectionType[])
+                                            ).map(t => {
                                                 const c = COLLECTION_COLORS[t];
                                                 return (
                                                     <button
@@ -2911,7 +3796,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                 : "border-white/5 text-gray-500 hover:border-white/10"
                                                         )}
                                                     >
-                                                        {t}
+                                                        {t === "subComposition" ? "Sub-Compositions" : t}
                                                     </button>
                                                 );
                                             })}
@@ -2926,7 +3811,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                         type: newCollectionType,
                                                         items: [],
                                                     };
-                                                    setCollections(prev => [...prev, newCol]);
+                                                    applyCollectionsChange(current => [...current, newCol]);
                                                     setNewCollectionTitle("");
                                                     setIsCreatingCollection(false);
                                                 }}
@@ -2981,22 +3866,22 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                         </div>
                                         <div className="flex gap-1.5">
                                             <button
-                                                onClick={() => {
-                                                    const selectedIds = Object.entries(newTextGroupSelection).filter(([, v]) => v).map(([id]) => id);
-                                                    if (!newTextGroupTitle.trim() || selectedIds.length < 2) return;
-                                                    setTextCollectionGroups(prev => {
-                                                        const cleaned = prev
-                                                            .map(g => ({ ...g, collectionIds: g.collectionIds.filter(id => !selectedIds.includes(id)) }))
-                                                            .filter(g => g.collectionIds.length > 1);
-                                                        return [...cleaned, {
-                                                            id: `tg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-                                                            title: newTextGroupTitle.trim(),
-                                                            collectionIds: selectedIds,
-                                                        }];
-                                                    });
-                                                    setNewTextGroupTitle("");
-                                                    setNewTextGroupSelection({});
-                                                    setIsCreatingTextGroup(false);
+	                                                onClick={() => {
+	                                                    const selectedIds = Object.entries(newTextGroupSelection).filter(([, v]) => v).map(([id]) => id);
+	                                                    if (!newTextGroupTitle.trim() || selectedIds.length < 2) return;
+	                                                    const cleaned = textCollectionGroups
+	                                                        .map(g => ({ ...g, collectionIds: g.collectionIds.filter(id => !selectedIds.includes(id)) }))
+	                                                        .filter(g => g.collectionIds.length > 1);
+	                                                    const nextGroups = [...cleaned, {
+	                                                        id: `tg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+	                                                        title: newTextGroupTitle.trim(),
+	                                                        collectionIds: selectedIds,
+	                                                    }];
+	                                                    replaceTextCollectionGroups(nextGroups);
+	                                                    void persistCollections(collectionsRef.current, nextGroups);
+	                                                    setNewTextGroupTitle("");
+	                                                    setNewTextGroupSelection({});
+	                                                    setIsCreatingTextGroup(false);
                                                 }}
                                                 className="flex-1 text-[9px] font-mono py-1 bg-amber-500/20 hover:bg-amber-500/30 text-amber-200 rounded transition-colors"
                                             >
@@ -3020,9 +3905,13 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                             <div key={group.id} className="border border-amber-500/20 rounded-md p-2 bg-black/20">
                                                 <div className="flex items-center justify-between gap-2">
                                                     <span className="text-[9px] font-mono text-amber-200 truncate">{group.title}</span>
-                                                    <button
-                                                        onClick={() => setTextCollectionGroups(prev => prev.filter(g => g.id !== group.id))}
-                                                        className="text-gray-500 hover:text-red-400 transition-colors"
+	                                                    <button
+	                                                        onClick={() => {
+	                                                            const nextGroups = textCollectionGroups.filter(g => g.id !== group.id);
+	                                                            replaceTextCollectionGroups(nextGroups);
+	                                                            void persistCollections(collectionsRef.current, nextGroups);
+	                                                        }}
+	                                                        className="text-gray-500 hover:text-red-400 transition-colors"
                                                         title="Delete text group"
                                                     >
                                                         <X className="w-3 h-3" />
@@ -3048,32 +3937,128 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                 <CollectionCard
                                     key={col.id}
                                     collection={col}
-                                    allCollections={collections}
-                                    onAddItem={(colId, label, value, duration) => {
-                                        setCollections(prev => prev.map(c =>
-                                            c.id === colId ? { ...c, items: [...c.items, { id: `v-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, label, value, duration }] } : c
-                                        ));
-                                    }}
-                                    onDeleteItem={(colId, variantId) => {
-                                        setCollections(prev => prev.map(c =>
-                                            c.id === colId ? { ...c, items: c.items.filter(v => v.id !== variantId) } : c
-                                        ));
-                                    }}
-                                    onUpdateItem={(colId, variantId, updates) => {
-                                        setCollections(prev => prev.map(c =>
-                                            c.id === colId ? { ...c, items: c.items.map(v => v.id === variantId ? { ...v, ...updates } : v) } : c
-                                        ));
-                                    }}
-                                    onDeleteCollection={(colId) => {
-                                        setCollections(prev => prev.filter(c => c.id !== colId));
-                                        setElements(prev => prev.filter(el => el.collectionId !== colId));
-                                        setTextCollectionGroups(prev => prev
+	                                    allCollections={collections}
+	                                    onAddItem={(colId, label, value, duration) => {
+	                                        applyCollectionsChange(current => current.map(c =>
+	                                            c.id === colId ? { ...c, items: [...c.items, { id: `v-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, label, value, duration }] } : c
+	                                        ));
+	                                    }}
+	                                    onDeleteItem={(colId, variantId) => {
+	                                        const collection = collections.find(c => c.id === colId);
+	                                        const variant = collection?.items.find(v => v.id === variantId);
+	                                        if (collection?.type === 'subComposition' && variant) {
+	                                            const sequenceId = variant.value || variant.id;
+	                                            const referenceCount = collections.reduce((count, c) => {
+	                                                if (c.type !== 'subComposition') return count;
+	                                                return count + c.items.filter(item => (item.value || item.id) === sequenceId).length;
+	                                            }, 0);
+	                                            if (referenceCount > 1) {
+	                                                applyCollectionsChange(current => current.map(c =>
+	                                                    c.id === colId ? { ...c, items: c.items.filter(v => v.id !== variantId) } : c
+	                                                ));
+	                                                return;
+	                                            }
+	                                            void deleteNestedSequence(sequenceId);
+	                                            return;
+	                                        }
+	                                        applyCollectionsChange(current => current.map(c =>
+	                                            c.id === colId ? { ...c, items: c.items.filter(v => v.id !== variantId) } : c
+	                                        ));
+	                                    }}
+	                                    onUpdateItem={(colId, variantId, updates) => {
+	                                        applyCollectionsChange(current => current.map(c =>
+	                                            c.id === colId ? { ...c, items: c.items.map(v => v.id === variantId ? { ...v, ...updates } : v) } : c
+	                                        ));
+	                                    }}
+	                                    onDuplicateItem={async (colId, variantId) => {
+	                                        const collection = collections.find(c => c.id === colId);
+	                                        const variant = collection?.items.find(v => v.id === variantId);
+	                                        if (!collection || !variant) return;
+
+	                                        let clone: CollectionVariant | null = null;
+	                                        if (collection.type === 'subComposition') {
+	                                            const sourceId = variant.value || variant.id;
+	                                            const source = nestedSequences.find(seq => seq.id === sourceId);
+	                                            if (!source || !compositionId) {
+	                                                showToast("Could not duplicate sub-composition.", "error");
+	                                                return;
+	                                            }
+
+	                                            try {
+	                                                const res = await fetch('/api/compositions', {
+	                                                    method: 'POST',
+	                                                    headers: { 'Content-Type': 'application/json' },
+	                                                    body: JSON.stringify({
+	                                                        title: `${source.title || variant.label} Copy`,
+	                                                        angle: undefined,
+	                                                        kind: source.kind || 'sequence',
+	                                                        parentId: compositionId,
+	                                                        duration: source.duration,
+	                                                        elements: typeof source.elements === 'string' ? JSON.parse(source.elements || '[]') : source.elements,
+	                                                        tracks: typeof source.tracks === 'string' ? JSON.parse(source.tracks || '[]') : source.tracks,
+	                                                        collections: typeof source.collections === 'string' ? JSON.parse(source.collections || '{}') : source.collections,
+	                                                    }),
+	                                                });
+	                                                const data = await res.json();
+	                                                if (!res.ok) throw new Error(data.error || "Failed to duplicate sub-composition");
+	                                                nestedSequencesRef.current = [data, ...nestedSequencesRef.current];
+	                                                setNestedSequences(prev => [data, ...prev]);
+	                                                clone = {
+	                                                    ...variant,
+	                                                    id: data.id,
+	                                                    label: data.title,
+	                                                    value: data.id,
+	                                                    duration: Math.max(0.1, data.duration || variant.duration || EMPTY_NESTED_COMPOSITION_DISPLAY_DURATION),
+	                                                    linkedVariantIds: variant.linkedVariantIds ? [...variant.linkedVariantIds] : undefined,
+	                                                };
+	                                            } catch (error) {
+	                                                console.error("Failed to duplicate sub-composition", error);
+	                                                showToast(error instanceof Error ? error.message : "Failed to duplicate sub-composition.", "error");
+	                                                return;
+	                                            }
+	                                        } else {
+	                                            clone = {
+	                                                ...variant,
+	                                                id: `v-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+	                                                label: `${variant.label} Copy`,
+	                                                linkedVariantIds: variant.linkedVariantIds ? [...variant.linkedVariantIds] : undefined,
+	                                            };
+	                                        }
+
+	                                        const nextCollections = collectionsRef.current.map(c => {
+	                                            if (c.id !== colId || !clone) return c;
+	                                            const index = c.items.findIndex(v => v.id === variantId);
+	                                            const nextItems = [...c.items];
+	                                            nextItems.splice(index + 1, 0, clone);
+	                                            return { ...c, items: nextItems };
+	                                        });
+	                                        replaceCollections(nextCollections);
+	                                        void persistCollections(nextCollections);
+	                                    }}
+	                                    onDeleteCollection={(colId) => {
+	                                        const collection = collections.find(c => c.id === colId);
+	                                        if (collection?.type === 'subComposition') {
+	                                            const idsToDelete = new Set(collection.items.map(item => item.value || item.id));
+	                                            const outsideIds = new Set(collections
+	                                                .filter(c => c.id !== colId && c.type === 'subComposition')
+	                                                .flatMap(c => c.items.map(item => item.value || item.id)));
+	                                            idsToDelete.forEach(sequenceId => {
+	                                                if (!outsideIds.has(sequenceId)) void deleteNestedSequence(sequenceId);
+	                                            });
+	                                        }
+                                        const nextCollections = collectionsRef.current.filter(c => c.id !== colId);
+                                        const nextTextGroups = textCollectionGroups
                                             .map(g => ({ ...g, collectionIds: g.collectionIds.filter(id => id !== colId) }))
-                                            .filter(g => g.collectionIds.length > 1));
+                                            .filter(g => g.collectionIds.length > 1);
+                                        replaceCollections(nextCollections);
+                                        setElements(prev => prev.filter(el => el.collectionId !== colId));
+                                        replaceTextCollectionGroups(nextTextGroups);
+                                        void persistCollections(nextCollections, nextTextGroups);
                                         if (elements.find(el => el.elementId === selectedElementId && el.collectionId === colId)) {
                                             setSelectedElementId(null);
                                         }
                                     }}
+                                    onCreateSubComposition={createSubComposition}
                                 />
                             ))}
                         </div>
@@ -3147,8 +4132,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                         const timing = elementTimings.get(baseEl.elementId);
                                                         
                                                         const trackIndex = tracks.findIndex(t => t.id === (baseEl.trackId || 'track-0'));
-                                                        const baseZ = 1000 - (Math.max(0, trackIndex) * 10);
-                                                        const el = { ...rawEl, ...(timing || {}), zIndex: baseZ + (rawEl.zIndex || 0) };
+                                                        const el = { ...rawEl, ...(timing || {}), zIndex: getTrackStackZ(trackIndex, rawEl.zIndex || 0) };
 
                                                         return (
                                                             <CanvasLayer
@@ -3167,8 +4151,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                 const rawEl = effectiveElement || selectedElement;
                                                 if (rawEl.visible === false) return null;
                                                 const trackIndex = tracks.findIndex(t => t.id === (rawEl.trackId || 'track-0'));
-                                                const baseZ = 1000 - (Math.max(0, trackIndex) * 10);
-                                                const el = { ...rawEl, zIndex: baseZ + (rawEl.zIndex || 0) + 100 }; // Boost selected on top of its track
+                                                const el = { ...rawEl, zIndex: getTrackStackZ(trackIndex, rawEl.zIndex || 0, 100) }; // Boost selected on top of its track
                                                 return (
                                                     <CanvasLayer
                                                         key={el.elementId}
@@ -3225,16 +4208,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                     <div className="w-full max-w-[320px] space-y-4 shrink-0 z-10">
                                         <div className="w-full aspect-[9/16] bg-black rounded-lg border border-white/10 relative overflow-hidden shadow-2xl">
                                             <div className="absolute inset-0 opacity-[0.03] pointer-events-none" style={{ backgroundImage: 'linear-gradient(rgba(255,255,255,0.3) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.3) 1px, transparent 1px)', backgroundSize: '10% 10%' }} />
-                                            {elements
-                                                .map(baseEl => {
-                                                    // When a specific variant is selected in inspector, use it for preview
-                                                    // When 'all', fall back to random seed-based preview
-                                                    const variant = previewVariants[baseEl.elementId];
-                                                    const overrides = variant ? getEffectiveElement(baseEl, variant.id) : baseEl;
-                                                    const timing = elementTimings.get(baseEl.elementId) || { startTime: baseEl.startTime, duration: baseEl.duration };
-                                                    const el = { ...overrides, ...timing };
-                                                    return { el, variant };
-                                                })
+                                            {previewTimelineItems
                                                 .filter(({ el }) => (el.visible !== false) && el.collectionType !== 'audio')
                                                 .sort((a, b) => {
                                                     const ta = tracks.findIndex(t => t.id === (a.el.trackId || 'track-0'));
@@ -3246,10 +4220,10 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                     const isActive = currentTime >= rawEl.startTime && currentTime < rawEl.startTime + rawEl.duration;
                                                     const colors = COLLECTION_COLORS[rawEl.collectionType];
                                                     const animStyle = evaluateAnimations(rawEl, currentTime);
+                                                    const blur = Math.max(animStyle.blur, rawEl.nestedCompositionBlur || 0);
                                                     
                                                     const trackIndex = tracks.findIndex(t => t.id === (rawEl.trackId || 'track-0'));
-                                                    const baseZ = 1000 - (Math.max(0, trackIndex) * 10);
-                                                    const el = { ...rawEl, zIndex: baseZ + (rawEl.zIndex || 0) };
+                                                    const el = { ...rawEl, zIndex: getTrackStackZ(trackIndex, rawEl.zIndex || 0) };
 
                                                     return (
                                                         <div
@@ -3264,7 +4238,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                 opacity: isActive ? animStyle.opacity : 0,
                                                                 pointerEvents: isActive ? 'auto' : 'none',
                                                                 transform: `rotate(${el.rotation || 0}deg) scale(${animStyle.scale}) rotate(${animStyle.rotate}deg)`,
-                                                                filter: animStyle.blur > 0 ? `blur(${animStyle.blur}px)` : undefined,
+                                                                filter: blur > 0 ? `blur(${blur}px)` : undefined,
                                                             }}
                                                         >
                                                             {el.collectionType === 'text' ? (
@@ -3289,29 +4263,21 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                         className="w-full h-full object-cover"
                                                                         playsInline
                                                                         preload="auto"
-                                                                        loop
                                                                         ref={(videoEl) => {
                                                                             if (!videoEl) return;
                                                                             const rawDur = (videoEl.duration && !isNaN(videoEl.duration)) ? videoEl.duration : Infinity;
+                                                                            const targetRate = getElementPlaybackSpeed(el);
                                                                             // Randomize window: pick a seeded-random start within the full media, preserving clip duration
                                                                             const baseOffset = el.randomizeWindow && rawDur !== Infinity
-                                                                                ? mulberry32(hashString(`${variantSeed}-${el.elementId}-window`))() * Math.max(0, rawDur - el.duration)
+                                                                                ? mulberry32(hashString(`${variantSeed}-${getSelectionKey(el)}-window`))() * Math.max(0, rawDur - (el.duration * targetRate))
                                                                                 : (el.mediaOffset ?? 0);
-                                                                            const localTime = Math.max(0, currentTime - el.startTime) + baseOffset;
-                                                                            let safeLocalTime = rawDur !== Infinity ? (localTime % rawDur) : localTime;
-                                                                            
-                                                                            // Prevent flash of first frame at the very end of the element's duration
-                                                                            const isAtElementEnd = (currentTime >= el.startTime + el.duration - 0.1);
-                                                                            if (isAtElementEnd && rawDur !== Infinity && safeLocalTime < 0.2) {
-                                                                                safeLocalTime = Math.max(0, rawDur - 0.05);
-                                                                            }
+                                                                            const { time: safeLocalTime, sourceExhausted } = getPreviewMediaTime(currentTime, el, baseOffset, rawDur);
 
                                                                             // Sync time if scrubbing or drifting out of sync
                                                                             if (Math.abs(videoEl.currentTime - safeLocalTime) > 0.2) {
                                                                                 videoEl.currentTime = safeLocalTime;
                                                                             }
                                                                             // Playback speed
-                                                                            const targetRate = el.speed ?? 1;
                                                                             if (videoEl.playbackRate !== targetRate) videoEl.playbackRate = targetRate;
                                                                             // Audio fade in/out
                                                                             const baseVol = el.volume ?? 1;
@@ -3322,7 +4288,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                             else if (el.audioFadeOut && el.audioFadeOut > 0 && remaining < el.audioFadeOut) fadeMult = Math.min(1, remaining / el.audioFadeOut);
                                                                             const targetVol = Math.max(0, Math.min(1, baseVol * fadeMult));
                                                                             if (Math.abs(videoEl.volume - targetVol) > 0.01) videoEl.volume = targetVol;
-                                                                            if (isPlaying && isActive) {
+                                                                            if (isPlaying && isActive && !sourceExhausted) {
                                                                                 if (videoEl.paused) videoEl.play().catch(() => { });
                                                                             }
                                                                             else {
@@ -3338,19 +4304,17 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                             ) : el.collectionType === 'audio' ? (
                                                                 <audio
                                                                     src={variant?.value || el.content}
-                                                                    loop
                                                                     ref={(audioEl) => {
                                                                         if (!audioEl) return;
                                                                         const rawDur = (audioEl.duration && !isNaN(audioEl.duration)) ? audioEl.duration : Infinity;
+                                                                        const targetRate = getElementPlaybackSpeed(el);
                                                                         const baseOffset = el.randomizeWindow && rawDur !== Infinity
-                                                                            ? mulberry32(hashString(`${variantSeed}-${el.elementId}-window`))() * Math.max(0, rawDur - el.duration)
+                                                                            ? mulberry32(hashString(`${variantSeed}-${getSelectionKey(el)}-window`))() * Math.max(0, rawDur - (el.duration * targetRate))
                                                                             : (el.mediaOffset ?? 0);
-                                                                        const localTime = Math.max(0, currentTime - el.startTime) + baseOffset;
-                                                                        const safeLocalTime = rawDur !== Infinity ? (localTime % rawDur) : localTime;
+                                                                        const { time: safeLocalTime, sourceExhausted } = getPreviewMediaTime(currentTime, el, baseOffset, rawDur);
                                                                         if (Math.abs(audioEl.currentTime - safeLocalTime) > 0.2) {
                                                                             audioEl.currentTime = safeLocalTime;
                                                                         }
-                                                                        const targetRate = el.speed ?? 1;
                                                                         if (audioEl.playbackRate !== targetRate) audioEl.playbackRate = targetRate;
                                                                         const baseVol = el.volume ?? 1;
                                                                         const elapsed = currentTime - el.startTime;
@@ -3360,44 +4324,42 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                         else if (el.audioFadeOut && el.audioFadeOut > 0 && remaining < el.audioFadeOut) fadeMult = Math.min(1, remaining / el.audioFadeOut);
                                                                         const targetVol = Math.max(0, Math.min(1, baseVol * fadeMult));
                                                                         if (Math.abs(audioEl.volume - targetVol) > 0.01) audioEl.volume = targetVol;
-                                                                        if (isPlaying && isActive) {
+                                                                        if (isPlaying && isActive && !sourceExhausted) {
                                                                             if (audioEl.paused) audioEl.play().catch(() => { });
                                                                         } else {
                                                                             if (!audioEl.paused) audioEl.pause();
                                                                         }
                                                                     }}
                                                                 />
+                                                            ) : el.collectionType === 'nestedSequence' ? (
+                                                                <div className="w-full h-full flex items-center justify-center bg-cyan-500/15 border border-cyan-400/30">
+                                                                    <span className="text-[10px] font-mono text-cyan-100 truncate px-2">{el.title}</span>
+                                                                </div>
                                                             ) : null}
                                                         </div>
                                                     );
                                                 })}
 
                                             {/* Hidden audio elements for playback */}
-                                            {elements
-                                                .filter(baseEl => baseEl.collectionType === 'audio' && baseEl.visible !== false)
-                                                .map(baseEl => {
-                                                    const variant = previewVariants[baseEl.elementId];
-                                                    const overrides = variant ? getEffectiveElement(baseEl, variant.id) : baseEl;
-                                                    const timing = elementTimings.get(baseEl.elementId) || { startTime: baseEl.startTime, duration: baseEl.duration };
-                                                    const el = { ...overrides, ...timing };
+                                            {previewTimelineItems
+                                                .filter(({ el }) => el.collectionType === 'audio' && el.visible !== false)
+                                                .map(({ el, variant }) => {
                                                     const isActive = currentTime >= el.startTime && currentTime < el.startTime + el.duration;
                                                     return (
                                                         <audio
                                                             key={`aud-${el.elementId}-${variant?.value || el.content || 'base'}`}
                                                             src={variant?.value || el.content}
-                                                            loop
                                                             ref={(audioEl) => {
                                                                 if (!audioEl) return;
                                                                 const rawDur = (audioEl.duration && !isNaN(audioEl.duration)) ? audioEl.duration : Infinity;
+                                                                const targetRate = getElementPlaybackSpeed(el);
                                                                 const baseOffset = el.randomizeWindow && rawDur !== Infinity
-                                                                    ? mulberry32(hashString(`${variantSeed}-${el.elementId}-window`))() * Math.max(0, rawDur - el.duration)
+                                                                    ? mulberry32(hashString(`${variantSeed}-${getSelectionKey(el)}-window`))() * Math.max(0, rawDur - (el.duration * targetRate))
                                                                     : (el.mediaOffset ?? 0);
-                                                                const localTime = Math.max(0, currentTime - el.startTime) + baseOffset;
-                                                                const safeLocalTime = rawDur !== Infinity ? (localTime % rawDur) : localTime;
+                                                                const { time: safeLocalTime, sourceExhausted } = getPreviewMediaTime(currentTime, el, baseOffset, rawDur);
                                                                 if (Math.abs(audioEl.currentTime - safeLocalTime) > 0.2) {
                                                                     audioEl.currentTime = safeLocalTime;
                                                                 }
-                                                                const targetRate = el.speed ?? 1;
                                                                 if (audioEl.playbackRate !== targetRate) audioEl.playbackRate = targetRate;
                                                                 const baseVol = el.volume ?? 1;
                                                                 const elapsed = currentTime - el.startTime;
@@ -3407,7 +4369,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                 else if (el.audioFadeOut && el.audioFadeOut > 0 && remaining < el.audioFadeOut) fadeMult = Math.min(1, remaining / el.audioFadeOut);
                                                                 const targetVol = Math.max(0, Math.min(1, baseVol * fadeMult));
                                                                 if (Math.abs(audioEl.volume - targetVol) > 0.01) audioEl.volume = targetVol;
-                                                                if (isPlaying && isActive) {
+                                                                if (isPlaying && isActive && !sourceExhausted) {
                                                                     if (audioEl.paused) audioEl.play().catch(() => { });
                                                                 } else {
                                                                     if (!audioEl.paused) audioEl.pause();
@@ -3993,10 +4955,12 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                                                     zIndex: el.zIndex
                                                                                                 }}>
                                                                                                 <div
-                                                                                                    className={cn(
-                                                                                                        "absolute inset-0 rounded flex items-center shrink-0 min-w-[20px] transition-colors",
-                                                                                                        timelineTool === 'split' ? "" : "cursor-grab active:cursor-grabbing",
-                                                                                                        isMediaAllMode
+                                                                                                   className={cn(
+                                                                                                       "absolute inset-0 rounded flex items-center shrink-0 min-w-[20px] transition-colors",
+                                                                                                       timelineTool === 'split' ? "" : "cursor-grab active:cursor-grabbing",
+                                                                                                        el.collectionType === 'nestedSequence'
+                                                                                                            ? (selectedElementId === el.elementId ? 'bg-violet-600 border border-violet-400' : 'bg-violet-900/80 border border-violet-500/30 hover:bg-violet-800')
+                                                                                                            : isMediaAllMode
                                                                                                             ? (selectedElementId === el.elementId ? 'bg-gray-600/60 border border-gray-400/50' : 'bg-gray-700/40 border border-transparent hover:bg-gray-600/40')
                                                                                                             : (selectedElementId === el.elementId ? 'bg-blue-600 border border-blue-400' : 'bg-blue-900 border border-transparent hover:bg-blue-800')
                                                                                                     )}
@@ -4116,11 +5080,11 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                             ) : (
                                 <div className="space-y-5">
                                     {/* Header */}
-                                    <div className="flex items-center justify-between pb-4 border-b border-white/5">
-                                        <div>
-                                            <span className="text-[9px] uppercase text-blue-400 font-bold tracking-widest">{selectedElement.collectionType}</span>
-                                            <h3 className="text-white font-semibold text-sm mt-0.5">{selectedElement.title}</h3>
-                                        </div>
+	                                    <div className="flex items-center justify-between pb-4 border-b border-white/5">
+	                                        <div>
+	                                            <span className="text-[9px] uppercase text-blue-400 font-bold tracking-widest">{selectedElement.collectionType}</span>
+	                                            <h3 className="text-white font-semibold text-sm mt-0.5">{selectedElement.title}</h3>
+	                                        </div>
                                         <div className="flex items-center gap-1.5">
                                             <button
                                                 onClick={() => updateSelected({ visible: !(selectedElement.visible !== false) })}
@@ -4166,11 +5130,24 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                             </button>
                                             <button onClick={removeSelected} className="p-1.5 bg-red-500/10 text-red-500 rounded-md hover:bg-red-500/20 transition-colors" title="Delete">
                                                 <X className="w-4 h-4" />
-                                            </button>
-                                        </div>
-                                    </div>
+	                                            </button>
+	                                        </div>
+	                                    </div>
 
-                                    {/* Universal Variant Selector */}
+                                    {selectedNestedEditorTarget && (
+                                        <Link
+                                            href={`/builder/${selectedNestedEditorTarget.id}`}
+                                            className="flex items-center justify-between gap-2 rounded-lg border border-violet-500/25 bg-violet-500/10 px-3 py-2 text-[10px] font-mono text-violet-200 hover:bg-violet-500/15 hover:border-violet-400/40 transition-colors"
+                                        >
+                                            <span className="flex items-center gap-2 min-w-0">
+                                                <Film className="w-3.5 h-3.5 shrink-0 text-violet-300" />
+                                                <span className="truncate">Open {selectedNestedEditorTarget.title}</span>
+                                            </span>
+                                            <span className="text-violet-300/70 shrink-0">Editor</span>
+                                        </Link>
+                                    )}
+
+	                                    {/* Universal Variant Selector */}
                                     {(() => {
                                         const col = collections.find(c => c.id === selectedResolvedCollectionId);
                                         const variants = col?.items || [];
@@ -4367,6 +5344,32 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                         </div>
                                     </div>
 
+                                    {/* Playback */}
+                                    {(selectedElement.collectionType === 'video' || selectedElement.collectionType === 'audio') && (() => {
+                                        const el = effectiveElement || selectedElement;
+                                        const spd = getElementPlaybackSpeed(el);
+                                        return (
+                                            <div className="space-y-3 pt-4 border-t border-white/5">
+                                                <h4 className="text-[9px] font-bold uppercase tracking-widest text-gray-500 font-mono">Playback</h4>
+                                                <div className="space-y-1.5">
+                                                    <div className="flex justify-between text-xs text-gray-400">
+                                                        <span>Speed</span>
+                                                        <span className="text-white font-mono font-medium">{spd.toFixed(2)}x</span>
+                                                    </div>
+                                                    <input
+                                                        type="range" min="0.25" max="4" step="0.05"
+                                                        value={spd}
+                                                        onChange={e => updateSelected({ speed: Number(e.target.value) })}
+                                                        className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                                                    />
+                                                    <div className="flex justify-between text-[9px] text-gray-600 font-mono">
+                                                        <span>0.25x</span><span>1x</span><span>2x</span><span>4x</span>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        );
+                                    })()}
+
                                     {/* Duration Linking */}
                                         <div className="space-y-3 pt-4 border-t border-white/5">
                                             <div className="flex items-center justify-between">
@@ -4510,13 +5513,19 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                         return (
                                             <div className="space-y-3 pt-4 border-t border-white/5">
                                                 <h4 className="text-[9px] font-bold uppercase tracking-widest text-gray-500 font-mono">Content</h4>
-                                                <textarea
-                                                    value={variant.value}
-                                                    onChange={e => {
-                                                        setCollections(prev => prev.map(c =>
-                                                            c.id === col.id ? { ...c, items: c.items.map(v => v.id === variant.id ? { ...v, value: e.target.value } : v) } : c
-                                                        ));
-                                                    }}
+	                                                <textarea
+	                                                    value={variant.value}
+	                                                    onChange={e => {
+	                                                        replaceCollections(collectionsRef.current.map(c =>
+	                                                            c.id === col.id ? { ...c, items: c.items.map(v => v.id === variant.id ? { ...v, value: e.target.value } : v) } : c
+	                                                        ));
+	                                                    }}
+	                                                    onBlur={e => {
+	                                                        const nextCollections = collections.map(c =>
+	                                                            c.id === col.id ? { ...c, items: c.items.map(v => v.id === variant.id ? { ...v, value: e.currentTarget.value } : v) } : c
+	                                                        );
+	                                                        void persistCollections(nextCollections);
+	                                                    }}
                                                     className="w-full bg-[#111] rounded-md border border-white/10 px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500/50 transition-colors min-h-[80px] resize-none"
                                                     placeholder="Edit variant content..."
                                                 />
@@ -4625,7 +5634,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                     {(selectedElement.collectionType === 'video' || selectedElement.collectionType === 'audio') && (() => {
                                         const el = effectiveElement || selectedElement;
                                         const vol = el.volume ?? 1;
-                                        const spd = el.speed ?? 1;
+                                        const spd = getElementPlaybackSpeed(el);
                                         const fadeIn = el.audioFadeIn ?? 0;
                                         const fadeOut = el.audioFadeOut ?? 0;
                                         return (
@@ -4647,7 +5656,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                 </div>
 
                                                 {/* Speed */}
-                                                <div className="space-y-1.5">
+                                                <div className="hidden">
                                                     <div className="flex justify-between text-xs text-gray-400">
                                                         <span>Speed</span>
                                                         <span className="text-white font-mono font-medium">{spd.toFixed(2)}×</span>
@@ -5040,7 +6049,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             <DragOverlay dropAnimation={null}>
                 {activeCollection ? (
                     <div className="opacity-80 scale-105 pointer-events-none origin-top-left w-[220px]">
-                        <CollectionCard collection={activeCollection} allCollections={collections} onAddItem={() => { }} onDeleteItem={() => { }} onUpdateItem={() => { }} onDeleteCollection={() => { }} />
+                        <CollectionCard collection={activeCollection} allCollections={collections} onAddItem={() => { }} onDeleteItem={() => { }} onUpdateItem={() => { }} onDuplicateItem={() => { }} onDeleteCollection={() => { }} onCreateSubComposition={() => { }} />
                     </div>
                 ) : null}
             </DragOverlay>

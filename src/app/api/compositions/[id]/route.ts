@@ -26,6 +26,8 @@ export async function PUT(request: Request, context: { params: Promise<{ id: str
         const updateData: any = {};
         if (body.title !== undefined) updateData.title = body.title;
         if (body.angle !== undefined) updateData.angle = body.angle;
+        if (body.kind !== undefined) updateData.kind = body.kind;
+        if (body.parentId !== undefined) updateData.parentId = body.parentId || null;
         if (body.duration !== undefined) updateData.duration = body.duration;
         if (body.elements !== undefined) updateData.elements = JSON.stringify(body.elements);
         if (body.tracks !== undefined) updateData.tracks = JSON.stringify(body.tracks);
