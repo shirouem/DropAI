@@ -1,11 +1,11 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Layers, Plus, Search, Trash2, Edit2, Clock, Copy, Clapperboard, ListPlus, Loader2, X, CheckCircle2, AlertCircle } from "lucide-react";
+import { Layers, Plus, Search, Trash2, Edit2, Clock, Copy, Clapperboard, ListPlus, Loader2, X, CheckCircle2, AlertCircle, FolderOpen } from "lucide-react";
 import { motion } from "framer-motion";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { renderComposition, type RenderJob, type RenderProgress } from "@/app/builder/renderer";
+import { renderComposition, type RenderJob, type RenderProgress, type RenderOutputTarget } from "@/app/builder/renderer";
 
 type QueuedRenderJob = {
     id: string;
@@ -36,6 +36,10 @@ type CompositionRecord = {
 type MasterQueueItem = QueuedRenderJob & {
     compositionId: string;
     compositionTitle: string;
+};
+
+type DirectoryPickerWindow = Window & {
+    showDirectoryPicker?: (options?: { mode?: "read" | "readwrite" }) => Promise<FileSystemDirectoryHandle>;
 };
 
 function parseCollections(input: CompositionRecord["collections"]): CollectionsPayload {
@@ -74,6 +78,8 @@ export default function CompositionsPage() {
     const [editName, setEditName] = useState("");
     const [masterProgress, setMasterProgress] = useState<RenderProgress | null>(null);
     const [isMasterRendering, setIsMasterRendering] = useState(false);
+    const [masterOutputDir, setMasterOutputDir] = useState<FileSystemDirectoryHandle | null>(null);
+    const [masterOutputDirName, setMasterOutputDirName] = useState<string | null>(null);
     const masterAbortRef = useRef<AbortController | null>(null);
     const router = useRouter();
 
@@ -116,10 +122,29 @@ export default function CompositionsPage() {
         )));
     };
 
+    const chooseMasterOutputDirectory = async () => {
+        const picker = (window as DirectoryPickerWindow).showDirectoryPicker;
+        if (!picker) {
+            alert("Folder export is not supported in this browser. Use Chrome or Edge to save master renders directly to a folder.");
+            return;
+        }
+
+        try {
+            const handle = await picker({ mode: "readwrite" });
+            setMasterOutputDir(handle);
+            setMasterOutputDirName(handle.name);
+        } catch (error) {
+            if (error instanceof DOMException && error.name === "AbortError") return;
+            console.error("Failed to choose master render folder", error);
+            alert("Failed to choose the master render folder.");
+        }
+    };
+
     const startMasterRender = async () => {
         if (masterQueue.length === 0 || isMasterRendering) return;
 
         const abortCtrl = new AbortController();
+        const outputTarget: RenderOutputTarget | undefined = masterOutputDir ? { directoryHandle: masterOutputDir } : undefined;
         const queueByComposition = new Map(
             compositions.map(comp => [comp.id, getRenderQueue(comp)])
         );
@@ -141,12 +166,15 @@ export default function CompositionsPage() {
                 await renderComposition(
                     { ...item.job, outputName: item.job.outputName || label },
                     (progress) => {
+                        const overallProgress = Math.min(1, (i + progress.progress) / masterQueue.length);
                         setMasterProgress({
                             ...progress,
+                            progress: overallProgress,
                             message: `[${i + 1}/${masterQueue.length}] ${label}: ${progress.message}`,
                         });
                     },
-                    abortCtrl.signal
+                    abortCtrl.signal,
+                    outputTarget
                 );
 
                 const currentQueue = queueByComposition.get(comp.id) ?? getRenderQueue(comp);
@@ -159,12 +187,20 @@ export default function CompositionsPage() {
                 setMasterProgress({ phase: "done", progress: 1, message: "Master render complete" });
             }
         } catch (error) {
-            setMasterProgress({
-                phase: "error",
-                progress: 0,
-                message: "Master render failed",
-                error: error instanceof Error ? error.message : String(error),
-            });
+            if (abortCtrl.signal.aborted || (error instanceof DOMException && error.name === "AbortError")) {
+                setMasterProgress(prev => ({
+                    phase: "error",
+                    progress: prev?.progress ?? 0,
+                    message: "Master render cancelled",
+                }));
+            } else {
+                setMasterProgress({
+                    phase: "error",
+                    progress: 0,
+                    message: "Master render failed",
+                    error: error instanceof Error ? error.message : String(error),
+                });
+            }
         } finally {
             setIsMasterRendering(false);
         }
@@ -322,6 +358,29 @@ export default function CompositionsPage() {
                         </div>
 
                         <div className="flex items-center gap-2">
+                            <div className="hidden xl:flex items-center gap-2 min-w-0 mr-2">
+                                <div className="max-w-48 rounded-lg border border-white/8 bg-black/20 px-3 py-2">
+                                    <p className="text-[10px] text-gray-500 font-mono truncate">
+                                        {masterOutputDirName || "Browser downloads folder"}
+                                    </p>
+                                </div>
+                            </div>
+                            <button
+                                onClick={chooseMasterOutputDirectory}
+                                disabled={isMasterRendering}
+                                className="px-3 py-2 rounded-lg bg-white/5 border border-white/8 text-xs font-semibold text-gray-400 hover:text-white hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center gap-2"
+                            >
+                                <FolderOpen className="w-4 h-4" />
+                                Folder
+                            </button>
+                            {masterOutputDir && !isMasterRendering && (
+                                <button
+                                    onClick={() => { setMasterOutputDir(null); setMasterOutputDirName(null); }}
+                                    className="px-3 py-2 rounded-lg bg-white/5 border border-white/8 text-xs font-semibold text-red-400 hover:text-red-300 hover:bg-white/10 transition-colors"
+                                >
+                                    Clear Folder
+                                </button>
+                            )}
                             <button
                                 onClick={clearMasterQueue}
                                 disabled={masterQueue.length === 0 || isMasterRendering}

@@ -4,12 +4,12 @@ import React, { useState, useEffect, useRef, useId, useCallback, useMemo } from 
 import { motion, AnimatePresence } from "framer-motion";
 import {
     Play, Pause, Plus, Image as ImageIcon, Music, Download, Upload,
-    Layers, X, Type, MonitorPlay, SlidersHorizontal, GripVertical, Shuffle, SkipBack, Video, Trash2, Sparkles, ChevronDown, Eye, EyeOff,
+    Layers, X, Type, MonitorPlay, SlidersHorizontal, GripVertical, Shuffle, SkipBack, Video, Trash2, Sparkles, ChevronDown, ChevronLeft, ChevronRight, Eye, EyeOff,
     Bold, Italic, Underline, AlignLeft, AlignCenter, AlignRight, Scissors, MousePointer2, Settings, Lock, Unlock, ArrowUp, ArrowDown,
-    Film, Loader2, CheckCircle2, AlertCircle, Clapperboard, ListPlus, Link2, Ban, RotateCcw, RotateCw, Copy, ListOrdered, ClipboardPaste
+    Film, Loader2, CheckCircle2, AlertCircle, Clapperboard, ListPlus, Link2, Ban, RotateCcw, RotateCw, Copy, ListOrdered, ClipboardPaste, FolderOpen, MoreHorizontal
 } from "lucide-react";
 import Link from "next/link";
-import { renderComposition, type RenderJob, type RenderProgress, type RenderElement, type RenderFormat } from "./renderer";
+import { renderComposition, type RenderJob, type RenderProgress, type RenderElement, type RenderFormat, type RenderOutputTarget } from "./renderer";
 import {
     DndContext,
     useSensor,
@@ -25,6 +25,17 @@ import {
 } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
 import { cn } from "@/lib/utils";
+import {
+    createCollectionVersion,
+    deleteCollectionVersion,
+    getActiveCollectionVersion,
+    getCollectionVersions,
+    normalizeCollectionsForLoad,
+    renameCollectionVersion,
+    switchCollectionVersion,
+    syncCollectionsWithActiveVersions,
+    type CollectionVersion,
+} from "./collectionVersions";
 
 // --- Types ---
 type CollectionType = "text" | "image" | "video" | "audio" | "subComposition";
@@ -40,6 +51,7 @@ interface CollectionVariant {
     duration?: number; // Intrinsic media duration in seconds
     linkedVariantIds?: string[];
     excluded?: boolean; // When true, this variant is skipped during shuffle/generation
+    isNull?: boolean; // Empty variant: selected element behaves as if absent
 }
 
 interface CollectionItem {
@@ -47,6 +59,9 @@ interface CollectionItem {
     title: string;
     type: CollectionType;
     items: CollectionVariant[];
+    activeVersionId?: string;
+    versions?: CollectionVersion<CollectionVariant>[];
+    sharedFromParent?: boolean;
 }
 
 interface TextCollectionGroup {
@@ -196,6 +211,16 @@ type ElementClipboardPayload = {
     nestedSequences?: NestedSequenceRecord[];
 };
 
+type ParsedCollectionsPayload = {
+    items: CollectionItem[];
+    textGroups: TextCollectionGroup[];
+    renderQueue: QueuedRenderJob[];
+};
+
+type DirectoryPickerWindow = Window & {
+    showDirectoryPicker?: (options?: { mode?: "read" | "readwrite" }) => Promise<FileSystemDirectoryHandle>;
+};
+
 // --- Collection Type Styling ---
 const COLLECTION_COLORS: Record<CollectionVisualType, { bg: string; border: string; text: string; icon: string }> = {
     text: { bg: "bg-amber-500/15", border: "border-amber-500/40", text: "text-amber-400", icon: "text-amber-500" },
@@ -231,6 +256,150 @@ function pruneTextGroupsForCollections(groups: TextCollectionGroup[], collection
         .filter(group => group.collectionIds.length > 1);
 }
 
+function parseCollectionsPayload(input: NestedSequenceRecord["collections"] | unknown): ParsedCollectionsPayload {
+    try {
+        const parsed = typeof input === "string" ? JSON.parse(input || "{}") : input;
+        if (Array.isArray(parsed)) {
+            return { items: parsed as CollectionItem[], textGroups: [], renderQueue: [] };
+        }
+        if (parsed && typeof parsed === "object") {
+            const wrapped = parsed as { items?: CollectionItem[]; textGroups?: TextCollectionGroup[]; renderQueue?: QueuedRenderJob[] };
+            return {
+                items: Array.isArray(wrapped.items) ? wrapped.items : [],
+                textGroups: Array.isArray(wrapped.textGroups) ? wrapped.textGroups : [],
+                renderQueue: Array.isArray(wrapped.renderQueue) ? wrapped.renderQueue : [],
+            };
+        }
+    } catch {
+        // Malformed collection payloads fall back to an empty child-local set.
+    }
+    return { items: [], textGroups: [], renderQueue: [] };
+}
+
+function mapCollectionVariants(
+    collection: CollectionItem,
+    mapper: (variant: CollectionVariant) => CollectionVariant,
+): CollectionItem {
+    return {
+        ...collection,
+        items: (collection.items || []).map(mapper),
+        versions: collection.versions?.map(version => ({
+            ...version,
+            items: (version.items || []).map(mapper),
+        })),
+    };
+}
+
+function getAllCollectionVariants(collection: CollectionItem) {
+    const variants: CollectionVariant[] = [...(collection.items || [])];
+    collection.versions?.forEach(version => {
+        variants.push(...(version.items || []));
+    });
+    return variants;
+}
+
+function ensureCollectionVariantIdMap(
+    collection: CollectionItem,
+    variantIdMap: Map<string, string>,
+    createId: (variant: CollectionVariant) => string,
+) {
+    getAllCollectionVariants(collection).forEach(variant => {
+        if (!variantIdMap.has(variant.id)) {
+            variantIdMap.set(variant.id, createId(variant));
+        }
+    });
+}
+
+function remapCollectionVariantIds(
+    collection: CollectionItem,
+    variantIdMap: Map<string, string>,
+    overridesByVariantId: Map<string, Partial<CollectionVariant>> = new Map(),
+): CollectionItem {
+    return mapCollectionVariants(collection, variant => {
+        const override = overridesByVariantId.get(variant.id) || {};
+        const linkedVariantIds = variant.linkedVariantIds
+            ?.map(id => variantIdMap.get(id))
+            .filter((id): id is string => Boolean(id));
+        const nextVariant: CollectionVariant = {
+            ...variant,
+            ...override,
+            id: variantIdMap.get(variant.id) || override.id || variant.id,
+        };
+
+        if (linkedVariantIds && linkedVariantIds.length > 0) {
+            nextVariant.linkedVariantIds = linkedVariantIds;
+        } else {
+            delete nextVariant.linkedVariantIds;
+        }
+
+        return nextVariant;
+    });
+}
+
+function stripVariantLinks(collection: CollectionItem): CollectionItem {
+    return mapCollectionVariants(collection, variant => {
+        const { linkedVariantIds, ...rest } = variant;
+        void linkedVariantIds;
+        return rest;
+    });
+}
+
+function stripSharedParentFlag(collection: CollectionItem): CollectionItem {
+    const { sharedFromParent, ...rest } = collection;
+    void sharedFromParent;
+    return rest;
+}
+
+function getLinkedVariantIdsByItemId(collection?: CollectionItem) {
+    const links = new Map<string, string[] | undefined>();
+    if (!collection) return links;
+    const normalized = normalizeCollectionsForLoad([collection])[0];
+    normalized.items.forEach(item => links.set(item.id, item.linkedVariantIds ? [...item.linkedVariantIds] : undefined));
+    normalized.versions?.forEach(version => {
+        version.items.forEach(item => links.set(item.id, item.linkedVariantIds ? [...item.linkedVariantIds] : undefined));
+    });
+    return links;
+}
+
+function applyVariantLinksFromOverlay(baseCollection: CollectionItem, overlayCollection?: CollectionItem): CollectionItem {
+    const overlayLinks = getLinkedVariantIdsByItemId(overlayCollection);
+    if (overlayLinks.size === 0) return baseCollection;
+    return mapCollectionVariants(baseCollection, variant => {
+        if (!overlayLinks.has(variant.id)) return variant;
+        const linkedVariantIds = overlayLinks.get(variant.id);
+        if (!linkedVariantIds || linkedVariantIds.length === 0) {
+            const { linkedVariantIds: _linkedVariantIds, ...rest } = variant;
+            void _linkedVariantIds;
+            return rest;
+        }
+        return { ...variant, linkedVariantIds };
+    });
+}
+
+function mergeParentAndChildCollections(parentCollections: CollectionItem[], childCollections: CollectionItem[]) {
+    const childById = new Map(normalizeCollectionsForLoad(childCollections).map(collection => [collection.id, collection]));
+    const parentVisibleCollections = normalizeCollectionsForLoad(withoutSubCompositionCollections(parentCollections));
+    const parentIds = new Set(parentVisibleCollections.map(collection => collection.id));
+
+    const sharedCollections = parentVisibleCollections.map(parentCollection => {
+        const parentWithoutLinks = stripVariantLinks(parentCollection);
+        return {
+            ...applyVariantLinksFromOverlay(parentWithoutLinks, childById.get(parentCollection.id)),
+            sharedFromParent: true,
+        };
+    });
+
+    const childLocalCollections = normalizeCollectionsForLoad(childCollections)
+        .filter(collection => !parentIds.has(collection.id) && collection.type !== "subComposition")
+        .map(stripSharedParentFlag);
+
+    return [...sharedCollections, ...childLocalCollections];
+}
+
+function restoreParentVariantLinks(childCollection: CollectionItem, parentCollection: CollectionItem) {
+    return stripSharedParentFlag(applyVariantLinksFromOverlay(stripVariantLinks(childCollection), parentCollection));
+}
+
 function syncSubCompositionVariantLabels(collections: CollectionItem[], sequences: NestedSequenceRecord[]) {
     if (sequences.length === 0) return collections;
     const sequenceById = new Map(sequences.map(sequence => [sequence.id, sequence]));
@@ -246,6 +415,10 @@ function syncSubCompositionVariantLabels(collections: CollectionItem[], sequence
         return nextItems === collection.items ? collection : { ...collection, items: nextItems };
     });
     return changed ? nextCollections : collections;
+}
+
+function isNullVariant(variant?: CollectionVariant | null) {
+    return Boolean(variant?.isNull);
 }
 
 function ScrubInput({ value, onChange, min, max, step, className }: { value: number; onChange: (v: number) => void; min?: number; max?: number; step?: string | number; className?: string }) {
@@ -311,18 +484,32 @@ const SEED_COLLECTIONS: CollectionItem[] = [
     },
 ];
 
+const INITIAL_COLLECTIONS = normalizeCollectionsForLoad(SEED_COLLECTIONS);
+const COLLECTIONS_PANE_MIN_WIDTH = 240;
+const COLLECTIONS_PANE_MAX_WIDTH = 520;
+const COLLECTIONS_PANE_DEFAULT_WIDTH = 288;
+const COLLECTIONS_PANE_COLLAPSED_WIDTH = 48;
+const COLLECTIONS_PANE_WIDTH_STORAGE_KEY = "dropai.collectionsPaneWidth";
+const COLLECTIONS_PANE_COLLAPSED_STORAGE_KEY = "dropai.collectionsPaneCollapsed";
+
 
 // --- Draggable Collection Card ---
-function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, onUpdateItem, onDuplicateItem, onCopyCollection, onDeleteCollection, onCreateSubComposition }: {
+function CollectionCard({ collection, allCollections, onAddItem, onAddItems, onAddNullVariant, onDeleteItem, onUpdateItem, onDuplicateItem, onCopyCollection, onDeleteCollection, onCreateSubComposition, onSwitchVersion, onCreateVersion, onRenameVersion, onDeleteVersion }: {
     collection: CollectionItem;
     allCollections: CollectionItem[];
     onAddItem: (collectionId: string, label: string, value: string, duration?: number) => void;
+    onAddItems: (collectionId: string, items: Array<Omit<CollectionVariant, "id">>) => void;
+    onAddNullVariant: (collectionId: string) => void;
     onDeleteItem: (collectionId: string, variantId: string) => void;
     onUpdateItem: (collectionId: string, variantId: string, updates: Partial<CollectionVariant>) => void;
     onDuplicateItem: (collectionId: string, variantId: string) => Promise<void> | void;
     onCopyCollection: (collectionId: string) => Promise<void> | void;
     onDeleteCollection: (collectionId: string) => void;
     onCreateSubComposition: (collectionId: string, name: string) => Promise<void> | void;
+    onSwitchVersion: (collectionId: string, versionId: string) => void;
+    onCreateVersion: (collectionId: string, name: string, duplicateActive: boolean) => void;
+    onRenameVersion: (collectionId: string, versionId: string, name: string) => void;
+    onDeleteVersion: (collectionId: string, versionId: string) => void;
 }) {
     const [isOpen, setIsOpen] = useState(false);
     const [isAdding, setIsAdding] = useState(false);
@@ -330,6 +517,7 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
     const [newValue, setNewValue] = useState("");
     const [isBulkTextMode, setIsBulkTextMode] = useState(false);
     const [bulkTextValues, setBulkTextValues] = useState("");
+    const [isVersionMenuOpen, setIsVersionMenuOpen] = useState(false);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const updateFileRef = useRef<HTMLInputElement>(null);
     const [updatingItemId, setUpdatingItemId] = useState<string | null>(null);
@@ -344,54 +532,97 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
         audio: "audio/*",
     };
 
-    const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
+    const { attributes, listeners, setNodeRef: setDraggableNodeRef, isDragging } = useDraggable({
         id: `collection-${collection.id}`,
-        data: { collection },
+        data: { collection, type: "collection" },
     });
+    const { setNodeRef: setDroppableNodeRef, isOver } = useDroppable({
+        id: `collection-drop-${collection.id}`,
+        data: { collectionId: collection.id, type: "collection-drop" },
+    });
+    const setCollectionNodeRef = useCallback((node: HTMLDivElement | null) => {
+        setDraggableNodeRef(node);
+        setDroppableNodeRef(node);
+    }, [setDraggableNodeRef, setDroppableNodeRef]);
 
     const colors = COLLECTION_COLORS[collection.type];
+    const collectionVersions = getCollectionVersions(collection);
+    const activeVersion = getActiveCollectionVersion(collection);
+
+    const promptForVersionName = (message: string, fallback: string) => {
+        return window.prompt(message, fallback)?.trim() || "";
+    };
+
+    const handleCreateVersion = (duplicateActive: boolean) => {
+        const fallback = duplicateActive ? `${activeVersion.name} Copy` : `Version ${collectionVersions.length + 1}`;
+        const name = promptForVersionName(duplicateActive ? "Duplicate as" : "New version name", fallback);
+        if (!name) return;
+        onCreateVersion(collection.id, name, duplicateActive);
+        setIsVersionMenuOpen(false);
+    };
+
+    const handleRenameVersion = () => {
+        const name = promptForVersionName("Rename version", activeVersion.name);
+        if (!name) return;
+        onRenameVersion(collection.id, activeVersion.id, name);
+        setIsVersionMenuOpen(false);
+    };
+
+    const handleDeleteVersion = () => {
+        if (collectionVersions.length <= 1) {
+            alert("A collection needs at least one version.");
+            setIsVersionMenuOpen(false);
+            return;
+        }
+        if (!confirm(`Delete version "${activeVersion.name}"?`)) return;
+        onDeleteVersion(collection.id, activeVersion.id);
+        setIsVersionMenuOpen(false);
+    };
+
+    const getMediaDuration = (file: File, objectUrl: string) => {
+        if (!file.type.startsWith("video/") && !file.type.startsWith("audio/")) {
+            return Promise.resolve<number | undefined>(undefined);
+        }
+
+        return new Promise<number | undefined>((resolve) => {
+            const media = document.createElement(file.type.startsWith("video/") ? "video" : "audio");
+            media.preload = "metadata";
+            media.onloadedmetadata = () => resolve(Number.isFinite(media.duration) ? media.duration : undefined);
+            media.onerror = () => resolve(undefined);
+            media.src = objectUrl;
+        });
+    };
+
+    const importMediaFile = async (file: File, filesCount: number): Promise<Omit<CollectionVariant, "id">> => {
+        const objectUrl = URL.createObjectURL(file);
+        const label = filesCount === 1 && newLabel.trim()
+            ? newLabel.trim()
+            : file.name.replace(/\.[^.]+$/, "");
+        const duration = await getMediaDuration(file, objectUrl);
+        const formData = new FormData();
+        formData.append("file", file);
+
+        try {
+            const res = await fetch('/api/upload', { method: 'POST', body: formData });
+            if (!res.ok) throw new Error("Upload failed");
+            const data = await res.json();
+            URL.revokeObjectURL(objectUrl);
+            return { label, value: data.url, duration };
+        } catch (e) {
+            console.error("Upload failed", e);
+            return { label, value: objectUrl, duration };
+        }
+    };
 
     const handleFilesSelected = async (files: File[]) => {
         setIsAdding(false);
         setNewLabel("");
         setNewValue("");
-        
-        files.forEach(file => {
-            const tempUrl = URL.createObjectURL(file);
-            const label = files.length === 1 && newLabel.trim() 
-                ? newLabel.trim() 
-                : file.name.replace(/\.[^.]+$/, "");
 
-            const finishUpload = async (duration?: number) => {
-                const formData = new FormData();
-                formData.append("file", file);
-                try {
-                    const res = await fetch('/api/upload', { method: 'POST', body: formData });
-                    if (!res.ok) throw new Error("Upload failed");
-                    const data = await res.json();
-                    onAddItem(collection.id, label, data.url, duration);
-                } catch (e) {
-                    console.error("Upload failed", e);
-                    onAddItem(collection.id, label, tempUrl, duration);
-                }
-            };
-
-            if (file.type.startsWith("video/") || file.type.startsWith("audio/")) {
-                const media = document.createElement(file.type.startsWith("video/") ? 'video' : 'audio');
-                media.preload = 'metadata';
-                media.onloadedmetadata = () => {
-                    URL.revokeObjectURL(media.src);
-                    finishUpload(media.duration);
-                };
-                media.onerror = () => {
-                    URL.revokeObjectURL(media.src);
-                    finishUpload();
-                }
-                media.src = URL.createObjectURL(file);
-            } else {
-                finishUpload();
-            }
-        });
+        const importedItems = await Promise.all(files.map(file => importMediaFile(file, files.length)));
+        if (importedItems.length > 0) {
+            onAddItems(collection.id, importedItems);
+        }
     };
 
     const handleUpdateFile = async (file: File, itemId: string) => {
@@ -475,10 +706,50 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
         setIsAdding(false);
     };
 
+    const activeVersionCsv = useMemo(() => {
+        const escapeCsvCell = (value: string | number | boolean | null | undefined) => {
+            const text = value === null || value === undefined ? "" : String(value);
+            return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+        };
+        const rows = [["label", "value"]];
+        for (const item of activeVersion.items || []) {
+            rows.push([item.label || "", isNullVariant(item) ? "" : item.value || ""]);
+        }
+        return rows.map(row => row.map(escapeCsvCell).join(",")).join("\r\n");
+    }, [activeVersion.items]);
+
+    const handleCopyActiveVersionCsv = async () => {
+        try {
+            await navigator.clipboard.writeText(activeVersionCsv);
+            setIsVersionMenuOpen(false);
+        } catch {
+            alert("Could not copy CSV to clipboard.");
+        }
+    };
+
+    const handleExportActiveVersionCsv = () => {
+        const safeCollectionName = collection.title.replace(/[<>:"/\\|?*\x00-\x1F]/g, "-").trim() || "collection";
+        const safeVersionName = activeVersion.name.replace(/[<>:"/\\|?*\x00-\x1F]/g, "-").trim() || "version";
+        const blob = new Blob([activeVersionCsv], { type: "text/csv;charset=utf-8" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `${safeCollectionName}-${safeVersionName}.csv`;
+        a.click();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        setIsVersionMenuOpen(false);
+    };
+
     return (
         <div
-            ref={setNodeRef}
-            className={cn("rounded-lg border transition-all", colors.bg, colors.border, isDragging && "opacity-40 scale-95")}
+            ref={setCollectionNodeRef}
+            className={cn(
+                "relative rounded-lg border transition-all",
+                colors.bg,
+                colors.border,
+                isDragging && "opacity-40 scale-95",
+                isOver && !isDragging && "ring-1 ring-blue-400/70 border-blue-400/70"
+            )}
         >
             {/* Header — draggable */}
             <div
@@ -488,8 +759,100 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
                 onClick={(e) => { e.stopPropagation(); }}
             >
                 <span className={cn(colors.icon)}>{COLLECTION_ICONS[collection.type]}</span>
-                <span className="text-[11px] font-mono text-gray-200 font-medium flex-1 truncate">{collection.title}</span>
-                <span className="text-[9px] font-mono text-gray-500 bg-white/5 px-1.5 py-0.5 rounded">{collection.items.length} items</span>
+                <div className="flex-1 min-w-0">
+                    <div className="text-[11px] font-mono text-gray-200 font-medium truncate">{collection.title}</div>
+                    <div className="mt-1 flex items-center gap-1.5 min-w-0">
+                        <div
+                            className="min-w-0 flex-1 flex items-center gap-1.5 rounded-md border border-white/8 bg-black/25 px-2 py-1"
+                            onPointerDown={(e) => e.stopPropagation()}
+                            onClick={(e) => e.stopPropagation()}
+                        >
+                            <span className="text-[8px] font-mono uppercase tracking-widest text-gray-600 shrink-0">Version</span>
+                            <select
+                                value={collection.activeVersionId || activeVersion.id}
+                                onChange={(e) => {
+                                    onSwitchVersion(collection.id, e.target.value);
+                                    setIsVersionMenuOpen(false);
+                                }}
+                                className="min-w-0 flex-1 bg-transparent text-[9px] font-mono text-gray-300 outline-none cursor-pointer"
+                                title="Active version"
+                            >
+                                {collectionVersions.map(version => (
+                                    <option key={version.id} value={version.id} className="bg-[#111]">
+                                        {version.name}
+                                    </option>
+                                ))}
+                            </select>
+                            <button
+                                onClick={(e) => {
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    setIsVersionMenuOpen(open => !open);
+                                }}
+                                className="text-gray-500 hover:text-gray-200 transition-colors shrink-0"
+                                title="Version actions"
+                                aria-label="Version actions"
+                            >
+                                <MoreHorizontal className="w-3.5 h-3.5" />
+                            </button>
+                            {isVersionMenuOpen && (
+                                <div
+                                    className="absolute left-9 right-3 top-[58px] z-40 rounded-lg border border-white/10 bg-[#111] shadow-2xl p-1.5"
+                                    onPointerDown={(e) => e.stopPropagation()}
+                                    onClick={(e) => e.stopPropagation()}
+                                >
+                                    <button
+                                        onClick={() => handleCreateVersion(false)}
+                                        className="w-full rounded-md px-2 py-1.5 text-left text-[10px] font-mono text-gray-300 hover:bg-white/8 hover:text-white transition-colors"
+                                    >
+                                        New blank version
+                                    </button>
+                                    <button
+                                        onClick={() => handleCreateVersion(true)}
+                                        className="w-full rounded-md px-2 py-1.5 text-left text-[10px] font-mono text-gray-300 hover:bg-white/8 hover:text-white transition-colors"
+                                    >
+                                        Duplicate current
+                                    </button>
+                                    {collection.type === "text" && (
+                                        <>
+                                            <div className="my-1 h-px bg-white/8" />
+                                            <button
+                                                onClick={() => { void handleCopyActiveVersionCsv(); }}
+                                                className="w-full rounded-md px-2 py-1.5 text-left text-[10px] font-mono text-gray-300 hover:bg-white/8 hover:text-white transition-colors"
+                                            >
+                                                Copy as CSV
+                                            </button>
+                                            <button
+                                                onClick={handleExportActiveVersionCsv}
+                                                className="w-full rounded-md px-2 py-1.5 text-left text-[10px] font-mono text-gray-300 hover:bg-white/8 hover:text-white transition-colors"
+                                            >
+                                                Export as CSV
+                                            </button>
+                                        </>
+                                    )}
+                                    <div className="my-1 h-px bg-white/8" />
+                                    <button
+                                        onClick={handleRenameVersion}
+                                        className="w-full rounded-md px-2 py-1.5 text-left text-[10px] font-mono text-gray-300 hover:bg-white/8 hover:text-white transition-colors"
+                                    >
+                                        Rename current
+                                    </button>
+                                    <button
+                                        onClick={handleDeleteVersion}
+                                        disabled={collectionVersions.length <= 1}
+                                        className="w-full rounded-md px-2 py-1.5 text-left text-[10px] font-mono text-red-300 hover:bg-red-500/10 transition-colors disabled:opacity-40 disabled:hover:bg-transparent"
+                                    >
+                                        Delete current
+                                    </button>
+                                </div>
+                            )}
+                        </div>
+                        {collection.sharedFromParent && (
+                            <span className="text-[8px] font-mono text-cyan-300/80 bg-cyan-500/10 border border-cyan-500/20 px-1.5 py-0.5 rounded shrink-0">Shared</span>
+                        )}
+                        <span className="text-[9px] font-mono text-gray-500 bg-white/5 px-1.5 py-0.5 rounded shrink-0">{collection.items.length} items</span>
+                    </div>
+                </div>
                 <button
                     onClick={(e) => { e.stopPropagation(); e.preventDefault(); void onCopyCollection(collection.id); }}
                     onPointerDown={(e) => e.stopPropagation()}
@@ -507,7 +870,7 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
                     <Trash2 className="w-3.5 h-3.5" />
                 </button>
                 <button
-                    onClick={(e) => { e.stopPropagation(); e.preventDefault(); setIsOpen(!isOpen); }}
+                    onClick={(e) => { e.stopPropagation(); e.preventDefault(); setIsVersionMenuOpen(false); setIsOpen(!isOpen); }}
                     onPointerDown={(e) => e.stopPropagation()}
                     className="text-gray-500 hover:text-gray-300 transition-colors"
                 >
@@ -530,12 +893,17 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
                             {collection.items.map((item) => (
                                     <div key={item.id} className={cn("flex items-center gap-2 group", item.excluded && "opacity-40")}>
                                         {/* Thumbnail preview for media items */}
-                                        {isSubComposition && (
+                                        {isNullVariant(item) && (
+                                            <div className="w-8 h-8 rounded overflow-hidden border border-white/10 shrink-0 bg-white/5 flex items-center justify-center">
+                                                <Ban className="w-3.5 h-3.5 text-gray-500" />
+                                            </div>
+                                        )}
+                                        {isSubComposition && !isNullVariant(item) && (
                                             <div className="w-8 h-8 rounded overflow-hidden border border-violet-500/20 shrink-0 bg-violet-500/10 flex items-center justify-center">
                                                 <Film className="w-3.5 h-3.5 text-violet-300" />
                                             </div>
                                         )}
-                                        {isMedia && item.value && (
+                                        {isMedia && item.value && !isNullVariant(item) && (
                                             <div className="w-8 h-8 rounded overflow-hidden border border-white/10 shrink-0 bg-black/40">
                                                 {collection.type === "image" ? (
                                                     <img src={item.value} className="w-full h-full object-cover" alt={item.label} />
@@ -548,8 +916,12 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
                                         )}
                                         <div className={cn("flex-1 text-[10px] font-mono text-gray-400 bg-black/30 rounded px-2 py-1.5 truncate min-w-0 relative", item.excluded && "line-through text-gray-600")}>
                                             <span className="text-gray-500 mr-1.5">{item.label}</span>
-                                            {!isMedia && !isSubComposition && <span className="text-gray-300">: {item.value}</span>}
-                                            {isSubComposition && <span className="text-violet-300/70">composition variant</span>}
+                                            {isNullVariant(item) ? (
+                                                <span className="text-gray-500 italic">empty</span>
+                                            ) : !isMedia && !isSubComposition ? (
+                                                <span className="text-gray-300">: {item.value}</span>
+                                            ) : null}
+                                            {isSubComposition && !isNullVariant(item) && <span className="text-violet-300/70">composition variant</span>}
                                             {item.excluded && <span className="ml-1.5 text-[8px] text-orange-500/70 font-bold uppercase tracking-wider">excl.</span>}
                                         </div>
                                         {/* Exclude toggle */}
@@ -588,7 +960,7 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
                                                 <Upload className="w-3 h-3" />
                                             </button>
                                         )}
-                                        {isSubComposition && item.value && (
+                                        {isSubComposition && item.value && !isNullVariant(item) && (
                                             <Link
                                                 href={`/builder/${item.value}`}
                                                 onClick={(e) => e.stopPropagation()}
@@ -799,12 +1171,20 @@ function CollectionCard({ collection, allCollections, onAddItem, onDeleteItem, o
                                     </div>
                                 </div>
                             ) : (
-                                <button
-                                    onClick={() => setIsAdding(true)}
-                                    className="w-full text-[9px] font-mono py-1.5 text-gray-500 hover:text-gray-300 border border-dashed border-white/10 hover:border-white/20 rounded transition-colors"
-                                >
-                                    {isSubComposition ? "+ Create Composition" : "+ Add Item"}
-                                </button>
+                                <div className="grid grid-cols-2 gap-1.5">
+                                    <button
+                                        onClick={() => setIsAdding(true)}
+                                        className="text-[9px] font-mono py-1.5 text-gray-500 hover:text-gray-300 border border-dashed border-white/10 hover:border-white/20 rounded transition-colors"
+                                    >
+                                        {isSubComposition ? "+ Create Composition" : "+ Add Item"}
+                                    </button>
+                                    <button
+                                        onClick={() => onAddNullVariant(collection.id)}
+                                        className="text-[9px] font-mono py-1.5 text-gray-500 hover:text-gray-300 border border-dashed border-white/10 hover:border-white/20 rounded transition-colors"
+                                    >
+                                        + Null Variant
+                                    </button>
+                                </div>
                             )}
                         </div>
                     </motion.div>
@@ -953,6 +1333,17 @@ function applyEasing(t: number, easing: EasingType): number {
 }
 
 type AnimatedStyle = { opacity: number; translateX: number; translateY: number; scale: number; rotate: number; blur: number };
+const MIN_RENDER_SCALE = 0.001;
+const PLAYBACK_STATE_FPS = 24;
+const PLAYBACK_STATE_INTERVAL_MS = 1000 / PLAYBACK_STATE_FPS;
+
+function getPreviewElementTransform(el: CanvasElement, animStyle: AnimatedStyle): string {
+    const safeScale = Math.max(MIN_RENDER_SCALE, animStyle.scale);
+    const translateX = el.width ? (animStyle.translateX / el.width) * 100 : 0;
+    const translateY = el.height ? (animStyle.translateY / el.height) * 100 : 0;
+    const rotation = (el.rotation || 0) + animStyle.rotate;
+    return `translate3d(${translateX}%, ${translateY}%, 0) rotate(${rotation}deg) scale3d(${safeScale}, ${safeScale}, 1)`;
+}
 
 function evaluateAnimations(el: CanvasElement, currentTime: number): AnimatedStyle {
     const result: AnimatedStyle = { opacity: el.opacity ?? 1, translateX: 0, translateY: 0, scale: 1, rotate: 0, blur: 0 };
@@ -1059,6 +1450,14 @@ export function resolveElementTimings(
         const baseTime = el.startTime;
         let baseDur = el.duration;
         const isMedia = el.collectionType === 'video' || el.collectionType === 'audio';
+        const col = collections.find(c => c.id === el.collectionId);
+        const selectedVariant = varMode !== 'all'
+            ? col?.items.find(item => item.id === varMode)
+            : null;
+
+        if (isNullVariant(selectedVariant)) {
+            return { el, startTime: baseTime, duration: 0 };
+        }
 
         if (isMedia) {
             // User overrides take precedence
@@ -1178,7 +1577,7 @@ export function resolveElementTimings(
                     if (trackConfig?.magnet) {
                         resolvedStart = pushStart;
                     } else {
-                        resolvedStart = Math.max(item.startTime, pushStart);
+                        resolvedStart = item.startTime;
                     }
                 } else {
                     resolvedStart = item.startTime;
@@ -1196,7 +1595,7 @@ export function resolveElementTimings(
                 if (trackConfig?.magnet) {
                     resolvedStart = pushStart;
                 } else {
-                    resolvedStart = Math.max(item.startTime, pushStart);
+                    resolvedStart = item.startTime;
                 }
             } else {
                 // First element in track, uses intrinsic
@@ -1235,6 +1634,7 @@ function getMediaDurationLimit(el: CanvasElement, variantMode: string, collectio
 
     if (variantMode !== 'all') {
         const variant = col.items.find(i => i.id === variantMode);
+        if (isNullVariant(variant)) return 0;
         const mediaOffset = getOffsetForVariant(variantMode);
         return variant?.duration !== undefined
             ? Math.max(0.1, (variant.duration - mediaOffset) / speed)
@@ -1350,13 +1750,29 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     const [editTitle, setEditTitle] = useState("");
     const [elements, setElements] = useState<CanvasElement[]>([]);
     const [tracks, setTracks] = useState<TrackConfig[]>([{ id: 'track-0', magnet: false }]);
-    const [collections, setCollections] = useState<CollectionItem[]>(SEED_COLLECTIONS);
+    const [collections, setCollections] = useState<CollectionItem[]>(INITIAL_COLLECTIONS);
     const [textCollectionGroups, setTextCollectionGroups] = useState<TextCollectionGroup[]>([]);
+    const [collectionsPaneWidth, setCollectionsPaneWidth] = useState(() => {
+        if (typeof window === "undefined") return COLLECTIONS_PANE_DEFAULT_WIDTH;
+        const savedWidth = Number(window.localStorage.getItem(COLLECTIONS_PANE_WIDTH_STORAGE_KEY));
+        if (!Number.isFinite(savedWidth)) return COLLECTIONS_PANE_DEFAULT_WIDTH;
+        return Math.max(COLLECTIONS_PANE_MIN_WIDTH, Math.min(COLLECTIONS_PANE_MAX_WIDTH, savedWidth));
+    });
+    const [isCollectionsPaneCollapsed, setIsCollectionsPaneCollapsed] = useState(() => {
+        if (typeof window === "undefined") return false;
+        return window.localStorage.getItem(COLLECTIONS_PANE_COLLAPSED_STORAGE_KEY) === "true";
+    });
     const [nestedSequences, setNestedSequences] = useState<NestedSequenceRecord[]>([]);
     const [isSubCompositionEditor, setIsSubCompositionEditor] = useState(false);
-    const collectionsRef = useRef<CollectionItem[]>(SEED_COLLECTIONS);
+    const collectionsRef = useRef<CollectionItem[]>(INITIAL_COLLECTIONS);
     const textCollectionGroupsRef = useRef<TextCollectionGroup[]>([]);
     const nestedSequencesRef = useRef<NestedSequenceRecord[]>([]);
+    const parentCompositionRef = useRef<{ id: string; title: string } | null>(null);
+    const parentSharedCollectionsRef = useRef<CollectionItem[]>([]);
+    const parentAllCollectionsRef = useRef<CollectionItem[]>([]);
+    const parentSharedTextGroupsRef = useRef<TextCollectionGroup[]>([]);
+    const parentSharedRenderQueueRef = useRef<QueuedRenderJob[]>([]);
+    const sharedParentCollectionIdsRef = useRef<Set<string>>(new Set());
     const [selectedElementId, setSelectedElementId] = useState<string | null>(null);
     const [centerView, setCenterView] = useState<"canvas" | "preview">("canvas");
     const [inspectorVariantModes, setInspectorVariantModes] = useState<Record<string, string>>({}); // elementId -> "all" | variantId
@@ -1372,10 +1788,65 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         setTimeout(() => setToast(null), 3000);
     };
 
+    const handleCollectionsPaneResizeStart = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const startX = e.clientX;
+        const startWidth = collectionsPaneWidth;
+
+        document.body.style.cursor = "col-resize";
+        document.body.style.userSelect = "none";
+
+        const handlePointerMove = (moveEvent: PointerEvent) => {
+            const nextWidth = Math.max(
+                COLLECTIONS_PANE_MIN_WIDTH,
+                Math.min(COLLECTIONS_PANE_MAX_WIDTH, startWidth + moveEvent.clientX - startX),
+            );
+            setCollectionsPaneWidth(nextWidth);
+        };
+
+        const handlePointerUp = (upEvent: PointerEvent) => {
+            const nextWidth = Math.max(
+                COLLECTIONS_PANE_MIN_WIDTH,
+                Math.min(COLLECTIONS_PANE_MAX_WIDTH, startWidth + upEvent.clientX - startX),
+            );
+            setCollectionsPaneWidth(nextWidth);
+            window.localStorage.setItem(COLLECTIONS_PANE_WIDTH_STORAGE_KEY, String(nextWidth));
+            document.body.style.cursor = "";
+            document.body.style.userSelect = "";
+            window.removeEventListener("pointermove", handlePointerMove);
+            window.removeEventListener("pointerup", handlePointerUp);
+            window.removeEventListener("pointercancel", handlePointerCancel);
+        };
+
+        const handlePointerCancel = () => {
+            document.body.style.cursor = "";
+            document.body.style.userSelect = "";
+            window.removeEventListener("pointermove", handlePointerMove);
+            window.removeEventListener("pointerup", handlePointerUp);
+            window.removeEventListener("pointercancel", handlePointerCancel);
+        };
+
+        window.addEventListener("pointermove", handlePointerMove);
+        window.addEventListener("pointerup", handlePointerUp);
+        window.addEventListener("pointercancel", handlePointerCancel);
+    }, [collectionsPaneWidth]);
+
+    const toggleCollectionsPaneCollapsed = useCallback(() => {
+        setIsCollectionsPaneCollapsed(prev => {
+            const next = !prev;
+            window.localStorage.setItem(COLLECTIONS_PANE_COLLAPSED_STORAGE_KEY, String(next));
+            return next;
+        });
+    }, []);
+
     // --- Export / Render state ---
     const [isExportModalOpen, setIsExportModalOpen] = useState(false);
     const [renderProgress, setRenderProgress] = useState<RenderProgress | null>(null);
     const renderAbortRef = useRef<AbortController | null>(null);
+    const [exportOutputDir, setExportOutputDir] = useState<FileSystemDirectoryHandle | null>(null);
+    const [exportOutputDirName, setExportOutputDirName] = useState<string | null>(null);
+    const lastRenderUsedVariantIdsRef = useRef<string[]>([]);
     const [renderQueue, setRenderQueue] = useState<QueuedRenderJob[]>([]);
     const renderQueueRef = useRef(renderQueue);
     renderQueueRef.current = renderQueue;
@@ -1424,7 +1895,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         setTOTAL_DURATION(snapshot.duration);
         setElements(clonePlain(snapshot.elements));
         setTracks(clonePlain(snapshot.tracks));
-        const nextCollections = clonePlain(snapshot.collections);
+        const nextCollections = normalizeCollectionsForLoad(clonePlain(snapshot.collections));
         const nextTextGroups = clonePlain(snapshot.textCollectionGroups || []);
         collectionsRef.current = nextCollections;
         textCollectionGroupsRef.current = nextTextGroups;
@@ -1462,12 +1933,16 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
 
         if (mode === 'all') {
             if (el) {
+                const isGroupedTextElement = el.collectionType === 'text'
+                    && (el.textCollectionMode || 'all') === 'all'
+                    && textCollectionGroups.some(group => group.collectionIds.includes(el.collectionId));
+                if (isGroupedTextElement) return 'all';
                 const col = collections.find(c => c.id === el.collectionId);
                 if (col?.items.length === 1) return col.items[0].id;
             }
         }
         return mode;
-    }, [inspectorVariantModes, elements, collections]);
+    }, [inspectorVariantModes, elements, collections, textCollectionGroups]);
 
     // Ref to always access latest getVariantMode without re-running effects
     const getVariantModeRef = useRef(getVariantMode);
@@ -1478,9 +1953,12 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         setInspectorVariantModes(prev => ({ ...prev, [elementId]: mode }));
     }, []);
 
-    const replaceCollections = useCallback((nextCollections: CollectionItem[]) => {
-        collectionsRef.current = nextCollections;
-        setCollections(nextCollections);
+    const replaceCollections = useCallback((nextCollections: CollectionItem[], source: "items" | "versions" = "items") => {
+        const normalizedCollections = source === "versions"
+            ? normalizeCollectionsForLoad(nextCollections)
+            : syncCollectionsWithActiveVersions(nextCollections);
+        collectionsRef.current = normalizedCollections;
+        setCollections(normalizedCollections);
     }, []);
 
     const replaceTextCollectionGroups = useCallback((nextGroups: TextCollectionGroup[]) => {
@@ -1518,21 +1996,40 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             refreshHistoryAvailability();
             setRenderQueue([]);
             setFetching(true);
-            fetch(`/api/compositions/${compositionId}`)
-                .then(res => res.json())
-                .then(data => {
+            const loadComposition = async () => {
+                try {
+                    const res = await fetch(`/api/compositions/${compositionId}`);
+                    const data = await res.json();
                     const isChildComposition = Boolean(data.parentId);
                     setIsSubCompositionEditor(isChildComposition);
                     setParentComposition(null);
+                    parentCompositionRef.current = null;
+                    parentAllCollectionsRef.current = [];
+                    parentSharedCollectionsRef.current = [];
+                    parentSharedTextGroupsRef.current = [];
+                    parentSharedRenderQueueRef.current = [];
+                    sharedParentCollectionIdsRef.current = new Set();
+
                     if (data.parentId) {
-                        fetch(`/api/compositions/${data.parentId}`)
-                            .then(parentRes => parentRes.ok ? parentRes.json() : null)
-                            .then(parentData => {
-                                if (parentData?.id && parentData?.title) {
-                                    setParentComposition({ id: parentData.id, title: parentData.title });
-                                }
-                            })
-                            .catch(err => console.error("Failed to fetch parent composition", err));
+                        try {
+                            const parentRes = await fetch(`/api/compositions/${data.parentId}`);
+                            const parentData = parentRes.ok ? await parentRes.json() : null;
+                            if (parentData?.id && parentData?.title) {
+                                const parentSummary = { id: parentData.id, title: parentData.title };
+                                setParentComposition(parentSummary);
+                                parentCompositionRef.current = parentSummary;
+                                const parentParsed = parseCollectionsPayload(parentData.collections);
+                                const parentCollections = normalizeCollectionsForLoad(parentParsed.items);
+                                const parentVisibleCollections = withoutSubCompositionCollections(parentCollections);
+                                parentAllCollectionsRef.current = parentCollections;
+                                parentSharedCollectionsRef.current = parentVisibleCollections;
+                                parentSharedTextGroupsRef.current = parentParsed.textGroups;
+                                parentSharedRenderQueueRef.current = parentParsed.renderQueue;
+                                sharedParentCollectionIdsRef.current = new Set(parentVisibleCollections.map(collection => collection.id));
+                            }
+                        } catch (err) {
+                            console.error("Failed to fetch parent composition", err);
+                        }
                     }
                     if (data.elements) {
                         try { setElements(typeof data.elements === 'string' ? JSON.parse(data.elements) : data.elements); } catch (e) { }
@@ -1545,23 +2042,14 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                     }
                     if (data.collections) {
                         try {
-                            const parsedCols = typeof data.collections === 'string' ? JSON.parse(data.collections) : data.collections;
-                            if (Array.isArray(parsedCols)) {
-                                const visibleCollections = isChildComposition ? withoutSubCompositionCollections(parsedCols) : parsedCols;
-                                replaceCollections(syncSubCompositionVariantLabels(visibleCollections, nestedSequencesRef.current));
-                                replaceTextCollectionGroups([]);
-                            } else if (parsedCols && typeof parsedCols === 'object') {
-                                const wrapped = parsedCols as { items?: CollectionItem[]; textGroups?: TextCollectionGroup[]; renderQueue?: QueuedRenderJob[] };
-                                const visibleCollections = Array.isArray(wrapped.items)
-                                    ? (isChildComposition ? withoutSubCompositionCollections(wrapped.items) : wrapped.items)
-                                    : [];
-                                const syncedCollections = syncSubCompositionVariantLabels(visibleCollections, nestedSequencesRef.current);
-                                replaceCollections(syncedCollections);
-                                if (Array.isArray(wrapped.textGroups)) {
-                                    replaceTextCollectionGroups(pruneTextGroupsForCollections(wrapped.textGroups, syncedCollections));
-                                }
-                                if (Array.isArray(wrapped.renderQueue)) setRenderQueue(wrapped.renderQueue);
-                            }
+                            const parsedCols = parseCollectionsPayload(data.collections);
+                            const visibleCollections = isChildComposition
+                                ? mergeParentAndChildCollections(parentSharedCollectionsRef.current, parsedCols.items)
+                                : normalizeCollectionsForLoad(parsedCols.items);
+                            const syncedCollections = syncSubCompositionVariantLabels(visibleCollections, nestedSequencesRef.current);
+                            replaceCollections(syncedCollections);
+                            replaceTextCollectionGroups(pruneTextGroupsForCollections(parsedCols.textGroups, syncedCollections));
+                            setRenderQueue(parsedCols.renderQueue);
                         } catch (e) { }
                     }
                     if (data.duration) {
@@ -1570,9 +2058,13 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                     if (data.title) {
                         setTitle(data.title);
                     }
-                })
-                .catch(err => console.error("Failed to fetch composition", err))
-                .finally(() => setFetching(false));
+                } catch (err) {
+                    console.error("Failed to fetch composition", err);
+                } finally {
+                    setFetching(false);
+                }
+            };
+            void loadComposition();
         }
     }, [compositionId, refreshHistoryAvailability, replaceCollections, replaceTextCollectionGroups]);
 
@@ -1696,6 +2188,9 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     const [previewLoop, setPreviewLoop] = useState(false);
     const [variantSeed, setVariantSeed] = useState(1);
     const lastFrameRef = useRef<number>(0);
+    const lastPublishedFrameRef = useRef<number>(0);
+    const currentTimeRef = useRef(0);
+    const playbackTimeRef = useRef(0);
     const playbackRafRef = useRef<number | null>(null);
 
     const hashString = (str: string) => {
@@ -1781,7 +2276,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     const recordVariantUsage = useCallback((usedVariantIds: string[]) => {
         setVariantUsage(prev => {
             const next = { ...prev };
-            for (const id of usedVariantIds) {
+            for (const id of Array.from(new Set(usedVariantIds.filter(Boolean)))) {
                 next[id] = (next[id] || 0) + 1;
             }
             if (typeof window !== 'undefined') {
@@ -1795,62 +2290,217 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         return type === 'text' || type === 'image' || type === 'video' || type === 'audio';
     }, []);
 
+    const getSortedElementsForSelection = useCallback((
+        targetElements: CanvasElement[],
+        collectionById: Map<string, CollectionItem>,
+        resolvedIds: Record<string, string> = {},
+    ) => {
+        const isLinkSourceCollection = (colId: string) => {
+            const collection = collectionById.get(colId);
+            return collection ? collection.items.some(variant => variant.linkedVariantIds?.length) : false;
+        };
+
+        return [...targetElements].sort((a, b) => {
+            const aColId = resolvedIds[a.elementId] || a.collectionId;
+            const bColId = resolvedIds[b.elementId] || b.collectionId;
+            const aIsSource = isLinkSourceCollection(aColId) ? 0 : 1;
+            const bIsSource = isLinkSourceCollection(bColId) ? 0 : 1;
+            if (aIsSource !== bIsSource) return aIsSource - bIsSource;
+            return a.startTime - b.startTime;
+        });
+    }, []);
+
+    const getSelectableVariants = useCallback((
+        collection: CollectionItem,
+        resolvedCollectionId: string,
+        localExcluded: Set<string>,
+        pickedVariantIds: Set<string>,
+        pickedByCollection: Record<string, Set<string>>,
+        collectionById: Map<string, CollectionItem>,
+        variantToCollectionId: Map<string, string>,
+    ) => {
+        const requiredLinkSets: Set<string>[] = [];
+        const evaluatedCollectionIds = new Set<string>();
+
+        for (const pickedId of pickedVariantIds) {
+            const pickedCollectionId = variantToCollectionId.get(pickedId);
+            if (pickedCollectionId) evaluatedCollectionIds.add(pickedCollectionId);
+            const pickedVariant = pickedCollectionId
+                ? collectionById.get(pickedCollectionId)?.items.find(item => item.id === pickedId)
+                : null;
+            const linksInThisCollection = pickedVariant?.linkedVariantIds
+                ?.filter(linkedId => collection.items.some(item => item.id === linkedId)) || [];
+            if (linksInThisCollection.length > 0) {
+                requiredLinkSets.push(new Set(linksInThisCollection));
+            }
+        }
+
+        let candidates = collection.items.filter(candidate => {
+            if (candidate.excluded || localExcluded.has(candidate.id)) return false;
+            if (requiredLinkSets.some(linkSet => !linkSet.has(candidate.id))) return false;
+
+            for (const evaluatedCollectionId of evaluatedCollectionIds) {
+                if (evaluatedCollectionId === collection.id) continue;
+                const evaluatedCollection = collectionById.get(evaluatedCollectionId);
+                if (!evaluatedCollection) continue;
+
+                const linksToEvaluatedCollection = candidate.linkedVariantIds
+                    ?.filter(linkedId => evaluatedCollection.items.some(item => item.id === linkedId)) || [];
+                if (linksToEvaluatedCollection.length === 0) continue;
+
+                const pickedInEvaluatedCollection = evaluatedCollection.items.filter(item => pickedVariantIds.has(item.id));
+                if (!pickedInEvaluatedCollection.some(picked => linksToEvaluatedCollection.includes(picked.id))) {
+                    return false;
+                }
+            }
+
+            return true;
+        });
+
+        const alreadyPicked = pickedByCollection[resolvedCollectionId] || pickedByCollection[collection.id];
+        if (alreadyPicked?.size) {
+            const deduped = candidates.filter(candidate => !alreadyPicked.has(candidate.id));
+            if (deduped.length > 0) candidates = deduped;
+        }
+
+        return candidates;
+    }, []);
+
+    const rememberPickedVariant = useCallback((
+        variant: CollectionVariant | null | undefined,
+        collectionId: string,
+        pickedVariantIds: Set<string>,
+        pickedByCollection: Record<string, Set<string>>,
+    ) => {
+        if (!variant || isNullVariant(variant)) return;
+        pickedVariantIds.add(variant.id);
+        if (!pickedByCollection[collectionId]) pickedByCollection[collectionId] = new Set();
+        pickedByCollection[collectionId].add(variant.id);
+    }, []);
+
     const parseNestedSequence = useCallback((sequence: NestedSequenceRecord) => {
-        const parsedCollections = typeof sequence.collections === 'string'
-            ? JSON.parse(sequence.collections || '{}')
-            : sequence.collections;
-        const sequenceCollections = Array.isArray(parsedCollections)
-            ? parsedCollections
-            : (parsedCollections?.items || []);
+        const parsedCollections = parseCollectionsPayload(sequence.collections);
         const sequenceTracks = typeof sequence.tracks === 'string'
             ? JSON.parse(sequence.tracks || '[]')
             : sequence.tracks;
         const sequenceElements = typeof sequence.elements === 'string'
             ? JSON.parse(sequence.elements || '[]')
             : sequence.elements;
+        const sequenceCollections = sequence.parentId === compositionId
+            ? mergeParentAndChildCollections(collections, parsedCollections.items)
+            : normalizeCollectionsForLoad(parsedCollections.items);
 
         return {
-            collections: sequenceCollections as CollectionItem[],
+            collections: sequenceCollections,
+            textGroups: pruneTextGroupsForCollections(parsedCollections.textGroups, sequenceCollections),
             tracks: (Array.isArray(sequenceTracks) && sequenceTracks.length > 0 ? sequenceTracks : [{ id: 'track-0', magnet: false }]) as TrackConfig[],
             elements: (Array.isArray(sequenceElements) ? sequenceElements : []) as CanvasElement[],
         };
-    }, []);
+    }, [compositionId, collections]);
 
-    const getVariantModesForElements = useCallback((targetElements: CanvasElement[], targetCollections: CollectionItem[]) => {
+    const getResolvedCollectionIdsForElements = useCallback((
+        targetElements: CanvasElement[],
+        targetCollections: CollectionItem[],
+        targetTextGroups: TextCollectionGroup[] = [],
+    ) => {
+        const result: Record<string, string> = {};
+        const collectionById = new Map(targetCollections.map(c => [c.id, c]));
+        const collectionToGroupId: Record<string, string> = {};
+        const groupById: Record<string, TextCollectionGroup> = {};
+
+        for (const group of targetTextGroups) {
+            groupById[group.id] = group;
+            for (const colId of group.collectionIds) {
+                if (!collectionToGroupId[colId]) collectionToGroupId[colId] = group.id;
+            }
+        }
+
+        for (const el of targetElements) {
+            if (el.collectionType !== 'text') {
+                result[el.elementId] = el.collectionId;
+                continue;
+            }
+
+            const groupId = collectionToGroupId[el.collectionId];
+            const group = groupId ? groupById[groupId] : null;
+            if (!group) {
+                result[el.elementId] = el.collectionId;
+                continue;
+            }
+
+            const localExcluded = new Set(el.localExcludedVariantIds || []);
+            const candidateIds = group.collectionIds.filter((colId) => {
+                const col = collectionById.get(colId);
+                if (!col || col.type !== 'text' || col.items.length === 0) return false;
+                return col.items.some(v => !v.excluded && !localExcluded.has(v.id));
+            });
+
+            if (candidateIds.length === 0) {
+                result[el.elementId] = el.collectionId;
+                continue;
+            }
+
+            const mode = el.textCollectionMode || 'all';
+            if (mode !== 'all' && candidateIds.includes(mode)) {
+                result[el.elementId] = mode;
+                continue;
+            }
+
+            const pickedCollectionId = pickVariantCandidate(
+                el,
+                candidateIds.map(id => ({ id })),
+                `${variantSeed}-${getElementSelectionKey(el)}-group-${group.id}`,
+                {},
+                1
+            )?.id;
+
+            result[el.elementId] = pickedCollectionId || candidateIds[0];
+        }
+
+        return result;
+    }, [pickVariantCandidate, variantSeed]);
+
+    const getVariantModesForElements = useCallback((
+        targetElements: CanvasElement[],
+        targetCollections: CollectionItem[],
+        targetTextGroups: TextCollectionGroup[] = [],
+    ) => {
         const modes: Record<string, string> = {};
         const collectionById = new Map(targetCollections.map(c => [c.id, c]));
+        const variantToCollectionId = new Map<string, string>();
+        for (const collection of targetCollections) {
+            collection.items.forEach(item => variantToCollectionId.set(item.id, collection.id));
+        }
+        const resolvedCollectionIds = getResolvedCollectionIdsForElements(targetElements, targetCollections, targetTextGroups);
+        const pickedVariantIds = new Set<string>();
         const pickedByCollection: Record<string, Set<string>> = {};
 
-        const sortedElements = [...targetElements].sort((a, b) => a.startTime - b.startTime);
+        const sortedElements = getSortedElementsForSelection(targetElements, collectionById, resolvedCollectionIds);
         for (const el of sortedElements) {
             if (!isCollectionElement(el.collectionType)) continue;
-            const col = collectionById.get(el.collectionId);
+            const resolvedCollectionId = resolvedCollectionIds[el.elementId] || el.collectionId;
+            const col = collectionById.get(resolvedCollectionId);
             if (!col?.items.length) continue;
 
             const localExcluded = new Set(el.localExcludedVariantIds || []);
+            const candidates = getSelectableVariants(col, resolvedCollectionId, localExcluded, pickedVariantIds, pickedByCollection, collectionById, variantToCollectionId);
             const selectedVariant = el.selectedVariantId
-                ? col.items.find(item => item.id === el.selectedVariantId && !item.excluded && !localExcluded.has(item.id))
+                ? candidates.find(item => item.id === el.selectedVariantId)
                 : undefined;
 
             let picked = selectedVariant || null;
             if (!picked) {
-                let candidates = col.items.filter(item => !item.excluded && !localExcluded.has(item.id));
-                const alreadyPicked = pickedByCollection[col.id];
-                if (alreadyPicked && candidates.some(item => !alreadyPicked.has(item.id))) {
-                    candidates = candidates.filter(item => !alreadyPicked.has(item.id));
-                }
                 picked = pickVariantCandidate(el, candidates, `${variantSeed}-${getElementSelectionKey(el)}-variant`, variantUsage);
             }
 
             if (picked) {
                 modes[el.elementId] = picked.id;
-                if (!pickedByCollection[col.id]) pickedByCollection[col.id] = new Set();
-                pickedByCollection[col.id].add(picked.id);
+                rememberPickedVariant(picked, resolvedCollectionId, pickedVariantIds, pickedByCollection);
             }
         }
 
         return modes;
-    }, [isCollectionElement, pickVariantCandidate, variantSeed, variantUsage]);
+    }, [getResolvedCollectionIdsForElements, getSelectableVariants, getSortedElementsForSelection, isCollectionElement, pickVariantCandidate, rememberPickedVariant, variantSeed, variantUsage]);
 
     const resolveNestedSequenceVariant = useCallback((parent: CanvasElement, sourceCollections: CollectionItem[] = collections) => {
         const variantCollection = sourceCollections.find(c => c.id === parent.collectionId && c.type === 'subComposition')
@@ -1876,6 +2526,8 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 variantUsage,
             );
         }
+
+        if (isNullVariant(picked)) return null;
 
         const sequenceId = picked?.value || picked?.id || parent.nestedSequenceId;
         const sequence = sequenceId ? nestedSequences.find(s => s.id === sequenceId) : null;
@@ -1916,7 +2568,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             };
         });
 
-        const childVariantModes = getVariantModesForElements(elementsWithNestedDurations, parsed.collections);
+        const childVariantModes = getVariantModesForElements(elementsWithNestedDurations, parsed.collections, parsed.textGroups);
         const childTimings = resolveElementTimings(elementsWithNestedDurations, parsed.tracks, parsed.collections, elId => childVariantModes[elId] || 'all');
         const maxEnd = elementsWithNestedDurations.reduce((max, el) => {
             const timing = childTimings.get(el.elementId) || { startTime: el.startTime, duration: el.duration };
@@ -1934,6 +2586,48 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         return durations;
     }, [nestedSequences, getNestedSequenceDuration]);
 
+    const getContextualNestedSequenceDuration = useCallback(function computeContextualDuration(
+        parent: CanvasElement,
+        sourceCollections: CollectionItem[] = collections,
+        path: string[] = [],
+    ): number {
+        const resolvedParent = resolveNestedSequenceVariant(parent, sourceCollections);
+        if (!resolvedParent) return 0;
+        if (path.includes(resolvedParent.sequence.id)) return Math.max(0.1, resolvedParent.sequence.duration || 0.1);
+
+        const sequence = resolvedParent.sequence;
+        const parsed = parseNestedSequence(sequence);
+        if (parsed.elements.length === 0) return EMPTY_NESTED_COMPOSITION_DISPLAY_DURATION;
+
+        const childSequenceIndex = getNestedChildSequenceIndex(parent, parsed.collections);
+        const elementsWithNestedDurations = parsed.elements.map(child => {
+            const childWithSequenceIndex = { ...child, variantSequenceIndex: childSequenceIndex };
+            if (child.collectionType !== 'nestedSequence') return childWithSequenceIndex;
+
+            const resolvedChild = resolveNestedSequenceVariant(childWithSequenceIndex, parsed.collections);
+            if (!resolvedChild) return childWithSequenceIndex;
+
+            return {
+                ...childWithSequenceIndex,
+                nestedSequenceId: resolvedChild.sequence.id,
+                selectedVariantId: resolvedChild.variantId,
+                duration: Math.min(
+                    child.duration,
+                    computeContextualDuration(childWithSequenceIndex, parsed.collections, [...path, sequence.id]),
+                ),
+            };
+        });
+
+        const childVariantModes = getVariantModesForElements(elementsWithNestedDurations, parsed.collections, parsed.textGroups);
+        const childTimings = resolveElementTimings(elementsWithNestedDurations, parsed.tracks, parsed.collections, elId => childVariantModes[elId] || 'all');
+        const maxEnd = elementsWithNestedDurations.reduce((max, el) => {
+            const timing = childTimings.get(el.elementId) || { startTime: el.startTime, duration: el.duration };
+            return Math.max(max, timing.startTime + timing.duration);
+        }, 0);
+
+        return Math.max(0.1, Math.round(maxEnd * 1000) / 1000);
+    }, [collections, getNestedChildSequenceIndex, getVariantModesForElements, parseNestedSequence, resolveNestedSequenceVariant]);
+
     const createSubCompositionGroupClip = useCallback((
         collection: CollectionItem,
         placement?: { x?: number; y?: number; startTime?: number },
@@ -1944,14 +2638,14 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         for (const sib of trackSiblings) {
             const subCompositionCollection = collections.find(c => c.id === sib.collectionId && c.type === 'subComposition');
             const siblingDuration = subCompositionCollection
-                ? Math.min(sib.duration, Math.max(0.1, ...subCompositionCollection.items.map(item => nestedSequenceDurations[item.value || item.id] ?? 0.1)))
+                ? Math.min(sib.duration, Math.max(0.1, ...subCompositionCollection.items.filter(item => !isNullVariant(item)).map(item => nestedSequenceDurations[item.value || item.id] ?? 0.1)))
                 : sib.collectionType === 'nestedSequence' && sib.nestedSequenceId
                     ? Math.min(sib.duration, nestedSequenceDurations[sib.nestedSequenceId] ?? sib.duration)
                     : sib.duration;
             bestStart = Math.max(bestStart, sib.startTime + siblingDuration);
         }
 
-        const sequenceIds = collection.items.map(item => item.value || item.id).filter(Boolean);
+        const sequenceIds = collection.items.filter(item => !isNullVariant(item)).map(item => item.value || item.id).filter(Boolean);
         const durations = sequenceIds.map(id => nestedSequenceDurations[id] ?? nestedSequences.find(seq => seq.id === id)?.duration ?? 0.1);
         const maxDuration = Math.max(0.1, ...durations);
         const firstSequenceId = sequenceIds[0];
@@ -1989,7 +2683,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         }
         const sequence = resolvedParent.sequence;
         const parsed = parseNestedSequence(sequence);
-        const parentDuration = Math.min(parent.duration, getNestedSequenceDuration(sequence, path));
+        const parentDuration = Math.min(parent.duration, getContextualNestedSequenceDuration(parent, collections, path));
         const childSequenceIndex = getNestedChildSequenceIndex(parent, parsed.collections);
         const elementsWithNestedDurations = parsed.elements.map(child => {
             const childWithSequenceIndex = { ...child, variantSequenceIndex: childSequenceIndex };
@@ -2000,10 +2694,11 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 ...childWithSequenceIndex,
                 nestedSequenceId: resolvedChild.sequence.id,
                 selectedVariantId: resolvedChild.variantId,
-                duration: Math.min(child.duration, getNestedSequenceDuration(resolvedChild.sequence, [...path, sequence.id])),
+                duration: Math.min(child.duration, getContextualNestedSequenceDuration(childWithSequenceIndex, parsed.collections, [...path, sequence.id])),
             };
         });
-        const childVariantModes = getVariantModesForElements(elementsWithNestedDurations, parsed.collections);
+        const childResolvedCollectionIds = getResolvedCollectionIdsForElements(elementsWithNestedDurations, parsed.collections, parsed.textGroups);
+        const childVariantModes = getVariantModesForElements(elementsWithNestedDurations, parsed.collections, parsed.textGroups);
         const childTimings = resolveElementTimings(elementsWithNestedDurations, parsed.tracks, parsed.collections, elId => childVariantModes[elId] || 'all');
         const childTrackCount = Math.max(1, parsed.tracks.length);
 
@@ -2016,10 +2711,12 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             const childLocalZ = Math.max(0, Math.min(999, child.zIndex || index));
             const parentLocalBand = Math.max(0, Math.min(8, parent.zIndex || 0)) * 1000;
             const flattenedZ = Math.min(9999, parentLocalBand + childTrackStack + childLocalZ);
+            const resolvedChildCollectionId = childResolvedCollectionIds[child.elementId] || child.collectionId;
             const childBase: CanvasElement = {
                 ...child,
                 elementId: `${parent.elementId}-${child.elementId}`,
                 sourceElementId: `${parent.elementId}-${child.elementId}`,
+                collectionId: child.collectionType === 'text' ? resolvedChildCollectionId : child.collectionId,
                 variantSeedKey: getElementSelectionKey(child),
                 variantSequenceIndex: child.variantSequenceIndex,
                 selectedVariantId: childVariantModes[child.elementId],
@@ -2044,7 +2741,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             }
             return [childBase];
         });
-    }, [getNestedChildSequenceIndex, getNestedSequenceDuration, getVariantModesForElements, parseNestedSequence, resolveNestedSequenceVariant]);
+    }, [collections, getContextualNestedSequenceDuration, getNestedChildSequenceIndex, getResolvedCollectionIdsForElements, getVariantModesForElements, parseNestedSequence, resolveNestedSequenceVariant]);
 
     const flattenTimelineElements = useCallback((): CanvasElement[] => {
         const flattened: CanvasElement[] = [];
@@ -2077,8 +2774,10 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                     picked = pickVariantCandidate(el, candidates, `${variantSeed}-${getElementSelectionKey(el)}-subcomposition`, variantUsage);
                 }
 
+                if (isNullVariant(picked)) continue;
+
                 const selectedSequenceId = picked?.value || picked?.id || el.nestedSequenceId;
-                if (picked) {
+                if (picked && !isNullVariant(picked)) {
                     if (!pickedBySubCompositionCollection[subCompositionCollection.id]) {
                         pickedBySubCompositionCollection[subCompositionCollection.id] = new Set();
                     }
@@ -2116,69 +2815,8 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     }, [textCollectionGroups]);
 
     const resolvedCollectionIdByElement = useMemo(() => {
-        const result: Record<string, string> = {};
-        const queueUsages = renderQueue.reduce((acc, curr) => {
-            curr.usedVariantIds?.forEach(id => {
-                acc[id] = (acc[id] || 0) + 1;
-            });
-            return acc;
-        }, {} as Record<string, number>);
-
-        for (const el of elements) {
-            if (el.collectionType !== 'text') {
-                result[el.elementId] = el.collectionId;
-                continue;
-            }
-
-            const groupId = collectionToTextGroupId[el.collectionId];
-            if (!groupId) {
-                result[el.elementId] = el.collectionId;
-                continue;
-            }
-
-            const group = textGroupById[groupId];
-            if (!group) {
-                result[el.elementId] = el.collectionId;
-                continue;
-            }
-            const localExcluded = new Set(el.localExcludedVariantIds || []);
-
-            const candidateIds = group.collectionIds.filter((colId) => {
-                const col = collections.find(c => c.id === colId);
-                if (!col || col.type !== 'text' || col.items.length === 0) return false;
-                return col.items.some(v => !v.excluded && !localExcluded.has(v.id));
-            });
-            if (candidateIds.length === 0) {
-                result[el.elementId] = el.collectionId;
-                continue;
-            }
-
-            const mode = el.textCollectionMode || 'all';
-            if (mode !== 'all' && candidateIds.includes(mode)) {
-                result[el.elementId] = mode;
-                continue;
-            }
-
-            const collectionUsage = Object.fromEntries(candidateIds.map((colId) => {
-                const col = collections.find(c => c.id === colId);
-                const usage = col?.items.reduce((sum, item) => {
-                    if (item.excluded || localExcluded.has(item.id)) return sum;
-                    return sum + (variantUsage[item.id] || 0) + (queueUsages[item.id] || 0);
-                }, 0) ?? 0;
-                return [colId, usage];
-            }));
-            const pickedCollectionId = pickVariantCandidate(
-                el,
-                candidateIds.map(id => ({ id })),
-                `${variantSeed}-${getSelectionKey(el)}-group-${group.id}`,
-                collectionUsage,
-                1
-            )?.id;
-            result[el.elementId] = pickedCollectionId || candidateIds[0];
-        }
-
-        return result;
-    }, [elements, collectionToTextGroupId, textGroupById, collections, variantSeed, variantUsage, renderQueue, getSelectionKey, pickVariantCandidate]);
+        return getResolvedCollectionIdsForElements(elements, collections, textCollectionGroups);
+    }, [collections, elements, getResolvedCollectionIdsForElements, textCollectionGroups]);
 
     const previewVariants = useMemo(() => {
         const variants: Record<string, CollectionVariant | null> = {};
@@ -2202,26 +2840,8 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             collection.items.forEach(item => variantToCollectionId.set(item.id, collection.id));
         }
 
-        // Sort elements so link-source collections are always evaluated first.
-        // A "link source" collection is one where at least one variant defines outgoing links.
-        // This ensures that when we evaluate the hook/dependent collection, the linked variant
-        // from the source collection is already in pickedVariantIds — regardless of startTime order.
-        const isLinkSourceCollection = (colId: string) => {
-            const c = collectionById.get(colId);
-            return c ? c.items.some(v => v.linkedVariantIds && v.linkedVariantIds.length > 0) : false;
-        };
-
-        const sortedElements = [...elements].sort((a, b) => {
-            const aColId = resolvedCollectionIdByElement[a.elementId] || a.collectionId;
-            const bColId = resolvedCollectionIdByElement[b.elementId] || b.collectionId;
-            const aIsSource = isLinkSourceCollection(aColId) ? 0 : 1;
-            const bIsSource = isLinkSourceCollection(bColId) ? 0 : 1;
-            if (aIsSource !== bIsSource) return aIsSource - bIsSource; // sources first
-            return a.startTime - b.startTime; // then by timeline position
-        });
+        const sortedElements = getSortedElementsForSelection(elements, collectionById, resolvedCollectionIdByElement);
         const pickedVariantIds = new Set<string>();
-        // Track which variant IDs have been picked per collection, so elements
-        // sharing the same collection are forced to pick different variants.
         const pickedByCollection: Record<string, Set<string>> = {};
 
         sortedElements.forEach(el => {
@@ -2235,105 +2855,28 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 let pickedVariant: CollectionVariant | null = null;
                 
                 if (userMode !== 'all') {
-                    const requested = col.items.find(v => v.id === userMode) || null;
-                    pickedVariant = requested && !requested.excluded && !localExcluded.has(requested.id)
-                        ? requested
-                        : null;
+                    pickedVariant = getSelectableVariants(col, resolvedColId, localExcluded, pickedVariantIds, pickedByCollection, collectionById, variantToCollectionId)
+                        .find(v => v.id === userMode) || null;
                 }
 
                 if (!pickedVariant) {
-                    // Linked variant resolution
-                    const allowedByLinks = new Set<string>();
-                    let hasLinksToThisCollection = false;
-
-                    for (const prevId of pickedVariantIds) {
-                        const prevColId = variantToCollectionId.get(prevId);
-                        const prevVariant = prevColId ? collectionById.get(prevColId)?.items.find(i => i.id === prevId) : null;
-                        if (prevVariant && prevVariant.linkedVariantIds && prevVariant.linkedVariantIds.length > 0) {
-                            const linksInThisCollection = prevVariant.linkedVariantIds.filter(lid => col.items.some(i => i.id === lid));
-                            if (linksInThisCollection.length > 0) {
-                                hasLinksToThisCollection = true;
-                                linksInThisCollection.forEach(lid => allowedByLinks.add(lid));
-                            }
-                        }
-                    }
-
-                    // Get list of collections that have already been evaluated (have at least one picked variant)
-                    const evaluatedColIds = new Set<string>();
-                    for (const pid of pickedVariantIds) {
-                        const pColId = variantToCollectionId.get(pid);
-                        if (pColId) evaluatedColIds.add(pColId);
-                    }
-
-                    const candidates = col.items.filter(v => {
-                        if (v.excluded || localExcluded.has(v.id)) return false;
-
-                        // 1. Forward check (from previously picked to candidate)
-                        if (hasLinksToThisCollection && !allowedByLinks.has(v.id)) {
-                            return false;
-                        }
-
-                        // 2. Backward check (from candidate to previously picked)
-                        // If 'v' has explicit links to another collection, and that collection has been evaluated,
-                        // then at least one picked variant from that collection MUST be in 'v's linkedVariantIds.
-                        if (v.linkedVariantIds && v.linkedVariantIds.length > 0) {
-                            for (const evalColId of evaluatedColIds) {
-                                if (evalColId === col.id) continue;
-                                const evalCol = collectionById.get(evalColId);
-                                if (!evalCol) continue;
-
-                                const vLinksToEvalCol = v.linkedVariantIds.filter(lid => evalCol.items.some(i => i.id === lid));
-                                
-                                if (vLinksToEvalCol.length > 0) {
-                                    // 'v' requires specific variants from 'evalCol'.
-                                    // Let's see which variants were ACTUALLY picked from 'evalCol'.
-                                    const pickedInEvalCol = evalCol.items.filter(i => pickedVariantIds.has(i.id));
-                                    
-                                    // If none of the picked variants are in 'v's required list, 'v' is invalid.
-                                    const isValid = pickedInEvalCol.some(picked => vLinksToEvalCol.includes(picked.id));
-                                    if (!isValid) return false;
-                                }
-                            }
-                        }
-
-                        return true;
-                    });
-
-                    let finalCandidates = candidates;
+                    const finalCandidates = getSelectableVariants(col, resolvedColId, localExcluded, pickedVariantIds, pickedByCollection, collectionById, variantToCollectionId);
                     if (finalCandidates.length === 0) {
                         variants[el.elementId] = null;
                         return;
-                    }
-
-                    // --- Same-collection deduplication ---
-                    // If another element from this collection already picked a variant,
-                    // forcibly exclude those variants so every element gets a unique one.
-                    const alreadyPickedInCol = pickedByCollection[resolvedColId];
-                    if (alreadyPickedInCol && alreadyPickedInCol.size > 0) {
-                        const deduped = finalCandidates.filter(v => !alreadyPickedInCol.has(v.id));
-                        // Only apply dedup if there are still candidates left;
-                        // if all variants are exhausted (more elements than variants), allow repeats.
-                        if (deduped.length > 0) {
-                            finalCandidates = deduped;
-                        }
                     }
 
                     pickedVariant = pickVariantCandidate(el, finalCandidates, `${variantSeed}-${selectionKey}-variant`, combinedUsage);
                 }
                 
                 variants[el.elementId] = pickedVariant;
-                if (pickedVariant) {
-                    pickedVariantIds.add(pickedVariant.id);
-                    // Record per-collection pick for deduplication
-                    if (!pickedByCollection[resolvedColId]) pickedByCollection[resolvedColId] = new Set();
-                    pickedByCollection[resolvedColId].add(pickedVariant.id);
-                }
+                rememberPickedVariant(pickedVariant, resolvedColId, pickedVariantIds, pickedByCollection);
             } else {
                 variants[el.elementId] = null;
             }
         });
         return variants;
-    }, [elements, collections, variantSeed, variantUsage, renderQueue, resolvedCollectionIdByElement, getSelectionKey, getVariantMode, pickVariantCandidate]);
+    }, [elements, collections, variantSeed, variantUsage, renderQueue, resolvedCollectionIdByElement, getSelectionKey, getVariantMode, getSelectableVariants, getSortedElementsForSelection, pickVariantCandidate, rememberPickedVariant]);
 
     const activeVariantModes = useMemo(() => {
         const modes: Record<string, string> = {};
@@ -2348,28 +2891,67 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     }, [elements, previewVariants, getVariantMode]);
 
     const elementsWithNestedDurations = useMemo(() => {
+        const pickedBySubCompositionCollection: Record<string, Set<string>> = {};
+
         return elements.map(el => {
             if (el.collectionType !== 'nestedSequence') return el;
             const subCompositionCollection = collections.find(c => c.id === el.collectionId && c.type === 'subComposition');
             let sequenceDuration: number | undefined;
+            let selectedVariantId = el.selectedVariantId;
+            let selectedSequenceId = el.nestedSequenceId;
+
             if (subCompositionCollection) {
-                const activeVariantId = activeVariantModes[el.elementId] || getVariantMode(el.elementId);
-                const activeItem = activeVariantId !== 'all'
-                    ? subCompositionCollection.items.find(item => item.id === activeVariantId)
-                    : undefined;
-                sequenceDuration = activeItem
-                    ? nestedSequenceDurations[activeItem.value || activeItem.id] ?? 0.1
-                    : Math.max(0.1, ...subCompositionCollection.items.map(item => nestedSequenceDurations[item.value || item.id] ?? 0.1));
+                const localExcluded = new Set(el.localExcludedVariantIds || []);
+                const requestedMode = getVariantMode(el.elementId);
+                let picked = requestedMode !== 'all'
+                    ? subCompositionCollection.items.find(item => item.id === requestedMode && !item.excluded && !localExcluded.has(item.id)) || null
+                    : null;
+
+                if (!picked) {
+                    let candidates = subCompositionCollection.items.filter(item => !item.excluded && !localExcluded.has(item.id));
+                    const alreadyPicked = pickedBySubCompositionCollection[subCompositionCollection.id];
+                    if (alreadyPicked && candidates.some(item => !alreadyPicked.has(item.id))) {
+                        candidates = candidates.filter(item => !alreadyPicked.has(item.id));
+                    }
+                    picked = pickVariantCandidate(el, candidates, `${variantSeed}-${getElementSelectionKey(el)}-subcomposition`, variantUsage);
+                }
+
+                selectedVariantId = picked?.id;
+                if (picked && !isNullVariant(picked)) {
+                    const sequenceId = picked.value || picked.id || el.nestedSequenceId;
+                    selectedSequenceId = sequenceId;
+                    sequenceDuration = sequenceId
+                        ? getContextualNestedSequenceDuration({
+                            ...el,
+                            nestedSequenceId: sequenceId,
+                            selectedVariantId: picked.id,
+                        })
+                        : 0.1;
+                    if (!pickedBySubCompositionCollection[subCompositionCollection.id]) {
+                        pickedBySubCompositionCollection[subCompositionCollection.id] = new Set();
+                    }
+                    pickedBySubCompositionCollection[subCompositionCollection.id].add(picked.id);
+                } else if (isNullVariant(picked)) {
+                    selectedSequenceId = undefined;
+                    sequenceDuration = 0;
+                } else {
+                    const durations = subCompositionCollection.items
+                        .filter(item => !item.excluded && !localExcluded.has(item.id) && !isNullVariant(item))
+                        .map(item => nestedSequenceDurations[item.value || item.id] ?? 0.1);
+                    sequenceDuration = Math.max(0.1, ...durations);
+                }
             } else if (el.nestedSequenceId) {
-                sequenceDuration = nestedSequenceDurations[el.nestedSequenceId];
+                sequenceDuration = getContextualNestedSequenceDuration(el);
             }
-            if (!sequenceDuration) return el;
+            if (sequenceDuration === undefined) return el;
             return {
                 ...el,
+                nestedSequenceId: selectedSequenceId,
+                selectedVariantId,
                 duration: Math.min(el.duration, sequenceDuration),
             };
         });
-    }, [activeVariantModes, collections, elements, getVariantMode, nestedSequenceDurations]);
+    }, [collections, elements, getContextualNestedSequenceDuration, getVariantMode, nestedSequenceDurations, pickVariantCandidate, variantSeed, variantUsage]);
 
     const elementTimings = useMemo(() => {
         return resolveElementTimings(elementsWithNestedDurations, tracks, collections, elId => activeVariantModes[elId] || 'all');
@@ -2377,7 +2959,6 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
 
     const flattenTimelineElementsWithResolvedTimings = useCallback((): CanvasElement[] => {
         const flattened: CanvasElement[] = [];
-        const pickedBySubCompositionCollection: Record<string, Set<string>> = {};
 
         for (const rawEl of elementsWithNestedDurations) {
             const timing = elementTimings.get(rawEl.elementId) || { startTime: rawEl.startTime, duration: rawEl.duration };
@@ -2399,39 +2980,21 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                     continue;
                 }
 
-                const localExcluded = new Set(el.localExcludedVariantIds || []);
-                const requestedMode = getVariantMode(el.elementId);
-                let picked = requestedMode !== 'all'
-                    ? subCompositionCollection.items.find(item => item.id === requestedMode && !item.excluded && !localExcluded.has(item.id)) || null
+                const picked = el.selectedVariantId
+                    ? subCompositionCollection.items.find(item => item.id === el.selectedVariantId) || null
                     : null;
-
-                if (!picked) {
-                    let candidates = subCompositionCollection.items.filter(item => !item.excluded && !localExcluded.has(item.id));
-                    const alreadyPicked = pickedBySubCompositionCollection[subCompositionCollection.id];
-                    if (alreadyPicked && candidates.some(item => !alreadyPicked.has(item.id))) {
-                        candidates = candidates.filter(item => !alreadyPicked.has(item.id));
-                    }
-                    picked = pickVariantCandidate(el, candidates, `${variantSeed}-${getElementSelectionKey(el)}-subcomposition`, variantUsage);
-                }
-
-                const selectedSequenceId = picked?.value || picked?.id || el.nestedSequenceId;
-                if (picked) {
-                    if (!pickedBySubCompositionCollection[subCompositionCollection.id]) {
-                        pickedBySubCompositionCollection[subCompositionCollection.id] = new Set();
-                    }
-                    pickedBySubCompositionCollection[subCompositionCollection.id].add(picked.id);
-                }
+                if (isNullVariant(picked)) continue;
 
                 flattened.push(...expandNestedSequenceClip({
                     ...el,
-                    nestedSequenceId: selectedSequenceId,
-                    selectedVariantId: picked?.id,
+                    nestedSequenceId: picked?.value || picked?.id || el.nestedSequenceId,
+                    selectedVariantId: picked?.id || el.selectedVariantId,
                 }));
             }
         }
 
         return flattened;
-    }, [collections, elementTimings, elementsWithNestedDurations, expandNestedSequenceClip, getVariantMode, isCollectionElement, pickVariantCandidate, variantSeed, variantUsage]);
+    }, [collections, elementTimings, elementsWithNestedDurations, expandNestedSequenceClip, isCollectionElement]);
 
     // Auto-expand playback duration when elements extend beyond the current timeline length
     useEffect(() => {
@@ -2545,26 +3108,46 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         setSplitHoverPosition(null);
     }, []);
 
+    useEffect(() => {
+        currentTimeRef.current = currentTime;
+        if (!isPlaying) {
+            playbackTimeRef.current = currentTime;
+        }
+    }, [currentTime, isPlaying]);
+
     // rAF playback loop
     useEffect(() => {
         if (!isPlaying) {
             if (playbackRafRef.current) cancelAnimationFrame(playbackRafRef.current);
             return;
         }
-        lastFrameRef.current = performance.now();
+        const startedAt = performance.now();
+        lastFrameRef.current = startedAt;
+        lastPublishedFrameRef.current = startedAt;
+        playbackTimeRef.current = currentTimeRef.current;
+
         const tick = (now: number) => {
             const dt = (now - lastFrameRef.current) / 1000;
             lastFrameRef.current = now;
-            setCurrentTime(prev => {
-                const next = prev + dt;
-                if (next >= TOTAL_DURATION) return 0; // loop
-                return next;
-            });
+
+            const safeDuration = Math.max(0.001, TOTAL_DURATION);
+            const nextTime = (playbackTimeRef.current + dt) % safeDuration;
+            playbackTimeRef.current = nextTime;
+            currentTimeRef.current = nextTime;
+
+            if (now - lastPublishedFrameRef.current >= PLAYBACK_STATE_INTERVAL_MS) {
+                lastPublishedFrameRef.current = now;
+                setCurrentTime(nextTime);
+            }
+
             playbackRafRef.current = requestAnimationFrame(tick);
         };
         playbackRafRef.current = requestAnimationFrame(tick);
-        return () => { if (playbackRafRef.current) cancelAnimationFrame(playbackRafRef.current); };
-    }, [isPlaying]);
+        return () => {
+            if (playbackRafRef.current) cancelAnimationFrame(playbackRafRef.current);
+            setCurrentTime(currentTimeRef.current);
+        };
+    }, [isPlaying, TOTAL_DURATION]);
 
     const handlePlayPause = () => {
         if (!isPlaying) {
@@ -2874,9 +3457,11 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         setActiveDragDelta(null);
 
         const { active, over, delta } = event;
+        const activeId = String(active.id);
+        const overId = over ? String(over.id) : "";
 
         // --- Drop collection onto canvas ---
-        if (String(active.id).startsWith("collection-") && isPointerOverCanvas(event)) {
+        if (activeId.startsWith("collection-") && isPointerOverCanvas(event)) {
             const data = active.data.current as { collection: CollectionItem } | undefined;
             const col = data?.collection;
             if (!col) return;
@@ -2971,9 +3556,28 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             return;
         }
 
+        // --- Reorder collections inside the collections pane ---
+        if (activeId.startsWith("collection-") && overId.startsWith("collection-drop-")) {
+            const sourceCollectionId = activeId.replace("collection-", "");
+            const targetCollectionId = overId.replace("collection-drop-", "");
+            if (sourceCollectionId && targetCollectionId && sourceCollectionId !== targetCollectionId) {
+                applyCollectionsChange(current => {
+                    const fromIndex = current.findIndex(collection => collection.id === sourceCollectionId);
+                    const toIndex = current.findIndex(collection => collection.id === targetCollectionId);
+                    if (fromIndex < 0 || toIndex < 0) return current;
+
+                    const next = [...current];
+                    const [moved] = next.splice(fromIndex, 1);
+                    next.splice(toIndex, 0, moved);
+                    return next;
+                });
+            }
+            return;
+        }
+
         // --- Move existing canvas element ---
-        if (String(active.id).startsWith("canvas-")) {
-            const elId = String(active.id).replace("canvas-", "");
+        if (activeId.startsWith("canvas-")) {
+            const elId = activeId.replace("canvas-", "");
             const rect = canvasRef.current?.getBoundingClientRect();
             if (!rect) return;
 
@@ -3033,6 +3637,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             const variant = pickedVariantId
                 ? subCompositionCollection.items.find(item => item.id === pickedVariantId)
                 : subCompositionCollection.items[0];
+            if (isNullVariant(variant)) return null;
             const sequenceId = variant?.value || variant?.id || selectedElement.nestedSequenceId;
             if (!sequenceId) return null;
             const sequence = nestedSequences.find(item => item.id === sequenceId);
@@ -3070,37 +3675,49 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             timelineElements = elements;
         }
 
+        const variantToCollectionId = new Map<string, string>();
+        for (const collection of collectionById.values()) {
+            collection.items.forEach(item => variantToCollectionId.set(item.id, collection.id));
+        }
+        const pickedVariantIds = new Set<string>();
         const pickedByCollection: Record<string, Set<string>> = {};
+        const selectedVariants: Record<string, CollectionVariant | null> = {};
 
-        return timelineElements.map(baseEl => {
+        getSortedElementsForSelection(timelineElements, collectionById, resolvedCollectionIdByElement).forEach(baseEl => {
             const resolvedColId = resolvedCollectionIdByElement[baseEl.elementId] || baseEl.collectionId;
             const col = collectionById.get(resolvedColId) || collectionById.get(baseEl.collectionId);
+            if (!col?.items.length) {
+                selectedVariants[baseEl.elementId] = null;
+                return;
+            }
+
+            const localExcluded = new Set(baseEl.localExcludedVariantIds || []);
+            const candidates = getSelectableVariants(col, resolvedColId, localExcluded, pickedVariantIds, pickedByCollection, collectionById, variantToCollectionId);
             const explicitMode = getVariantMode(baseEl.elementId);
             const explicitPicked = explicitMode !== 'all'
-                ? col?.items.find(item => item.id === explicitMode) || null
+                ? candidates.find(item => item.id === explicitMode) || null
                 : null;
             const nestedPicked = baseEl.selectedVariantId
-                ? col?.items.find(item => item.id === baseEl.selectedVariantId) || null
+                ? candidates.find(item => item.id === baseEl.selectedVariantId) || null
                 : null;
             const statePicked = explicitPicked || nestedPicked || previewVariants[baseEl.elementId];
-            let variant: CollectionVariant | null = statePicked && col?.items.some(item => item.id === statePicked.id)
+            let variant: CollectionVariant | null = statePicked && candidates.some(item => item.id === statePicked.id)
                 ? statePicked
                 : null;
 
-            if (!variant && col?.items.length) {
-                const localExcluded = new Set(baseEl.localExcludedVariantIds || []);
-                let candidates = col.items.filter(item => !item.excluded && !localExcluded.has(item.id));
-                const alreadyPicked = pickedByCollection[col.id];
-                if (alreadyPicked && candidates.some(item => !alreadyPicked.has(item.id))) {
-                    candidates = candidates.filter(item => !alreadyPicked.has(item.id));
-                }
-
+            if (!variant && candidates.length > 0) {
                 variant = pickVariantCandidate(baseEl, candidates, `${variantSeed}-${getSelectionKey(baseEl)}-variant`, variantUsage);
             }
 
-            if (variant && col) {
-                if (!pickedByCollection[col.id]) pickedByCollection[col.id] = new Set();
-                pickedByCollection[col.id].add(variant.id);
+            selectedVariants[baseEl.elementId] = variant;
+            rememberPickedVariant(variant, resolvedColId, pickedVariantIds, pickedByCollection);
+        });
+
+        return timelineElements.map(baseEl => {
+            const variant = selectedVariants[baseEl.elementId] ?? null;
+
+            if (isNullVariant(variant)) {
+                return null;
             }
 
             const variantOverride = variant ? baseEl.variantOverrides?.[variant.id] : undefined;
@@ -3121,7 +3738,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 },
                 variant,
             };
-        });
+        }).filter((item): item is { el: CanvasElement; variant: CollectionVariant | null } => Boolean(item));
     }, [
         collections,
         nestedSequences,
@@ -3134,6 +3751,9 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         variantSeed,
         getSelectionKey,
         getVariantMode,
+        getSelectableVariants,
+        getSortedElementsForSelection,
+        rememberPickedVariant,
         variantUsage,
         getEffectiveElement,
         elementTimings,
@@ -3323,6 +3943,45 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         setSelectedElementId(null);
     };
 
+    const persistSharedParentCollections = useCallback(async (normalizedCollections: CollectionItem[]) => {
+        if (!isSubCompositionEditor) return;
+        const parent = parentCompositionRef.current;
+        if (!parent) return;
+
+        const sharedIds = sharedParentCollectionIdsRef.current;
+        if (sharedIds.size === 0) return;
+
+        const childCollectionById = new Map(normalizedCollections.map(collection => [collection.id, collection]));
+        const sharedParentCollections = parentSharedCollectionsRef.current.map(parentCollection => {
+            const childCollection = childCollectionById.get(parentCollection.id);
+            return childCollection
+                ? restoreParentVariantLinks(childCollection, parentCollection)
+                : parentCollection;
+        });
+
+        if (JSON.stringify(sharedParentCollections) === JSON.stringify(parentSharedCollectionsRef.current)) return;
+
+        const sharedById = new Map(sharedParentCollections.map(collection => [collection.id, collection]));
+        const nextParentCollections = parentAllCollectionsRef.current.map(parentCollection =>
+            sharedById.get(parentCollection.id) || parentCollection
+        );
+
+        const res = await fetch(`/api/compositions/${parent.id}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                collections: {
+                    items: nextParentCollections,
+                    textGroups: parentSharedTextGroupsRef.current,
+                    renderQueue: parentSharedRenderQueueRef.current,
+                },
+            }),
+        });
+        if (!res.ok) throw new Error("Failed to sync shared parent collections");
+        parentAllCollectionsRef.current = nextParentCollections;
+        parentSharedCollectionsRef.current = sharedParentCollections;
+    }, [isSubCompositionEditor]);
+
     const persistRenderQueue = useCallback(async (nextQueue: QueuedRenderJob[], successMessage?: string) => {
         setRenderQueue(nextQueue);
         if (!compositionId) {
@@ -3331,12 +3990,16 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         }
 
         try {
+            const normalizedCollections = syncCollectionsWithActiveVersions(collections);
+            const persistedCollections = isSubCompositionEditor
+                ? withoutSubCompositionCollections(normalizedCollections).map(stripSharedParentFlag)
+                : normalizedCollections;
             const res = await fetch(`/api/compositions/${compositionId}`, {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                     collections: {
-                        items: collections,
+                        items: persistedCollections,
                         textGroups: textCollectionGroups,
                         renderQueue: nextQueue,
                     },
@@ -3348,7 +4011,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             console.error("Failed to persist render queue", e);
             showToast("Queue updated locally, but failed to save.", "error");
         }
-    }, [compositionId, collections, textCollectionGroups]);
+    }, [compositionId, collections, isSubCompositionEditor, textCollectionGroups]);
 
     const persistCollections = useCallback(async (
         nextCollections: CollectionItem[],
@@ -3356,12 +4019,14 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         nextQueue = renderQueue,
     ) => {
         if (!compositionId) return;
+        const normalizedCollections = syncCollectionsWithActiveVersions(nextCollections);
         const persistedCollections = isSubCompositionEditor
-            ? withoutSubCompositionCollections(nextCollections)
-            : nextCollections;
+            ? withoutSubCompositionCollections(normalizedCollections).map(stripSharedParentFlag)
+            : normalizedCollections;
         const persistedTextGroups = pruneTextGroupsForCollections(nextTextGroups, persistedCollections);
 
         try {
+            await persistSharedParentCollections(normalizedCollections);
             const res = await fetch(`/api/compositions/${compositionId}`, {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
@@ -3378,7 +4043,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             console.error("Failed to persist collections", error);
             showToast("Collection change updated locally, but failed to save.", "error");
         }
-    }, [compositionId, isSubCompositionEditor, renderQueue, textCollectionGroups]);
+    }, [compositionId, isSubCompositionEditor, persistSharedParentCollections, renderQueue, textCollectionGroups]);
 
     const applyCollectionsChange = useCallback((
         updater: (current: CollectionItem[]) => CollectionItem[],
@@ -3401,7 +4066,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         const referencedSequenceIds = new Set(
             copiedCollections
                 .filter(collection => collection.type === "subComposition")
-                .flatMap(collection => collection.items.map(item => item.value || item.id))
+                .flatMap(collection => collection.items.filter(item => !isNullVariant(item)).map(item => item.value || item.id))
                 .filter(Boolean)
         );
         const copiedSequences = clonePlain(nestedSequencesRef.current.filter(sequence => referencedSequenceIds.has(sequence.id)));
@@ -3480,17 +4145,28 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             }
         };
 
-        const clonedCollections: CollectionItem[] = [];
+        const clonedCollectionSources: { collection: CollectionItem; overrides: Map<string, Partial<CollectionVariant>> }[] = [];
         const newNestedSequences: NestedSequenceRecord[] = [];
 
         try {
             for (const collection of sourceCollections) {
                 const newCollectionId = `col-copy-${stamp}-${collectionIdMap.size}`;
                 collectionIdMap.set(collection.id, newCollectionId);
-                const clonedItems: CollectionVariant[] = [];
+                const overrides = new Map<string, Partial<CollectionVariant>>();
 
-                for (const item of collection.items || []) {
+                if (collection.type !== "subComposition") {
+                    ensureCollectionVariantIdMap(collection, variantIdMap, () => `v-copy-${stamp}-${variantIdMap.size}`);
+                }
+
+                for (const item of getAllCollectionVariants(collection)) {
+                    if (variantIdMap.has(item.id)) continue;
                     if (collection.type === "subComposition") {
+                        if (isNullVariant(item)) {
+                            const newVariantId = `null-copy-${stamp}-${variantIdMap.size}`;
+                            variantIdMap.set(item.id, newVariantId);
+                            overrides.set(item.id, { id: newVariantId, value: "", duration: 0, isNull: true });
+                            continue;
+                        }
                         const sourceSequenceId = item.value || item.id;
                         const sourceSequence = sequenceById.get(sourceSequenceId) || nestedSequencesRef.current.find(sequence => sequence.id === sourceSequenceId);
                         if (!sourceSequence || !compositionId) continue;
@@ -3514,8 +4190,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                         }
                         newNestedSequences.push(data);
                         variantIdMap.set(item.id, data.id);
-                        clonedItems.push({
-                            ...item,
+                        overrides.set(item.id, {
                             id: data.id,
                             label: data.title || item.label,
                             value: data.id,
@@ -3523,19 +4198,14 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                         });
                         continue;
                     }
-
-                    const newVariantId = `v-copy-${stamp}-${variantIdMap.size}`;
-                    variantIdMap.set(item.id, newVariantId);
-                    clonedItems.push({
-                        ...item,
-                        id: newVariantId,
-                    });
                 }
 
-                clonedCollections.push({
-                    ...collection,
-                    id: newCollectionId,
-                    items: clonedItems,
+                clonedCollectionSources.push({
+                    collection: {
+                        ...collection,
+                        id: newCollectionId,
+                    },
+                    overrides,
                 });
             }
         } catch (error) {
@@ -3544,15 +4214,9 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             return;
         }
 
-        const remappedCollections = clonedCollections.map(collection => ({
-            ...collection,
-            items: collection.items.map(item => ({
-                ...item,
-                linkedVariantIds: item.linkedVariantIds
-                    ?.map(id => variantIdMap.get(id))
-                    .filter((id): id is string => Boolean(id)),
-            })),
-        }));
+        const remappedCollections = clonedCollectionSources.map(({ collection, overrides }) =>
+            remapCollectionVariantIds(collection, variantIdMap, overrides)
+        );
 
         const remappedTextGroups = sourceTextGroups
             .map(group => ({
@@ -3588,7 +4252,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
 
         const referencedSequenceIds = new Set<string>();
         if (sourceCollection.type === "subComposition") {
-            sourceCollection.items.forEach(item => referencedSequenceIds.add(item.value || item.id));
+            sourceCollection.items.filter(item => !isNullVariant(item)).forEach(item => referencedSequenceIds.add(item.value || item.id));
         }
         if (selectedElement.nestedSequenceId) referencedSequenceIds.add(selectedElement.nestedSequenceId);
         const copiedSequences = clonePlain(nestedSequencesRef.current.filter(sequence => referencedSequenceIds.has(sequence.id)));
@@ -3673,6 +4337,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                     value: item.value,
                     duration: item.duration ?? null,
                     excluded: !!item.excluded,
+                    isNull: !!item.isNull,
                     linkedVariantIndexes: (item.linkedVariantIds || [])
                         .map(id => variantIndexById.get(id))
                         .filter((index): index is number => index !== undefined)
@@ -3695,14 +4360,25 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 if (!matchingItem) return;
                 variantIdMap.set(item.id, matchingItem.id);
                 if (sourceCollection.type === "subComposition") {
-                    sequenceIdMap.set(item.value || item.id, matchingItem.value || matchingItem.id);
+                    if (!isNullVariant(item)) sequenceIdMap.set(item.value || item.id, matchingItem.value || matchingItem.id);
                 }
             });
         } else {
-            const clonedItems: CollectionVariant[] = [];
+            const overrides = new Map<string, Partial<CollectionVariant>>();
             try {
-                for (const item of sourceCollection.items || []) {
+                if (sourceCollection.type !== "subComposition") {
+                    ensureCollectionVariantIdMap(sourceCollection, variantIdMap, () => `v-copy-${stamp}-${variantIdMap.size}`);
+                }
+
+                for (const item of getAllCollectionVariants(sourceCollection)) {
+                    if (variantIdMap.has(item.id)) continue;
                     if (sourceCollection.type === "subComposition") {
+                        if (isNullVariant(item)) {
+                            const newVariantId = `null-copy-${stamp}-${variantIdMap.size}`;
+                            variantIdMap.set(item.id, newVariantId);
+                            overrides.set(item.id, { id: newVariantId, value: "", duration: 0, isNull: true });
+                            continue;
+                        }
                         const sourceSequenceId = item.value || item.id;
                         const sourceSequence = sequenceById.get(sourceSequenceId) || nestedSequencesRef.current.find(sequence => sequence.id === sourceSequenceId);
                         if (!sourceSequence || !compositionId) continue;
@@ -3725,8 +4401,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                         newNestedSequences.push(data);
                         variantIdMap.set(item.id, data.id);
                         sequenceIdMap.set(sourceSequenceId, data.id);
-                        clonedItems.push({
-                            ...item,
+                        overrides.set(item.id, {
                             id: data.id,
                             label: data.title || item.label,
                             value: data.id,
@@ -3735,9 +4410,6 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                         continue;
                     }
 
-                    const newVariantId = `v-copy-${stamp}-${variantIdMap.size}`;
-                    variantIdMap.set(item.id, newVariantId);
-                    clonedItems.push({ ...item, id: newVariantId });
                 }
             } catch (error) {
                 console.error("Failed to paste element", error);
@@ -3749,13 +4421,8 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 ...sourceCollection,
                 id: `col-copy-${stamp}`,
                 title: `${sourceCollection.title} Copy`,
-                items: clonedItems.map(item => ({
-                    ...item,
-                    linkedVariantIds: item.linkedVariantIds
-                        ?.map(id => variantIdMap.get(id))
-                        .filter((id): id is string => Boolean(id)),
-                })),
             };
+            remappedCollection = remapCollectionVariantIds(remappedCollection, variantIdMap, overrides);
         }
 
         if (!remappedCollection) {
@@ -3825,9 +4492,11 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
 
         if (compositionId) {
             try {
+                const normalizedCollections = syncCollectionsWithActiveVersions(nextCollections);
+                await persistSharedParentCollections(normalizedCollections);
                 const persistedCollections = isSubCompositionEditor
-                    ? withoutSubCompositionCollections(nextCollections)
-                    : nextCollections;
+                    ? withoutSubCompositionCollections(normalizedCollections).map(stripSharedParentFlag)
+                    : normalizedCollections;
                 const persistedTextGroups = pruneTextGroupsForCollections(textCollectionGroupsRef.current, persistedCollections);
                 const res = await fetch(`/api/compositions/${compositionId}`, {
                     method: "PUT",
@@ -3850,7 +4519,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
         }
 
         showToast(`Pasted ${pastedElement.title}.`, "success");
-    }, [clonePlain, compositionId, elementTimings, elements, isSubCompositionEditor, persistCollections, renderQueue, replaceCollections, tracks]);
+    }, [clonePlain, compositionId, elementTimings, elements, isSubCompositionEditor, persistCollections, persistSharedParentCollections, renderQueue, replaceCollections, tracks]);
 
     const createSubComposition = useCallback(async (collectionId: string, name: string) => {
         if (!compositionId) {
@@ -3862,8 +4531,8 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             showToast("Name the sub-composition first.", "error");
             return;
         }
-        const childCollections = withoutSubCompositionCollections(collections);
-        const childTextGroups = pruneTextGroupsForCollections(textCollectionGroups, childCollections);
+        const childCollections: CollectionItem[] = [];
+        const childTextGroups: TextCollectionGroup[] = [];
 
         try {
             const res = await fetch('/api/compositions', {
@@ -3944,45 +4613,44 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 // Ignore malformed child payloads here; flattening will surface render errors when needed.
             }
         }
+        const variantToCollectionId = new Map<string, string>();
+        for (const collection of collectionById.values()) {
+            collection.items.forEach(item => variantToCollectionId.set(item.id, collection.id));
+        }
+        const pickedVariantIds = new Set<string>();
         const pickedByCollection: Record<string, Set<string>> = {};
         const chosenVariants: Record<string, CollectionVariant | null> = {};
 
-        for (const el of timelineElements) {
-            const col = collectionById.get(el.collectionId);
+        for (const el of getSortedElementsForSelection(timelineElements, collectionById, resolvedCollectionIdByElement)) {
+            const resolvedColId = resolvedCollectionIdByElement[el.elementId] || el.collectionId;
+            const col = collectionById.get(resolvedColId) || collectionById.get(el.collectionId);
             if (!col) {
                 chosenVariants[el.elementId] = null;
                 continue;
             }
 
+            const localExcluded = new Set(el.localExcludedVariantIds || []);
+            const candidates = getSelectableVariants(col, resolvedColId, localExcluded, pickedVariantIds, pickedByCollection, collectionById, variantToCollectionId);
             const nestedPicked = el.selectedVariantId
-                ? col.items.find(item => item.id === el.selectedVariantId) || null
+                ? candidates.find(item => item.id === el.selectedVariantId) || null
                 : null;
             const statePicked = nestedPicked || previewVariants[el.elementId];
-            if (statePicked && col.items.some(item => item.id === statePicked.id)) {
+            if (statePicked && candidates.some(item => item.id === statePicked.id)) {
                 chosenVariants[el.elementId] = statePicked;
-                if (!pickedByCollection[col.id]) pickedByCollection[col.id] = new Set();
-                pickedByCollection[col.id].add(statePicked.id);
+                rememberPickedVariant(statePicked, resolvedColId, pickedVariantIds, pickedByCollection);
                 continue;
-            }
-
-            const localExcluded = new Set(el.localExcludedVariantIds || []);
-            let candidates = col.items.filter(item => !item.excluded && !localExcluded.has(item.id));
-            const alreadyPicked = pickedByCollection[col.id];
-            if (alreadyPicked && candidates.some(item => !alreadyPicked.has(item.id))) {
-                candidates = candidates.filter(item => !alreadyPicked.has(item.id));
             }
 
             const picked = pickVariantCandidate(el, candidates, `${variantSeed}-${getSelectionKey(el)}-variant`, variantUsage);
             chosenVariants[el.elementId] = picked;
-            if (picked) {
-                if (!pickedByCollection[col.id]) pickedByCollection[col.id] = new Set();
-                pickedByCollection[col.id].add(picked.id);
-            }
+            rememberPickedVariant(picked, resolvedColId, pickedVariantIds, pickedByCollection);
         }
+        lastRenderUsedVariantIdsRef.current = Array.from(pickedVariantIds);
 
         const renderEls: RenderElement[] = timelineElements
             .filter(el => {
                 const chosenVariant = chosenVariants[el.elementId];
+                if (isNullVariant(chosenVariant)) return false;
                 const effectiveEl = getEffectiveElement(el, chosenVariant?.id || 'all');
                 return effectiveEl.visible !== false;
             })
@@ -4085,11 +4753,11 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             videoBitsPerSecond: exportSettings.bitrate * 1_000_000,
             format: exportSettings.format,
         };
-    }, [collections, exportSettings, TOTAL_DURATION, resolvedCollectionIdByElement, tracks, variantSeed, flattenTimelineElementsWithResolvedTimings, pickVariantCandidate, previewVariants, variantUsage, nestedSequences, parseNestedSequence, elementTimings, getSelectionKey]);
+    }, [collections, exportSettings, TOTAL_DURATION, resolvedCollectionIdByElement, tracks, variantSeed, flattenTimelineElementsWithResolvedTimings, getSelectableVariants, getSortedElementsForSelection, pickVariantCandidate, previewVariants, rememberPickedVariant, variantUsage, nestedSequences, parseNestedSequence, elementTimings, getSelectionKey]);
 
     const queueCurrentVariant = useCallback(() => {
         const job = buildRenderJob();
-        const currentUsedVariantIds = elements.map(el => activeVariantModes[el.elementId]).filter(id => id !== 'all') as string[];
+        const currentUsedVariantIds = lastRenderUsedVariantIdsRef.current;
         const name = `Variant ${renderQueueRef.current.length + 1} (Seed ${variantSeed})`;
         const queuedJob: QueuedRenderJob = {
             id: `job-${Date.now()}`,
@@ -4098,11 +4766,30 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             usedVariantIds: currentUsedVariantIds,
         };
         void persistRenderQueue([...renderQueueRef.current, queuedJob], "Variant added to composition bucket");
-    }, [buildRenderJob, variantSeed, title, elements, activeVariantModes, persistRenderQueue]);
+    }, [buildRenderJob, variantSeed, title, persistRenderQueue]);
+
+    const chooseExportOutputDirectory = useCallback(async () => {
+        const picker = (window as DirectoryPickerWindow).showDirectoryPicker;
+        if (!picker) {
+            showToast("Folder export is not supported in this browser.", "error");
+            return;
+        }
+
+        try {
+            const handle = await picker({ mode: "readwrite" });
+            setExportOutputDir(handle);
+            setExportOutputDirName(handle.name);
+        } catch (error) {
+            if (error instanceof DOMException && error.name === "AbortError") return;
+            showToast("Failed to choose export folder.", "error");
+        }
+    }, []);
 
     const startRender = useCallback(async () => {
-        const currentUsedVariantIds = elements.map(el => activeVariantModes[el.elementId]).filter(id => id !== 'all') as string[];
-        const jobsToRender = renderQueue.length > 0 ? renderQueue : [{ id: 'current', name: 'Current View', job: buildRenderJob(), usedVariantIds: currentUsedVariantIds }];
+        const currentJob = renderQueue.length > 0 ? null : buildRenderJob();
+        const currentUsedVariantIds = lastRenderUsedVariantIdsRef.current;
+        const jobsToRender = renderQueue.length > 0 ? renderQueue : [{ id: 'current', name: 'Current View', job: currentJob!, usedVariantIds: currentUsedVariantIds }];
+        const outputTarget: RenderOutputTarget | undefined = exportOutputDir ? { directoryHandle: exportOutputDir } : undefined;
         
         const abortCtrl = new AbortController();
         renderAbortRef.current = abortCtrl;
@@ -4123,7 +4810,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                     });
                 };
                 
-                await renderComposition(item.job, progressWrapper, abortCtrl.signal);
+                await renderComposition(item.job, progressWrapper, abortCtrl.signal, outputTarget);
                 
                 // Record usage for negative bias in future randomizations
                 recordVariantUsage(item.usedVariantIds);
@@ -4137,9 +4824,13 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                 setRenderProgress({ phase: 'done', progress: 1, message: jobsToRender.length > 1 ? 'All exports complete!' : 'Export complete!' });
             }
         } catch (e: unknown) {
-            setRenderProgress({ phase: 'error', progress: 0, message: 'Render failed', error: e instanceof Error ? e.message : String(e) });
+            if (abortCtrl.signal.aborted || (e instanceof DOMException && e.name === "AbortError")) {
+                setRenderProgress(prev => ({ phase: 'error', progress: prev?.progress ?? 0, message: 'Render cancelled' }));
+            } else {
+                setRenderProgress({ phase: 'error', progress: 0, message: 'Render failed', error: e instanceof Error ? e.message : String(e) });
+            }
         }
-    }, [buildRenderJob, renderQueue, elements, activeVariantModes, persistRenderQueue, recordVariantUsage]);
+    }, [buildRenderJob, renderQueue, exportOutputDir, persistRenderQueue, recordVariantUsage]);
 
     const cancelRender = useCallback(() => {
         renderAbortRef.current?.abort();
@@ -4148,9 +4839,11 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
     const saveSkeleton = useCallback(async (overrides?: { tracks?: TrackConfig[], silent?: boolean }) => {
         setSaving(true);
         try {
+            const normalizedCollections = syncCollectionsWithActiveVersions(collections);
+            await persistSharedParentCollections(normalizedCollections);
             const persistedCollections = isSubCompositionEditor
-                ? withoutSubCompositionCollections(collections)
-                : collections;
+                ? withoutSubCompositionCollections(normalizedCollections).map(stripSharedParentFlag)
+                : normalizedCollections;
             const persistedTextGroups = pruneTextGroupsForCollections(textCollectionGroups, persistedCollections);
             const payload = {
                 title: title,
@@ -4176,7 +4869,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             else { if (!overrides?.silent) showToast("Failed to save composition.", "error"); }
             } catch { if (!overrides?.silent) showToast("Failed to save.", "error"); }
             finally { setSaving(false); }
-            }, [title, TOTAL_DURATION, elements, tracks, collections, textCollectionGroups, renderQueue, compositionId, isSubCompositionEditor]);
+            }, [title, TOTAL_DURATION, elements, tracks, collections, textCollectionGroups, renderQueue, compositionId, isSubCompositionEditor, persistSharedParentCollections]);
 
     const saveSkeletonRef = useRef(saveSkeleton);
     const savingRef = useRef(saving);
@@ -4364,10 +5057,60 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
 
                 <main className="flex-1 flex overflow-hidden">
 
-                    <aside className="w-72 border-r border-white/5 flex flex-col bg-[#0a0a0a] shrink-0">
+                    <aside
+                        className="relative border-r border-white/5 flex flex-col bg-[#0a0a0a] shrink-0 overflow-hidden"
+                        style={{ width: isCollectionsPaneCollapsed ? COLLECTIONS_PANE_COLLAPSED_WIDTH : collectionsPaneWidth }}
+                    >
+                        {isCollectionsPaneCollapsed && (
+                            <div className="flex h-full flex-col items-center py-3">
+                                <button
+                                    onClick={toggleCollectionsPaneCollapsed}
+                                    className="w-8 h-8 rounded-md bg-white/5 border border-white/8 text-gray-400 hover:text-white hover:bg-white/10 transition-colors flex items-center justify-center"
+                                    title="Expand collections pane"
+                                    aria-label="Expand collections pane"
+                                >
+                                    <ChevronRight className="w-4 h-4" />
+                                </button>
+                                <div className="mt-4 text-[9px] font-bold uppercase tracking-widest text-gray-600 font-mono [writing-mode:vertical-rl] rotate-180">
+                                    Collections
+                                </div>
+                            </div>
+                        )}
+                        {!isCollectionsPaneCollapsed && (
+                            <div
+                            role="separator"
+                            aria-label="Resize collections pane"
+                            aria-orientation="vertical"
+                            tabIndex={0}
+                            onPointerDown={handleCollectionsPaneResizeStart}
+                            onKeyDown={(e) => {
+                                if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+                                e.preventDefault();
+                                const direction = e.key === "ArrowRight" ? 1 : -1;
+                                const nextWidth = Math.max(
+                                    COLLECTIONS_PANE_MIN_WIDTH,
+                                    Math.min(COLLECTIONS_PANE_MAX_WIDTH, collectionsPaneWidth + direction * 16),
+                                );
+                                setCollectionsPaneWidth(nextWidth);
+                                window.localStorage.setItem(COLLECTIONS_PANE_WIDTH_STORAGE_KEY, String(nextWidth));
+                            }}
+                            className="absolute top-0 right-[-4px] z-30 h-full w-2 cursor-col-resize outline-none group"
+                        >
+                            <div className="mx-auto h-full w-px bg-white/10 transition-colors group-hover:bg-blue-400/70 group-focus:bg-blue-400/70" />
+                            </div>
+                        )}
+                        <div className={cn("flex min-h-0 flex-1 flex-col", isCollectionsPaneCollapsed && "hidden")}>
                         <div className="px-5 py-4 border-b border-white/5 flex items-center justify-between">
                             <h2 className="text-[10px] font-bold uppercase tracking-widest text-gray-500 font-mono">Collections</h2>
                             <div className="flex items-center gap-2">
+                                <button
+                                    onClick={toggleCollectionsPaneCollapsed}
+                                    className="text-gray-500 hover:text-gray-300 transition-colors"
+                                    title="Collapse collections pane"
+                                    aria-label="Collapse collections pane"
+                                >
+                                    <ChevronLeft className="w-4 h-4" />
+                                </button>
                                 <button
                                     onClick={() => { void pasteCollectionsFromClipboard(); }}
                                     className="text-gray-500 hover:text-emerald-300 transition-colors"
@@ -4565,14 +5308,49 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
 	                                            c.id === colId ? { ...c, items: [...c.items, { id: `v-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, label, value, duration }] } : c
 	                                        ));
 	                                    }}
+                                    onAddItems={(colId, items) => {
+                                        applyCollectionsChange(current => current.map(c =>
+                                            c.id === colId
+                                                ? {
+                                                    ...c,
+                                                    items: [
+                                                        ...c.items,
+                                                        ...items.map(item => ({
+                                                            id: `v-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                                                            ...item,
+                                                        })),
+                                                    ],
+                                                }
+                                                : c
+                                        ));
+                                    }}
+                                    onAddNullVariant={(colId) => {
+                                        applyCollectionsChange(current => current.map(c =>
+                                            c.id === colId
+                                                ? {
+                                                    ...c,
+                                                    items: [
+                                                        ...c.items,
+                                                        {
+                                                            id: `null-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                                                            label: "Null",
+                                                            value: "",
+                                                            duration: 0,
+                                                            isNull: true,
+                                                        },
+                                                    ],
+                                                }
+                                                : c
+                                        ));
+                                    }}
 	                                    onDeleteItem={(colId, variantId) => {
 	                                        const collection = collections.find(c => c.id === colId);
 	                                        const variant = collection?.items.find(v => v.id === variantId);
-	                                        if (collection?.type === 'subComposition' && variant) {
+	                                        if (collection?.type === 'subComposition' && variant && !isNullVariant(variant)) {
 	                                            const sequenceId = variant.value || variant.id;
 	                                            const referenceCount = collections.reduce((count, c) => {
 	                                                if (c.type !== 'subComposition') return count;
-	                                                return count + c.items.filter(item => (item.value || item.id) === sequenceId).length;
+	                                                return count + c.items.filter(item => !isNullVariant(item) && (item.value || item.id) === sequenceId).length;
 	                                            }, 0);
 	                                            if (referenceCount > 1) {
 	                                                applyCollectionsChange(current => current.map(c =>
@@ -4598,7 +5376,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
 	                                        if (!collection || !variant) return;
 
 	                                        let clone: CollectionVariant | null = null;
-	                                        if (collection.type === 'subComposition') {
+	                                        if (collection.type === 'subComposition' && !isNullVariant(variant)) {
 	                                            const sourceId = variant.value || variant.id;
 	                                            const source = nestedSequences.find(seq => seq.id === sourceId);
 	                                            if (!source || !compositionId) {
@@ -4660,11 +5438,15 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                     onCopyCollection={copyCollectionToClipboard}
 	                                    onDeleteCollection={(colId) => {
 	                                        const collection = collections.find(c => c.id === colId);
+                                            if (isSubCompositionEditor && collection?.sharedFromParent) {
+                                                showToast("Parent shared collections stay linked to the sub-composition.", "error");
+                                                return;
+                                            }
 	                                        if (collection?.type === 'subComposition') {
-	                                            const idsToDelete = new Set(collection.items.map(item => item.value || item.id));
+	                                            const idsToDelete = new Set(collection.items.filter(item => !isNullVariant(item)).map(item => item.value || item.id));
 	                                            const outsideIds = new Set(collections
 	                                                .filter(c => c.id !== colId && c.type === 'subComposition')
-	                                                .flatMap(c => c.items.map(item => item.value || item.id)));
+	                                                .flatMap(c => c.items.filter(item => !isNullVariant(item)).map(item => item.value || item.id)));
 	                                            idsToDelete.forEach(sequenceId => {
 	                                                if (!outsideIds.has(sequenceId)) void deleteNestedSequence(sequenceId);
 	                                            });
@@ -4682,8 +5464,42 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                         }
                                     }}
                                     onCreateSubComposition={createSubComposition}
+                                    onSwitchVersion={(colId, versionId) => {
+                                        const nextCollections = collectionsRef.current.map(c =>
+                                            c.id === colId ? switchCollectionVersion(c, versionId) : c
+                                        );
+                                        replaceCollections(nextCollections, "versions");
+                                        void persistCollections(nextCollections);
+                                    }}
+                                    onCreateVersion={(colId, name, duplicateActive) => {
+                                        const nextCollections = collectionsRef.current.map(c =>
+                                            c.id === colId ? createCollectionVersion(c, name, duplicateActive) : c
+                                        );
+                                        replaceCollections(nextCollections, "versions");
+                                        void persistCollections(nextCollections);
+                                    }}
+                                    onRenameVersion={(colId, versionId, name) => {
+                                        const nextCollections = collectionsRef.current.map(c =>
+                                            c.id === colId ? renameCollectionVersion(c, versionId, name) : c
+                                        );
+                                        replaceCollections(nextCollections, "versions");
+                                        void persistCollections(nextCollections);
+                                    }}
+                                    onDeleteVersion={(colId, versionId) => {
+                                        const collection = collectionsRef.current.find(c => c.id === colId);
+                                        if (collection && getCollectionVersions(collection).length <= 1) {
+                                            showToast("A collection needs at least one version.", "error");
+                                            return;
+                                        }
+                                        const nextCollections = collectionsRef.current.map(c =>
+                                            c.id === colId ? deleteCollectionVersion(c, versionId) : c
+                                        );
+                                        replaceCollections(nextCollections, "versions");
+                                        void persistCollections(nextCollections);
+                                    }}
                                 />
                             ))}
+                        </div>
                         </div>
                     </aside>
 
@@ -4860,7 +5676,13 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                                                 zIndex: el.zIndex,
                                                                 opacity: isActive ? animStyle.opacity : 0,
                                                                 pointerEvents: isActive ? 'auto' : 'none',
-                                                                transform: `rotate(${el.rotation || 0}deg) scale(${animStyle.scale}) rotate(${animStyle.rotate}deg)`,
+                                                                transform: getPreviewElementTransform(el, animStyle),
+                                                                transformOrigin: 'center center',
+                                                                backfaceVisibility: 'hidden',
+                                                                willChange: 'transform, opacity, filter',
+                                                                transitionProperty: isPlaying ? 'transform, opacity, filter' : undefined,
+                                                                transitionDuration: isPlaying ? `${PLAYBACK_STATE_INTERVAL_MS}ms` : undefined,
+                                                                transitionTimingFunction: isPlaying ? 'linear' : undefined,
                                                                 filter: blur > 0 ? `blur(${blur}px)` : undefined,
                                                             }}
                                                         >
@@ -6706,7 +7528,7 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
             <DragOverlay dropAnimation={null}>
                 {activeCollection ? (
                     <div className="opacity-80 scale-105 pointer-events-none origin-top-left w-[220px]">
-                        <CollectionCard collection={activeCollection} allCollections={collections} onAddItem={() => { }} onDeleteItem={() => { }} onUpdateItem={() => { }} onDuplicateItem={() => { }} onCopyCollection={() => { }} onDeleteCollection={() => { }} onCreateSubComposition={() => { }} />
+                        <CollectionCard collection={activeCollection} allCollections={collections} onAddItem={() => { }} onAddItems={() => { }} onAddNullVariant={() => { }} onDeleteItem={() => { }} onUpdateItem={() => { }} onDuplicateItem={() => { }} onCopyCollection={() => { }} onDeleteCollection={() => { }} onCreateSubComposition={() => { }} onSwitchVersion={() => { }} onCreateVersion={() => { }} onRenameVersion={() => { }} onDeleteVersion={() => { }} />
                     </div>
                 ) : null}
             </DragOverlay>
@@ -6831,10 +7653,36 @@ function BuilderInner({ compositionId }: { compositionId?: string }) {
                                     </div>
 
                                     {/* Info row */}
+                                    <div>
+                                        <label className="text-[10px] font-mono uppercase tracking-widest text-gray-500 mb-2 block">Output Folder</label>
+                                        <div className="flex items-center gap-2">
+                                            <button
+                                                onClick={chooseExportOutputDirectory}
+                                                className="shrink-0 py-2 px-3 rounded-lg text-[10px] font-mono border border-white/8 bg-white/5 text-gray-300 hover:text-white hover:bg-white/10 transition-colors flex items-center gap-2"
+                                            >
+                                                <FolderOpen className="w-3.5 h-3.5" />
+                                                Choose
+                                            </button>
+                                            <div className="min-w-0 flex-1 rounded-lg border border-white/5 bg-black/20 px-3 py-2">
+                                                <p className="text-[10px] font-mono text-gray-400 truncate">
+                                                    {exportOutputDirName || "Browser downloads folder"}
+                                                </p>
+                                            </div>
+                                            {exportOutputDir && (
+                                                <button
+                                                    onClick={() => { setExportOutputDir(null); setExportOutputDirName(null); }}
+                                                    className="text-[10px] font-mono text-red-400 hover:text-red-300 px-2"
+                                                >
+                                                    Clear
+                                                </button>
+                                            )}
+                                        </div>
+                                    </div>
+
                                     <div className="flex items-center gap-2 bg-amber-500/8 border border-amber-500/15 rounded-lg px-3 py-2.5">
                                         <AlertCircle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
                                         <p className="text-[10px] text-amber-300/80 leading-relaxed">
-                                            Export renders frame-by-frame in your browser. Keep the tab active. Large compositions may take a few minutes.
+                                            Export renders frame-by-frame in your browser. You can switch tabs while it runs; keep this window open.
                                         </p>
                                     </div>
 

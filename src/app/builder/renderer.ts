@@ -70,6 +70,10 @@ export interface RenderJob {
     outputName?: string;
 }
 
+export type RenderOutputTarget = {
+    directoryHandle?: FileSystemDirectoryHandle | null;
+};
+
 export type RenderProgress = {
     phase: 'preparing' | 'rendering' | 'encoding' | 'done' | 'error';
     progress: number;
@@ -78,6 +82,44 @@ export type RenderProgress = {
 };
 
 type ProgressCb = (p: RenderProgress) => void;
+
+function yieldToBrowser(): Promise<void> {
+    if (typeof MessageChannel === 'undefined') return Promise.resolve();
+
+    return new Promise(resolve => {
+        const channel = new MessageChannel();
+        channel.port1.onmessage = () => {
+            channel.port1.close();
+            channel.port2.close();
+            resolve();
+        };
+        channel.port2.postMessage(undefined);
+    });
+}
+
+async function saveRenderBlob(blob: Blob, safeName: string, format: RenderFormat, outputTarget?: RenderOutputTarget): Promise<string> {
+    const fileName = `${safeName}.${format}`;
+
+    if (outputTarget?.directoryHandle) {
+        const fileHandle = await outputTarget.directoryHandle.getFileHandle(fileName, { create: true });
+        const writable = await fileHandle.createWritable();
+        try {
+            await writable.write(blob);
+        } finally {
+            await writable.close();
+        }
+        return `Saved ${fileName}`;
+    }
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fileName;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 10000);
+
+    return 'Export complete';
+}
 
 const ANIM_CATEGORIES: Record<string, 'in' | 'out'> = {
     fadeIn: 'in', slideInLeft: 'in', slideInRight: 'in', slideInTop: 'in', slideInBottom: 'in', scaleIn: 'in', rotateIn: 'in', bounceIn: 'in', blurIn: 'in',
@@ -294,33 +336,47 @@ function seekTo(vid: HTMLVideoElement, target: number): Promise<void> {
             return;
         }
 
-        // Initiate the seek
-        vid.currentTime = clampedTarget;
+        // Initiate the seek using media events instead of a tight timer loop.
+        let frameCallbackId: number | undefined;
 
-        // Single polling loop: wait until the decoder has actually
-        // landed on the target AND has pixel data ready to draw.
-        // This runs every 2ms — far faster than any event-based approach —
-        // and has zero risk of resolving before the frame is decoded.
-        let elapsed = 0;
-        const poll = () => {
-            // Frame is decoded and position is correct
-            if (vid.readyState >= 2 && Math.abs(vid.currentTime - clampedTarget) < 0.1) {
-                resolve();
-                return;
+        const cleanup = () => {
+            vid.removeEventListener('seeked', check);
+            vid.removeEventListener('loadeddata', check);
+            vid.removeEventListener('canplay', check);
+            window.clearTimeout(timeoutId);
+            if (frameCallbackId !== undefined && 'cancelVideoFrameCallback' in vid) {
+                vid.cancelVideoFrameCallback(frameCallbackId);
             }
-            elapsed += 2;
-            // Hard deadline: 5 seconds. If we haven't got a frame by now,
-            // something is seriously wrong — resolve anyway so the export
-            // doesn't hang forever. At this point readyState < 2 is caught
-            // by drawFrame which will draw the last good cached frame.
-            if (elapsed > 5000) {
-                resolve();
-                return;
-            }
-            setTimeout(poll, 2);
         };
-        // Start polling on next tick to give the browser a chance to start seeking
-        setTimeout(poll, 2);
+
+        const finish = () => {
+            cleanup();
+            resolve();
+        };
+
+        const requestDecodedFrame = () => {
+            if (!('requestVideoFrameCallback' in vid) || frameCallbackId !== undefined) return;
+            frameCallbackId = vid.requestVideoFrameCallback(() => {
+                frameCallbackId = undefined;
+                check();
+            });
+        };
+
+        function check() {
+            if (vid.readyState >= 2 && Math.abs(vid.currentTime - clampedTarget) < 0.1) {
+                finish();
+                return;
+            }
+            requestDecodedFrame();
+        }
+
+        vid.addEventListener('seeked', check);
+        vid.addEventListener('loadeddata', check);
+        vid.addEventListener('canplay', check);
+        const timeoutId = window.setTimeout(finish, 5000);
+
+        vid.currentTime = clampedTarget;
+        check();
     });
 }
 
@@ -527,7 +583,7 @@ async function encodeComposition(
         
         // Prevent audio encoder from hoarding RAM
         while (aEnc.encodeQueueSize > 50) {
-            await new Promise(r => setTimeout(r, 2));
+            await yieldToBrowser();
         }
     }
 
@@ -562,7 +618,7 @@ async function encodeComposition(
 
         // CRITICAL PERFORMANCE FIX: Prevent OOM freezes by pausing the frame loop until encoder queue drains
         while (vEnc.encodeQueueSize > 2) {
-            await new Promise(r => setTimeout(r, 5));
+            await yieldToBrowser();
         }
 
         vEnc.encode(vf, { keyFrame: frame % FPS === 0 });
@@ -577,7 +633,7 @@ async function encodeComposition(
 
     // Drain remaining frames
     while (vEnc.encodeQueueSize > 0 || aEnc.encodeQueueSize > 0) {
-        await new Promise(r => setTimeout(r, 10));
+        await yieldToBrowser();
     }
 
     await vEnc.flush(); await aEnc.flush();
@@ -585,7 +641,7 @@ async function encodeComposition(
     finalise();
 }
 
-export async function renderComposition(job: RenderJob, onProgress: ProgressCb, signal?: AbortSignal): Promise<void> {
+export async function renderComposition(job: RenderJob, onProgress: ProgressCb, signal?: AbortSignal, outputTarget?: RenderOutputTarget): Promise<void> {
     const W = job.width || 1080;
     const H = job.height || 1920;
     const FPS = job.fps || 30;
@@ -644,18 +700,14 @@ export async function renderComposition(job: RenderJob, onProgress: ProgressCb, 
             blob = new Blob([target.buffer], { type: 'video/webm' });
         }
 
-        const url = URL.createObjectURL(blob);
         const safeName = (job.outputName || `export-${Date.now()}`)
             .replace(/[<>:"/\\|?*\x00-\x1F]/g, '-')
             .replace(/\s+/g, ' ')
             .trim()
             .slice(0, 120) || `export-${Date.now()}`;
-        const a = document.createElement('a'); a.href = url; a.download = `${safeName}.${format}`; a.click();
-        
-        // Clean up the final export URL after download
-        setTimeout(() => URL.revokeObjectURL(url), 10000);
-        
-        onProgress({ phase: 'done', progress: 1, message: 'Export complete' });
+
+        const doneMessage = await saveRenderBlob(blob, safeName, format, outputTarget);
+        onProgress({ phase: 'done', progress: 1, message: doneMessage });
     } catch (e: unknown) {
         onProgress({ phase: 'error', progress: 0, message: 'Export failed', error: e instanceof Error ? e.message : String(e) });
         throw e;
